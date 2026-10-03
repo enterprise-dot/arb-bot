@@ -2471,7 +2471,10 @@ def main() -> None:
             + [(outlier_payload(o), cfg.outlier_webhook_url or ev_url, "outlier") for o in find_outliers(events, cfg)[:1]]
         ids = []
         for payload, url, kind in samples:  # each to the channel real alerts of that kind use
-            payload["embeds"][0]["footer"] = {"text": "SAMPLE ALERT (made-up prices, don't bet)"}
+            emb = payload["embeds"][0]
+            emb["title"] = ("🧪 SAMPLE · " + emb["title"])[:256]
+            emb["footer"] = {"text": "SAMPLE ALERT: made-up game and prices. Don't bet this."}
+            emb.pop("url", None)
             ids.append((_webhook(url, payload) or {}).get("id"))
             print(f"  sent the {kind} sample to {'the main channel' if url == cfg.webhook_url else 'its own channel'}")
         print(f"Sent {len(samples)} sample alerts. In 5 seconds the arb turns 'GONE'...")
