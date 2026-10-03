@@ -1186,6 +1186,23 @@ class Budget(unittest.TestCase):
         spend = s.core_demand / s.scale + s.extra_demand / s.extra_scale
         self.assertAlmostEqual(spend, s.allowance, delta=1)
 
+    def test_weekends_get_more_credits(self):
+        s = sched_with({"basketball_nba": []}, remaining=60_000)
+        sat = datetime(2026, 10, 3, 14, 0, tzinfo=timezone.utc)    # Saturday 10am New York
+        tue = datetime(2026, 10, 6, 14, 0, tzinfo=timezone.utc)    # Tuesday 10am New York
+        s.update_budget(sat)
+        weekend = s.allowance
+        s.update_budget(tue)
+        self.assertGreater(weekend, s.allowance * 2)                # Sat/Sun 2.0-2.2 vs Tue/Wed 0.6
+
+    def test_even_weights_spread_evenly(self):
+        cfg = Config(sports=["basketball_nba"], budget_weights={d: 1.0 for d in
+                     ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]})
+        s = sched_with({"basketball_nba": []}, cfg, remaining=29_000)
+        s.update_budget(NOW)
+        hours = (next_reset(cfg, NOW) - NOW).total_seconds() / 3600
+        self.assertAlmostEqual(s.allowance, 29_000 * 0.98 * 24 / int(hours), delta=5)
+
     def test_out_of_credits_pauses(self):
         s = sched_with({"basketball_nba": [("g1", NOW)]}, remaining=0)
         s.update_budget(NOW)

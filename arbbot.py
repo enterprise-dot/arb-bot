@@ -58,6 +58,9 @@ DEFAULT_GAME_MINUTES = [
 ]
 FALLBACK_GAME_MINUTES = 180
 
+DEFAULT_BUDGET_WEIGHTS = {"mon": 1.2, "tue": 0.6, "wed": 0.6, "thu": 1.2, "fri": 1.0, "sat": 2.0, "sun": 2.2}
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
 # Prop markets checked per sport (each one costs a credit per game per check).
 DEFAULT_PROP_MARKETS = {
     "americanfootball_nfl": "player_pass_yds,player_rush_yds,player_reception_yds,player_receptions",
@@ -149,6 +152,9 @@ class Config:
     far_minutes: int = 180        # games 24-48h out: main lines this often
     far_max_age_seconds: int = 10800  # early lines can sit unchanged for hours without being stale
     extra_max_stretch: float = 4.0    # on a tight budget, slow early checks up to this much first
+    # How the month's credits are shared across days of the week (relative weights, local time).
+    # Busy days (Sun NFL, Sat college, Mon/Thu night games) get more; quiet midweek days less.
+    budget_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_BUDGET_WEIGHTS))
     monthly_credits: int = 100_000
     billing_day: int = 1          # day of month your plan's credits reset
     events_refresh_minutes: int = 10
@@ -259,6 +265,8 @@ class Config:
             far_minutes=int(e("FAR_MINUTES", d.far_minutes)),
             far_max_age_seconds=int(e("FAR_MAX_AGE_SECONDS", d.far_max_age_seconds)),
             extra_max_stretch=float(e("EXTRA_MAX_STRETCH", d.extra_max_stretch)),
+            budget_weights={**d.budget_weights, **{k.strip().lower()[:3]: float(v) for k, v in
+                            (x.split("=") for x in _csv(e("BUDGET_WEIGHTS", "")))}},
             monthly_credits=int(e("MONTHLY_CREDITS", d.monthly_credits)),
             billing_day=int(e("BILLING_DAY", d.billing_day)),
             events_refresh_minutes=int(e("EVENTS_REFRESH_MINUTES", d.events_refresh_minutes)),
@@ -2319,8 +2327,7 @@ class Scheduler:
         """Pick the smallest slow-down that makes credits last until the plan resets."""
         remaining = self.api.remaining if self.api.remaining is not None else self.cfg.monthly_credits
         reserve = 0.02 * remaining  # small cushion for forecast misses
-        days_left = max(1.0, (next_reset(self.cfg, now) - now).total_seconds() / 86400)
-        self.allowance = max(0.0, remaining - reserve) / days_left
+        self.allowance = max(0.0, remaining - reserve) * self.next24_share(now)
 
         core = extra = 0.0
         for step in range(0, 86400, STEP):
@@ -2421,6 +2428,21 @@ class Scheduler:
                 elif isinstance(result, dict) and result.get("bookmakers"):
                     events.append(apply_fees([result], self.cfg)[0])
         return events
+
+    def day_weight(self, t: datetime) -> float:
+        day = WEEKDAYS[t.astimezone(ZoneInfo(self.cfg.timezone)).weekday()]
+        return max(0.0, self.cfg.budget_weights.get(day, 1.0))
+
+    def next24_share(self, now: datetime) -> float:
+        """The part of the remaining credits the next 24h may use: its share of the weighted
+        hours left until the plan resets (weekends weigh more, quiet weekdays less)."""
+        end = next_reset(self.cfg, now)
+        hours = int((end - now).total_seconds() // 3600)
+        if hours <= 24:
+            return 1.0
+        weights = [self.day_weight(now + timedelta(hours=h)) for h in range(hours)]
+        total = sum(weights)
+        return sum(weights[:24]) / total if total else 24 / hours
 
     # ---- polling
 
@@ -2606,6 +2628,11 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
         print(f"\nProps: {len(prop_games)} games in the next 24h ({', '.join(short(s) for s in cfg.prop_sports)}): "
               f"every {cfg.prop_early_minutes // 60}h from {cfg.prop_early_hours:g}h out, "
               f"every {cfg.prop_minutes}m in the last {cfg.prop_hours:g}h.")
+    day = WEEKDAYS[now.astimezone(tz).weekday()]
+    w = cfg.budget_weights.get(day, 1.0)
+    avg = sum(cfg.budget_weights.get(d, 1.0) for d in WEEKDAYS) / 7
+    print(f"\nBudget weighting: today ({day.title()}) gets {w / avg:.1f}x an average day's credits "
+          f"(BUDGET_WEIGHTS; busy days get more, quiet weekdays less).")
     print(f"\nFull speed would use {sched.forecast:,.0f} credits in the next 24h; "
           f"you can afford {sched.allowance:,.0f}/day.")
     if sched.scale > 1 or sched.extra_scale > 1:
