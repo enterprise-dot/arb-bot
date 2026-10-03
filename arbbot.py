@@ -172,6 +172,7 @@ class Config:
     status_webhook_url: str = ""  # health messages; defaults to the alerts webhook
     low_credits: int = 5000       # warn on Discord below this many credits
     log_file: str = "arbs.csv"    # every arb with how long it lasted ("" = off)
+    state_dir: str = "state"      # open alerts survive restarts (no duplicate posts) ("" = off)
     summary_hour: int = 9         # local hour for the daily Discord summary (-1 = off)
     odds_format: str = "american"  # "american" (+152 / -154) or "decimal" (2.52)
     # +EV
@@ -280,6 +281,7 @@ class Config:
             status_webhook_url=e("DISCORD_STATUS_WEBHOOK_URL", ""),
             low_credits=int(e("LOW_CREDITS", d.low_credits)),
             log_file=e("LOG_FILE", d.log_file),
+            state_dir=e("STATE_DIR", d.state_dir),
             summary_hour=int(e("SUMMARY_HOUR", d.summary_hour)),
             odds_format=e("ODDS_FORMAT", d.odds_format).strip().lower(),
             ev_enabled=e("EV_ENABLED", "true").lower() in ("1", "true", "yes"),
@@ -920,11 +922,77 @@ class Alerter:
     on_log = None  # optional callback(row) after a row is logged
     log_on_open = False  # arbs are logged when they close, so the row has how long it lasted
 
-    def __init__(self, cfg: Config, dry_run: bool):
+    RESTORE_GRACE = 900  # seconds a restored alert gets to show up again before it's marked gone
+
+    def __init__(self, cfg: Config, dry_run: bool, noun: str | None = None):
         self.cfg = cfg
+        if noun:
+            self.noun = noun  # before loading state: it names the state file
         self.dry_run = dry_run or not cfg.webhook_url
         self.open: dict[str, OpenArb] = {}
+        self.restored: dict[str, dict] = {}
+        self.started = time.time()
         self.reset_stats()
+        self._load_state()
+
+    # ---- remembering open alerts across restarts
+    def _state_path(self) -> Path | None:
+        if self.dry_run or not self.cfg.state_dir:
+            return None
+        slug = "".join(c if c.isalnum() else "_" for c in self.noun).strip("_")
+        return data_path(self.cfg.state_dir) / f"open_{slug}.json"
+
+    def _load_state(self) -> None:
+        path = self._state_path()
+        if not path or not path.exists():
+            return
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        cutoff = time.time() - 86400
+        self.restored = {k: v for k, v in saved.items() if v.get("first_seen", 0) > cutoff}
+
+    def _save_state(self) -> None:
+        path = self._state_path()
+        if not path:
+            return
+        data = {k: {"message_id": op.message_id, "url": op.url, "first_seen": op.first_seen,
+                    "alerted_pct": op.alerted_pct, "best_pct": op.best_pct,
+                    "fingerprint": op.arb.fingerprint, "label": self.label(op.arb)}
+                for k, op in self.open.items() if op.message_id}
+        data.update(self.restored)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            tmp.replace(path)
+        except OSError as e:
+            print(f"  ! Couldn't save alert state: {e}", file=sys.stderr)
+
+    def _restore(self, arb, now: float) -> OpenArb | None:
+        """Pick an alert back up after a restart: same Discord message, no new ping."""
+        saved = self.restored.pop(arb.key, None)
+        if not saved:
+            return None
+        op = OpenArb(arb, saved["first_seen"], now, max(saved.get("best_pct", 0), self.value(arb)),
+                     message_id=saved.get("message_id"), url=saved.get("url", ""),
+                     alerted_pct=saved.get("alerted_pct", self.value(arb)))
+        self.open[arb.key] = op
+        if saved.get("fingerprint") != arb.fingerprint and op.message_id:
+            self._discord(self.payload(arb, first_seen=op.first_seen), op.message_id, op.url)
+        return op
+
+    def _expire_restored(self, now: float) -> None:
+        """Alerts that closed while the bot was down: mark their cards gone."""
+        if not self.restored or now - self.started < self.RESTORE_GRACE:
+            return
+        for key, saved in list(self.restored.items()):
+            if saved.get("message_id"):
+                self._discord(_gone_card(f"❌ GONE · {saved.get('label', 'alert')}",
+                                         "Ignore this one. It closed while the bot was restarting."),
+                              saved["message_id"], saved.get("url", ""))
+            del self.restored[key]
 
     # ---- hooks (overridden for +EV)
     def text(self, item) -> str:
@@ -986,7 +1054,7 @@ class Alerter:
         seen = set()
         for arb in arbs:
             seen.add(arb.key)
-            cur = self.open.get(arb.key)
+            cur = self.open.get(arb.key) or self._restore(arb, now)
             if cur is None:
                 print(self.text(arb), flush=True)
                 op = OpenArb(arb, now, now, self.value(arb), alerted_pct=self.value(arb),
@@ -1027,6 +1095,8 @@ class Alerter:
             if checked_events is not None and op.arb.event_id not in checked_events:
                 continue  # that game wasn't re-checked this round
             self._close(key, now)
+        self._expire_restored(now)
+        self._save_state()
         return new
 
     def _close(self, key: str, now: float) -> None:
@@ -2455,10 +2525,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     ev_alerter.on_log = out_alerter.on_log = tracker.add
     # Props are fetched per game on their own schedule, so they get their own alert trackers
     # (a main-line check must never "close" a prop alert it didn't look at).
-    prop_arbs, prop_evs, prop_outs = (Alerter(cfg, dry_run=args.dry_run), EVAlerter(cfg, dry_run=args.dry_run),
-                                      OutlierAlerter(cfg, dry_run=args.dry_run))
-    for a, noun in ((prop_arbs, "prop arbs"), (prop_evs, "+EV props"), (prop_outs, "prop outliers")):
-        a.noun = noun
+    prop_arbs = Alerter(cfg, dry_run=args.dry_run, noun="prop arbs")
+    prop_evs = EVAlerter(cfg, dry_run=args.dry_run, noun="+EV props")
+    prop_outs = OutlierAlerter(cfg, dry_run=args.dry_run, noun="prop outliers")
     prop_evs.on_log = prop_outs.on_log = tracker.add
     prop_cfg = cfg.for_props()
     parlay_alerter = ParlayAlerter(cfg, dry_run=args.dry_run)
@@ -2471,6 +2540,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         # Sample data must never reach the real logs (it would be graded and counted).
         for a in (alerter, ev_alerter, out_alerter, parlay_alerter):
             a.log_path = lambda: ""
+            a._state_path = lambda: None
+            a.restored = {}
         events = demo_events()
         outs = find_outliers(events, cfg)
         arbs, evs = find_arbs(events, cfg), without_outliers(find_evs(events, cfg), outs)

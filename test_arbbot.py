@@ -208,6 +208,48 @@ class Stakes(unittest.TestCase):
         self.assertEqual(links, {"A": "https://a.example/slip/home", "B": "https://b.example/event"})
 
 
+class RestartMemory(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(webhook_url="https://main", state_dir=self.tmp.name, log_file="")
+        self.sent = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def alerter(self, noun=None):
+        a = Alerter(self.cfg, dry_run=False, noun=noun)
+        def fake(payload, message_id=None, url=""):
+            self.sent.append(("PATCH" if message_id else "POST", payload["embeds"][0]["title"]))
+            return message_id or "m1"
+        a._discord = fake
+        return a
+
+    def test_no_repost_after_restart(self):
+        arbs = find_arbs(demo_events(), Config())
+        self.alerter().handle(arbs, ["basketball_nba"], now=time.time())
+        self.assertEqual([m for m, _ in self.sent], ["POST"])
+        again = self.alerter()                                    # restart
+        self.assertEqual(again.handle(arbs, ["basketball_nba"], now=time.time()), 0)  # no new alert
+        self.assertEqual([m for m, _ in self.sent], ["POST"])      # nothing re-posted
+        self.assertIn(arbs[0].key, again.open)
+
+    def test_closed_while_down_marked_gone(self):
+        arbs = find_arbs(demo_events(), Config())
+        self.alerter().handle(arbs, ["basketball_nba"], now=time.time())
+        again = self.alerter()
+        again.started -= 1000                                     # past the grace period
+        again.handle([], ["icehockey_nhl"], now=time.time())
+        self.assertEqual(self.sent[-1][0], "PATCH")
+        self.assertTrue(self.sent[-1][1].startswith("❌ GONE"))
+
+    def test_state_files_kept_apart(self):
+        arbs = find_arbs(demo_events(), Config())
+        self.alerter().handle(arbs, ["basketball_nba"], now=time.time())
+        self.assertEqual(self.alerter(noun="prop arbs").restored, {})
+
+
 class LiveChannel(unittest.TestCase):
     def test_live_arbs_use_their_own_webhook(self):
         a = Alerter(Config(webhook_url="https://main", live_webhook_url="https://live"), dry_run=True)
