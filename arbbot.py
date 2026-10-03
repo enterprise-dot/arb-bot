@@ -271,6 +271,21 @@ class Config:
             timezone=e("TIMEZONE", d.timezone),
         )
 
+    def bad_webhooks(self) -> list[str]:
+        """Clear any webhook setting that isn't a URL (e.g. a leftover placeholder) and name it,
+        so those alerts fall back to the main channel instead of failing silently."""
+        bad = []
+        for attr, env in (("ev_webhook_url", "DISCORD_EV_WEBHOOK_URL"),
+                          ("outlier_webhook_url", "DISCORD_OUTLIER_WEBHOOK_URL"),
+                          ("parlay_webhook_url", "DISCORD_PARLAY_WEBHOOK_URL"),
+                          ("live_webhook_url", "DISCORD_LIVE_WEBHOOK_URL"),
+                          ("status_webhook_url", "DISCORD_STATUS_WEBHOOK_URL")):
+            value = getattr(self, attr)
+            if value and not value.startswith(("https://", "http://")):
+                bad.append(env)
+                setattr(self, attr, "")
+        return bad
+
     def credits_per_call(self) -> int:
         """The Odds API charges markets x regions; every 10 bookmakers count as one region."""
         n_markets = len(_csv(self.markets))
@@ -2423,7 +2438,11 @@ def main() -> None:
         print("Set ODDS_API_KEY in .env (key at https://the-odds-api.com), or run with --demo.", file=sys.stderr)
         sys.exit(2)
 
+    bad = cfg.bad_webhooks()
     status = Status(cfg, dry_run=args.dry_run or args.demo or args.plan or args.once or args.results)
+    if bad:
+        status.send(f"⚠️ {', '.join(bad)} in .env isn't a Discord webhook URL, so those alerts are going "
+                    f"to this channel for now. Fix it with: nano /opt/arb-bot/.env")
     while True:
         try:
             run(cfg, args, status)

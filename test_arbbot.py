@@ -773,6 +773,12 @@ class Parlays(unittest.TestCase):
 
 
 class Channels(unittest.TestCase):
+    def test_placeholder_webhook_falls_back_to_main(self):
+        cfg = Config(webhook_url="https://main", ev_webhook_url="PASTE_URL_HERE")
+        self.assertEqual(cfg.bad_webhooks(), ["DISCORD_EV_WEBHOOK_URL"])
+        self.assertEqual(EVAlerter(cfg, True).webhook_for(None), "https://main")
+        self.assertEqual(Config(ev_webhook_url="https://discord.com/api/webhooks/1/x").bad_webhooks(), [])
+
     def test_routing(self):
         cfg = Config(webhook_url="main", ev_webhook_url="ev")
         [arb] = find_arbs(demo_events(), Config())
