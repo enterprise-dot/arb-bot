@@ -164,6 +164,8 @@ class Config:
     round_keep_pct: float = 85    # only use a rounding that keeps this much of the exact edge
     arb_live: bool = True         # alert on arbs in games already in progress
     min_live_profit_pct: float = 1.0  # live gaps are often one book lagging; ask for more
+    live_arb_max_skew: int = 60   # live arb legs must be priced within this many seconds of each other
+    live_sports: list[str] = field(default_factory=list)  # sports to check while live ([] = all)
     live_webhook_url: str = ""    # send live arbs to a separate Discord channel
     ev_webhook_url: str = ""      # +EV (incl. props) channel; outliers and parlays fall back to it
     parlay_webhook_url: str = ""
@@ -273,6 +275,8 @@ class Config:
             round_keep_pct=float(e("ROUND_KEEP_PCT", d.round_keep_pct)),
             arb_live=e("ARB_LIVE", "true").lower() in ("1", "true", "yes"),
             min_live_profit_pct=float(e("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct)),
+            live_arb_max_skew=int(e("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew)),
+            live_sports=_csv(e("LIVE_SPORTS", "")),
             live_webhook_url=e("DISCORD_LIVE_WEBHOOK_URL", ""),
             ev_webhook_url=e("DISCORD_EV_WEBHOOK_URL", ""),
             parlay_webhook_url=e("DISCORD_PARLAY_WEBHOOK_URL", ""),
@@ -394,6 +398,7 @@ class Leg:
     book: str
     stake: float = 0.0
     link: str = ""    # deep link to the bet slip, when the book provides one
+    updated: datetime | None = None  # when the book last updated this price
 
 
 @dataclass
@@ -649,7 +654,9 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
                     cur = slot.get(oc["name"])
                     if cur is None or price > cur.price:
                         link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
-                        slot[oc["name"]] = Leg(oc["name"], price, bm.get("title", bm["key"]), link=link)
+                        ts = mkt.get("last_update") or bm.get("last_update")
+                        slot[oc["name"]] = Leg(oc["name"], price, bm.get("title", bm["key"]), link=link,
+                                               updated=_parse_time(ts) if ts else None)
                 for k, n in per_line.items():
                     n_outcomes[k] = max(n_outcomes.get(k, 0), n)
 
@@ -675,6 +682,11 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
                 margin=margin,
                 sport_key=ev.get("sport_key", ""),
             )
+            if is_live and cfg.live_arb_max_skew:
+                stamps = [l.updated for l in arb.legs if l.updated]
+                if len(stamps) == len(arb.legs) and \
+                        (max(stamps) - min(stamps)).total_seconds() > cfg.live_arb_max_skew:
+                    continue  # one side's price is older: usually a lagging line, not a real arb
             min_pct = cfg.min_live_profit_pct if is_live else cfg.min_profit_pct
             if min_pct <= arb.exact_pct <= cfg.max_profit_pct:
                 arb.set_stakes(cfg.bankroll, cfg.round_stakes, cfg.round_keep_pct)
@@ -2225,6 +2237,7 @@ class Scheduler:
         self.ended: set[str] = set()
         self.need_close: set[str] = set()  # event ids wanting a last pre-kickoff check (CLV)
         self.last_props: dict[str, float] = {}  # event id -> last prop check
+        self.bad_prop_sports: set[str] = set()  # sports whose prop request the API rejected
         self.scale = 1.0         # slow-down for live and near-kickoff checks
         self.extra_scale = 1.0   # slow-down for early/far-out checks (stretched first)
         self.forecast = 0.0      # credits the next 24h would cost at full speed
@@ -2237,8 +2250,9 @@ class Scheduler:
         """The most urgent reason to check this sport: a live game, then the soonest kickoff."""
         cfg = self.cfg
         dur = timedelta(minutes=cfg.minutes_for(sport))
-        want_live = (cfg.arb_live or (cfg.ev_enabled and cfg.ev_live)
-                     or (cfg.outliers_enabled and cfg.outlier_live))
+        want_live = ((cfg.arb_live or (cfg.ev_enabled and cfg.ev_live)
+                      or (cfg.outliers_enabled and cfg.outlier_live))
+                     and (not cfg.live_sports or sport in cfg.live_sports))
         soonest = None
         for gid, start in self.games[sport]:
             if gid in self.ended:
@@ -2352,7 +2366,7 @@ class Scheduler:
         near = timedelta(hours=cfg.prop_hours)
         early = timedelta(hours=max(cfg.prop_hours, cfg.prop_early_hours if cfg.prop_early_minutes else 0))
         return [(sport, gid, start - now <= near) for sport in cfg.prop_sports if sport in self.games
-                and cfg.prop_markets.get(sport)
+                and cfg.prop_markets.get(sport) and sport not in self.bad_prop_sports
                 for gid, start in self.games[sport] if now < start <= now + early]
 
     def _prop_games(self, now: datetime) -> list[tuple[str, str]]:
@@ -2394,7 +2408,14 @@ class Scheduler:
                 if isinstance(result, urllib.error.HTTPError):
                     if result.code in (401, 429):
                         raise result
-                    print(f"! Props error for {sport} {gid}: {result.code}", file=sys.stderr)
+                    if result.code == 422 and sport not in self.bad_prop_sports:
+                        # The API rejected the request itself (e.g. a prop type it doesn't offer
+                        # for this sport). Retrying would fail the same way, so stop asking.
+                        self.bad_prop_sports.add(sport)
+                        print(f"! Props for {sport} rejected (422): check PROP_MARKETS for it. "
+                              f"Skipping {sport} props until restart.", file=sys.stderr)
+                    else:
+                        print(f"! Props error for {sport} {gid}: {result.code}", file=sys.stderr)
                 elif isinstance(result, Exception):
                     print(f"! Props error for {sport} {gid}: {result}", file=sys.stderr)
                 elif isinstance(result, dict) and result.get("bookmakers"):

@@ -1,6 +1,8 @@
 import math
 import time
 import unittest
+import urllib.error
+from dataclasses import replace
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -129,6 +131,17 @@ class FindArbs(unittest.TestCase):
         g = guide_payload()["embeds"][0]
         for word in ("ARB", "+EV", "OUTLIER", "GONE", "skip"):
             self.assertIn(word, g["description"])
+
+    def test_live_arb_needs_fresh_prices_on_both_sides(self):
+        ev = event({
+            "A": [("h2h", [("Home", 2.10, None), ("Away", 1.80, None)])],
+            "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])],
+        }, start="2026-10-03T11:00:00Z")
+        cfg = Config(min_live_profit_pct=0, round_stakes=0)
+        self.assertEqual(len(find_arbs([ev], cfg, NOW)), 1)
+        ev["bookmakers"][1]["markets"][0]["last_update"] = (NOW - timedelta(seconds=90)).isoformat()
+        self.assertEqual(find_arbs([ev], cfg, NOW), [])                       # 90s apart: a lagging line
+        self.assertEqual(len(find_arbs([ev], replace(cfg, live_arb_max_skew=0), NOW)), 1)
 
     def test_live_arb_controls(self):
         ev = event({
@@ -1086,6 +1099,25 @@ class SchedulerState(unittest.TestCase):
         self.assertEqual(s.state("basketball_nba", NOW), PREGAME)   # skips the live game
         s.games["basketball_nba"] = [("g1", NOW - timedelta(minutes=30))]
         self.assertIsNone(s.state("basketball_nba", NOW))
+
+    def test_live_sports_switch(self):
+        cfg = Config(sports=["americanfootball_ncaaf", "icehockey_nhl"], live_sports=["icehockey_nhl"])
+        s = sched_with({"americanfootball_ncaaf": [("c1", NOW - timedelta(minutes=30))],
+                        "icehockey_nhl": [("n1", NOW - timedelta(minutes=30))]}, cfg)
+        self.assertIsNone(s.state("americanfootball_ncaaf", NOW))   # no paid live checks
+        self.assertEqual(s.state("icehockey_nhl", NOW), LIVE)
+
+    def test_rejected_props_stop(self):
+        cfg = Config(sports=["basketball_nba"])
+        s = sched_with({"basketball_nba": [("g1", NOW + timedelta(hours=1))]}, cfg)
+        class Api:
+            remaining = None
+            def event_odds(self, sport, gid, markets):
+                raise urllib.error.HTTPError("u", 422, "bad market", {}, None)
+        s.api = Api()
+        s.fetch_props([("basketball_nba", "g1")])
+        self.assertIn("basketball_nba", s.bad_prop_sports)
+        self.assertEqual(s.props_due(NOW), [])
 
     def test_pregame_off(self):
         # PREGAME_MINUTES=0 and LOOKAHEAD_HOURS=0: live games only.
