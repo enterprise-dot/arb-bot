@@ -522,7 +522,8 @@ class PlusEV(unittest.TestCase):
         h = SharpHistory(60)
         self.assertIsNone(h.record(("e", "h2h", None, "Home"), NOW, 0.50))
         self.assertAlmostEqual(h.record(("e", "h2h", None, "Home"), NOW + timedelta(minutes=20), 0.53), 3.0)
-        self.assertAlmostEqual(h.record(("e", "h2h", None, "Home"), NOW + timedelta(minutes=90), 0.53), 0.0)
+        # 90 min later both readings are over an hour old: no recent movement to report.
+        self.assertIsNone(h.record(("e", "h2h", None, "Home"), NOW + timedelta(minutes=90), 0.53))
 
     def test_history_flows_into_alerts(self):
         from arbbot import SharpHistory
