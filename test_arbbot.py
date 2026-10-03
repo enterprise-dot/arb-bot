@@ -107,6 +107,15 @@ class FindArbs(unittest.TestCase):
         [arb] = find_arbs([ev], Config(min_profit_pct=0, live_only=True), NOW)
         self.assertTrue(arb.is_live)
 
+    def test_live_arb_controls(self):
+        ev = event({
+            "A": [("h2h", [("Home", 2.02, None), ("Away", 1.90, None)])],
+            "B": [("h2h", [("Home", 1.90, None), ("Away", 2.02, None)])],
+        }, start="2026-10-03T11:00:00Z")   # live, ~1% exact edge
+        self.assertEqual(find_arbs([ev], Config(min_live_profit_pct=1.5), NOW), [])
+        self.assertEqual(len(find_arbs([ev], Config(min_live_profit_pct=0.5, round_stakes=0), NOW)), 1)
+        self.assertEqual(find_arbs([ev], Config(min_live_profit_pct=0, arb_live=False), NOW), [])
+
     def test_sharp_book_never_an_arb_leg(self):
         # Pinnacle's price would make an arb, but US bettors can't bet there.
         ev = event({
@@ -120,22 +129,36 @@ class FindArbs(unittest.TestCase):
     def test_demo_data_has_one_arb(self):
         [arb] = find_arbs(demo_events(), Config())
         self.assertEqual(arb.matchup, "New York Knicks @ Boston Celtics")
-        self.assertAlmostEqual(arb.profit_pct, 3.76, places=2)  # (1/(1/1.8+1/2.45)-1)*100
+        self.assertAlmostEqual(arb.exact_pct, 3.76, places=2)   # (1/(1/1.8+1/2.45)-1)*100
+        self.assertAlmostEqual(arb.profit_pct, 3.50, places=2)  # $57.50 / $42.50 -> $103.50
+        self.assertEqual([l.stake for l in arb.legs], [57.5, 42.5])
         self.assertEqual(len(discord_payload(arb)["embeds"][0]["fields"]), 3)
 
 
 class Stakes(unittest.TestCase):
-    def arb(self, round_to):
+    def arb(self, round_to, keep=85):
         ev = event({
             "A": [("h2h", [("Home", 2.10, None), ("Away", 1.80, None)])],
             "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])],
         })
-        return find_arbs([ev], Config(min_profit_pct=0, bankroll=100, round_stakes=round_to), NOW)[0]
+        cfg = Config(min_profit_pct=0, bankroll=100, round_stakes=round_to, round_keep_pct=keep)
+        return find_arbs([ev], cfg, NOW)[0]
 
-    def test_rounded_to_five_and_still_profitable(self):
-        arb = self.arb(5)
+    def test_rounded_to_five_when_it_keeps_enough(self):
+        arb = self.arb(5, keep=50)
         self.assertTrue(all(l.stake % 5 == 0 for l in arb.legs))
         self.assertGreater(arb.guaranteed_profit, 0)
+
+    def test_steps_down_to_keep_85_percent_of_edge(self):
+        arb = self.arb(5)   # $5 rounding here keeps only ~80% of the 6.2% edge
+        self.assertFalse(all(l.stake % 5 == 0 for l in arb.legs))
+        self.assertGreaterEqual(arb.profit_pct, 0.85 * arb.exact_pct)
+
+    def test_headline_is_edge_after_rounding(self):
+        arb = self.arb(5, keep=50)
+        self.assertLess(arb.profit_pct, arb.exact_pct)
+        self.assertAlmostEqual(arb.profit_pct, arb.guaranteed_profit / arb.total_stake * 100)
+        self.assertIn("with exact stakes", discord_payload(arb)["embeds"][0]["fields"][-1]["value"])
 
     def test_falls_back_when_rounding_kills_profit(self):
         ev = event({
@@ -156,6 +179,15 @@ class Stakes(unittest.TestCase):
         [arb] = find_arbs([ev], CFG, NOW)
         links = {l.book: l.link for l in arb.legs}
         self.assertEqual(links, {"A": "https://a.example/slip/home", "B": "https://b.example/event"})
+
+
+class LiveChannel(unittest.TestCase):
+    def test_live_arbs_use_their_own_webhook(self):
+        a = Alerter(Config(webhook_url="https://main", live_webhook_url="https://live"), dry_run=True)
+        [arb] = find_arbs(demo_events(), Config())   # the demo NBA arb is live
+        self.assertEqual(a.webhook_for(arb), "https://live")
+        arb.is_live = False
+        self.assertEqual(a.webhook_for(arb), "https://main")
 
 
 class AlerterLifecycle(unittest.TestCase):
@@ -190,8 +222,9 @@ class AlerterLifecycle(unittest.TestCase):
     def test_big_improvement_sends_fresh_alert(self):
         a = self.alerter
         a.handle(self.arbs, ["basketball_nba"], now=1000)
-        self.arbs[0].legs[0].price = 1.95   # 3.76% -> ~7.9%: jump of more than 2.5 points
+        self.arbs[0].legs[0].price = 1.95   # 3.5% -> ~7.9%: jump of more than 2.5 points
         self.arbs[0].margin = 1 / 1.95 + 1 / 2.45
+        self.arbs[0].set_stakes(100, 5)
         self.assertEqual(a.handle(self.arbs, ["basketball_nba"], now=1060), 1)
         self.assertEqual(a.handle(self.arbs, ["basketball_nba"], now=1120), 0)  # no repeat
 
@@ -467,6 +500,14 @@ class SchedulerState(unittest.TestCase):
 
     def test_game_over_after_duration(self):
         s = sched_with({"basketball_nba": [("g1", NOW - timedelta(minutes=200))]})
+        self.assertIsNone(s.state("basketball_nba", NOW))
+
+    def test_no_live_checks_when_nothing_live_is_wanted(self):
+        cfg = Config(sports=["basketball_nba"], arb_live=False, ev_live=False)
+        s = sched_with({"basketball_nba": [("g1", NOW - timedelta(minutes=30)),
+                                           ("g2", NOW + timedelta(hours=1))]}, cfg)
+        self.assertEqual(s.state("basketball_nba", NOW), PREGAME)   # skips the live game
+        s.games["basketball_nba"] = [("g1", NOW - timedelta(minutes=30))]
         self.assertIsNone(s.state("basketball_nba", NOW))
 
     def test_pregame_off(self):

@@ -101,6 +101,10 @@ class Config:
     realert_jump_pct: float = 2.5  # send a fresh alert if the edge grows by this many points
     bankroll: float = 100.0
     round_stakes: float = 5       # round stakes to this many dollars (0 = exact cents)
+    round_keep_pct: float = 85    # only use a rounding that keeps this much of the exact edge
+    arb_live: bool = True         # alert on arbs in games already in progress
+    min_live_profit_pct: float = 1.0  # live gaps are often one book lagging; ask for more
+    live_webhook_url: str = ""    # send live arbs to a separate Discord channel
     include_links: bool = True    # ask for bet-slip deep links where books support them
     discord_mention: str = ""     # e.g. @everyone or <@USER_ID> to force a phone ping
     status_webhook_url: str = ""  # health messages; defaults to the alerts webhook
@@ -157,6 +161,10 @@ class Config:
             realert_jump_pct=float(e("REALERT_JUMP_PCT", d.realert_jump_pct)),
             bankroll=float(e("BANKROLL", d.bankroll)),
             round_stakes=float(e("ROUND_STAKES", d.round_stakes)),
+            round_keep_pct=float(e("ROUND_KEEP_PCT", d.round_keep_pct)),
+            arb_live=e("ARB_LIVE", "true").lower() in ("1", "true", "yes"),
+            min_live_profit_pct=float(e("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct)),
+            live_webhook_url=e("DISCORD_LIVE_WEBHOOK_URL", ""),
             include_links=e("INCLUDE_LINKS", "true").lower() in ("1", "true", "yes"),
             discord_mention=e("DISCORD_MENTION", ""),
             status_webhook_url=e("DISCORD_STATUS_WEBHOOK_URL", ""),
@@ -229,8 +237,16 @@ class Arb:
     sport_key: str = ""
 
     @property
-    def profit_pct(self) -> float:
+    def exact_pct(self) -> float:
+        """Edge with perfectly split stakes."""
         return (1 / self.margin - 1) * 100
+
+    @property
+    def profit_pct(self) -> float:
+        """Edge for the stakes we actually print (after rounding)."""
+        if self.total_stake <= 0:
+            return self.exact_pct
+        return self.guaranteed_profit / self.total_stake * 100
 
     @property
     def key(self) -> str:
@@ -240,18 +256,21 @@ class Arb:
     def fingerprint(self) -> str:
         return self.key + "|" + ",".join(f"{l.book}@{l.price}" for l in self.legs)
 
-    def set_stakes(self, bankroll: float, round_to: float = 0) -> None:
+    def set_stakes(self, bankroll: float, round_to: float = 0, keep_pct: float = 85) -> None:
         """Split the bankroll so every outcome pays about the same.
 
         With round_to (e.g. 5), stakes are rounded to natural-looking amounts like $55
-        instead of $57.65 (exact amounts are a giveaway to books). If rounding would kill
-        the profit, it falls back to $1 rounding, then to exact cents.
+        instead of $57.65 (exact amounts are a giveaway to books). Rounding costs some edge,
+        so it steps down ($5 -> $1 -> $0.50 -> cents) until a rounding keeps at least
+        keep_pct of the exact edge.
         """
         exact = [bankroll * (1 / l.price) / self.margin for l in self.legs]
-        for unit in ([round_to, 1] if round_to > 0 else []) + [0.01]:
-            stakes = [max(unit, round(x / unit) * unit) for x in exact]
-            stakes = [round(x, 2) for x in stakes]
-            if min(st * l.price for st, l in zip(stakes, self.legs)) > sum(stakes):
+        exact_profit = bankroll * (1 / self.margin - 1)
+        units = sorted({u for u in (round_to, 1, 0.5) if 0 < u <= round_to}, reverse=True) + [0.01]
+        for unit in units:
+            stakes = [round(max(unit, round(x / unit) * unit), 2) for x in exact]
+            profit = min(st * l.price for st, l in zip(stakes, self.legs)) - sum(stakes)
+            if profit >= exact_profit * keep_pct / 100:
                 break
         for leg, st in zip(self.legs, stakes):
             leg.stake = st
@@ -367,7 +386,7 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
     for ev in events:
         start = _parse_time(ev["commence_time"])
         is_live = start <= now
-        if cfg.live_only and not is_live:
+        if (cfg.live_only and not is_live) or (is_live and not cfg.arb_live):
             continue
 
         # (market, line) -> outcome name -> best Leg
@@ -418,9 +437,11 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
                 margin=margin,
                 sport_key=ev.get("sport_key", ""),
             )
-            if cfg.min_profit_pct <= arb.profit_pct <= cfg.max_profit_pct:
-                arb.set_stakes(cfg.bankroll, cfg.round_stakes)
-                arbs.append(arb)
+            min_pct = cfg.min_live_profit_pct if is_live else cfg.min_profit_pct
+            if min_pct <= arb.exact_pct <= cfg.max_profit_pct:
+                arb.set_stakes(cfg.bankroll, cfg.round_stakes, cfg.round_keep_pct)
+                if arb.profit_pct >= min_pct:
+                    arbs.append(arb)
 
     return sorted(arbs, key=lambda a: a.profit_pct, reverse=True)
 
@@ -436,6 +457,11 @@ def _line_label(arb: Arb) -> str:
     return f" {arb.line:+g}" if arb.market == "spreads" else f" {arb.line:g}"
 
 
+def money(x: float) -> str:
+    """$58 for whole dollars, $57.50 otherwise."""
+    return f"${x:,.0f}" if abs(x - round(x)) < 0.005 else f"${x:,.2f}"
+
+
 def _fmt_secs(s: float) -> str:
     s = int(round(s))
     return f"{s}s" if s < 90 else f"{s // 60}m {s % 60:02d}s"
@@ -444,14 +470,14 @@ def _fmt_secs(s: float) -> str:
 def format_text(arb: Arb) -> str:
     status = "🔴 LIVE" if arb.is_live else f"starts {arb.commence_time}"
     rows = "\n".join(
-        f"  • {l.outcome} @ {l.price:.2f} on {l.book}  → stake ${l.stake:g}"
+        f"  • {l.outcome} @ {l.price:.2f} on {l.book}  → stake {money(l.stake)}"
         + (f"\n    {l.link}" if l.link else "")
         for l in arb.legs
     )
     return (
         f"💰 {arb.profit_pct:.2f}% ARB | {arb.sport} | {arb.matchup} ({status})\n"
         f"  {MARKET_NAMES.get(arb.market, arb.market)}{_line_label(arb)}\n{rows}\n"
-        f"  Total ${arb.total_stake:g} → returns ≥ ${arb.guaranteed_return:.2f} "
+        f"  Total {money(arb.total_stake)} → returns ≥ ${arb.guaranteed_return:.2f} "
         f"(+${arb.guaranteed_profit:.2f})"
     )
 
@@ -469,16 +495,18 @@ def discord_payload(arb: Arb, mention: str = "", gone_after: float | None = None
     fields = [
         {
             "name": f"{l.outcome} @ {l.price:.2f}",
-            "value": f"**{l.book}**\nStake **${l.stake:g}**"
+            "value": f"**{l.book}**\nStake **{money(l.stake)}**"
                      + (f"\n[Open bet slip]({l.link})" if l.link and not gone else ""),
             "inline": True,
         }
         for l in arb.legs
     ]
+    rounding = (f"\n{arb.exact_pct:.2f}% with exact stakes; rounded to look like normal bets"
+                if arb.exact_pct - arb.profit_pct >= 0.05 else "")
     fields.append({
         "name": "Result",
-        "value": f"Stake ${arb.total_stake:g} → return ≥ ${arb.guaranteed_return:.2f} "
-                 f"(**+${arb.guaranteed_profit:.2f}**)",
+        "value": f"Stake {money(arb.total_stake)} → return ≥ ${arb.guaranteed_return:.2f} "
+                 f"(**+${arb.guaranteed_profit:.2f}**){rounding}",
         "inline": False,
     })
     payload = {
@@ -532,6 +560,7 @@ class OpenArb:
     last_seen: float
     best_pct: float
     message_id: str | None = None
+    url: str = ""             # webhook the message was posted with (edits must use the same one)
     alerted_pct: float = 0.0  # edge when we last sent a (pinging) alert
 
 
@@ -604,14 +633,20 @@ class Alerter:
             "legs": "; ".join(f"{l.outcome} @{l.price} {l.book}" for l in a.legs),
         }
 
-    def _discord(self, payload: dict, message_id: str | None = None) -> str | None:
+    def webhook_for(self, item) -> str:
+        if item.is_live and self.cfg.live_webhook_url:
+            return self.cfg.live_webhook_url
+        return self.cfg.webhook_url
+
+    def _discord(self, payload: dict, message_id: str | None = None, url: str = "") -> str | None:
         if self.dry_run:
             return None
+        url = url or self.cfg.webhook_url
         try:
             if message_id:
-                _webhook(self.cfg.webhook_url, payload, "PATCH", message_id)
+                _webhook(url, payload, "PATCH", message_id)
                 return message_id
-            msg = _webhook(self.cfg.webhook_url, payload)
+            msg = _webhook(url, payload)
             return msg.get("id") if msg else None
         except Exception as e:  # keep scanning even if Discord hiccups
             print(f"  ! Discord send failed: {e}", file=sys.stderr)
@@ -629,8 +664,9 @@ class Alerter:
             cur = self.open.get(arb.key)
             if cur is None:
                 print(self.text(arb), flush=True)
-                op = OpenArb(arb, now, now, self.value(arb), alerted_pct=self.value(arb))
-                op.message_id = self._discord(self.payload(arb, self.mention(), first_seen=now))
+                op = OpenArb(arb, now, now, self.value(arb), alerted_pct=self.value(arb),
+                             url=self.webhook_for(arb))
+                op.message_id = self._discord(self.payload(arb, self.mention(), first_seen=now), url=op.url)
                 self.open[arb.key] = op
                 if self.log_on_open:
                     self._log(op, now, None)
@@ -648,13 +684,14 @@ class Alerter:
                     print(self.text(arb), flush=True)
                     if cur.message_id:
                         self._discord({"embeds": [{"title": "⬆️ Better price: see the newer alert below",
-                                                   "color": 0x95A5A6}]}, cur.message_id)
-                    cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=now))
+                                                   "color": 0x95A5A6}]}, cur.message_id, cur.url)
+                    cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=now),
+                                                   url=cur.url)
                     cur.alerted_pct = self.value(arb)
                     new += 1
                 elif changed:
                     print(f"  ↻ updated: {self.label(arb)} now {self.value(arb):.2f}%", flush=True)
-                    self._discord(self.payload(arb, first_seen=cur.first_seen), cur.message_id)
+                    self._discord(self.payload(arb, first_seen=cur.first_seen), cur.message_id, cur.url)
 
         checked = set(checked_sports) if checked_sports is not None else None
         for key in list(self.open):
@@ -669,7 +706,7 @@ class Alerter:
         lasted = now - op.first_seen  # first seen -> first check where it was gone
         print(f"  ❌ gone after {_fmt_secs(lasted)}: {self.label(op.arb)}", flush=True)
         if op.message_id:
-            self._discord(self.payload(op.arb, gone_after=lasted), op.message_id)
+            self._discord(self.payload(op.arb, gone_after=lasted), op.message_id, op.url)
         self.stats["closed"] += 1
         self.stats["open_seconds"] += lasted
         if not self.log_on_open:
@@ -758,7 +795,7 @@ class EVBet:
     @property
     def stake_label(self) -> str:
         units = f" ({self.stake / self.unit_size:.2g}u)" if self.unit_size > 0 else ""
-        return f"${self.stake:g}{units}"
+        return f"{money(self.stake)}{units}"
 
     @property
     def ev_pct(self) -> float:
@@ -1163,12 +1200,15 @@ class Scheduler:
     def state(self, sport: str, now: datetime) -> str | None:
         dur = timedelta(minutes=self.cfg.minutes_for(sport))
         soon = timedelta(hours=self.cfg.pregame_hours)
+        want_live = self.cfg.arb_live or (self.cfg.ev_enabled and self.cfg.ev_live)
         pregame = False
         for gid, start in self.games[sport]:
             if gid in self.ended:
                 continue
             if start <= now < start + dur:
-                return LIVE
+                if want_live:
+                    return LIVE
+                continue  # nothing live is wanted: don't pay to check games in progress
             if self.cfg.pregame_minutes and now < start <= now + soon:
                 pregame = True
         return PREGAME if pregame else None

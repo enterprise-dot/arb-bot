@@ -7,18 +7,21 @@ Watches odds from many sportsbooks and pings Discord about two kinds of bets:
   You don't win every bet, but you come out ahead over many of them.
 
 ```
-💰 3.76% ARB | NBA | New York Knicks @ Boston Celtics (🔴 LIVE)
+💰 3.50% ARB | NBA | New York Knicks @ Boston Celtics (🔴 LIVE)
   Moneyline
-  • Boston Celtics @ 1.80 on FanDuel  → stake $58
-  • New York Knicks @ 2.45 on DraftKings  → stake $42
-  Total $100 → returns ≥ $102.90 (+$2.90)
+  • Boston Celtics @ 1.80 on FanDuel  → stake $57.50
+  • New York Knicks @ 2.45 on DraftKings  → stake $42.50
+  Total $100 → returns ≥ $103.50 (+$3.50)
 ```
 
 **What a Discord alert does:**
 - **Pings you** the moment a gap appears. Each bet has a **tap-to-bet link** when the book provides one.
 - **Updates itself** if the prices shift while the gap is still open.
 - **Turns grey with "❌ GONE after 45s"** when the gap closes, so you know not to chase it.
-- **Uses round stakes** ($58 / $42 instead of $57.65 / $42.35), which look like normal bets to the books.
+- **Uses round stakes** ($57.50 / $42.50 instead of $57.65 / $42.35), which look like normal bets to the books.
+  The headline edge is always for the stakes printed, after rounding.
+- **Live arbs are marked 🔴 LIVE** and need a bigger edge (1%). They can go to their own channel
+  (`DISCORD_LIVE_WEBHOOK_URL`) or be turned off (`ARB_LIVE=false`).
 
 **What else you get:**
 - **`arbs.csv`:** every gap and how long it stayed open. After a week, this tells you whether you can realistically catch them.
