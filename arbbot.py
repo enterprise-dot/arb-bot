@@ -1233,6 +1233,7 @@ class EVBet:
     board: list[tuple[str, float, float, str]] = field(default_factory=list)   # every book: (book, price, EV%, link)
     hedge: list[tuple[str, str, float, str]] = field(default_factory=list)  # (outcome, book, price, link)
     hedge_pct: float = 0.0           # guaranteed profit % if the hedge is placed too
+    related: list[str] = field(default_factory=list)  # other alerts open on the same game
     confidence: str = ""             # high / medium / low
     confidence_notes: list[str] = field(default_factory=list)
     first_fair_prob: float = 0.0     # fair probability when first alerted (to show movement)
@@ -1624,6 +1625,9 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
     ]
     if len([r for r in b.board if r[2] > 0]) > 1:
         parts.append("Can't use that book? Any 🟢 book below works too, at its price.")
+    if b.related:
+        parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}. These move together, "
+                     f"so treat them as one bet, not separate ones.")
     details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}\n\n"
                f"**Fair value** {_fair_line(b)} · {b.fair_prob:.1%} to win"
                + (f"\n**{b.sharp_quotes[0][0]}** {' / '.join(odds(x) for x in b.sharp_quotes[0][1])}"
@@ -1772,6 +1776,20 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
     return sorted(out, key=lambda b: b.ev_pct, reverse=True)
 
 
+def note_related(bets: list[EVBet], *alerters: "Alerter") -> None:
+    """Tell each +EV/outlier alert about other alerts on the same game (they tend to win or lose
+    together, so they aren't independent bets)."""
+    pool = {b.key: b for b in bets}
+    for a in alerters:
+        for op in a.open.values():
+            pool.setdefault(op.arb.key, op.arb)
+    by_game: dict[str, list[EVBet]] = {}
+    for b in pool.values():
+        by_game.setdefault(b.event_id, []).append(b)
+    for b in bets:
+        b.related = [o.pick for o in by_game.get(b.event_id, []) if o.key != b.key][:3]
+
+
 def without_outliers(evs: list[EVBet], outs: list[EVBet]) -> list[EVBet]:
     """Drop +EV alerts for bets that already have an outlier alert."""
     taken = {(o.event_id, o.market, o.line, o.outcome) for o in outs}
@@ -1790,6 +1808,8 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
         f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**\n"
         f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**",
     ]
+    if b.related:
+        parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}.")
     if b.hedge:
         legs = [(b.pick, b.book, b.price, b.link)] + [(o, bk, pr, ln) for o, bk, pr, ln in b.hedge]
         margin = sum(1 / pr for _, _, pr, _ in legs)
@@ -2821,9 +2841,10 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             arbs = find_arbs(events, cfg)
             sent = alerter.handle(arbs, checked_sports=due)
             outs = find_outliers(events, cfg)
-            out_sent = out_alerter.handle(outs, checked_sports=due)
             evs = without_outliers(find_evs(events, cfg, history=sharp_history), outs)  # outliers cover those
+            note_related(evs + outs, ev_alerter, out_alerter, prop_evs, prop_outs)
             sharp_history.prune(now)
+            out_sent = out_alerter.handle(outs, checked_sports=due)
             ev_sent = ev_alerter.handle(evs, checked_sports=due)
             tracker.observe(events, now)
             tracker.finalize()
@@ -2860,9 +2881,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             prop_events = fetched_props
             checked = {gid for _, gid in prop_games}
             p_outs = find_outliers(prop_events, cfg)
+            p_evs = without_outliers(find_evs(prop_events, prop_cfg, history=sharp_history), p_outs)
+            note_related(p_evs + p_outs, ev_alerter, out_alerter, prop_evs, prop_outs)
             n_arb = prop_arbs.handle(find_arbs(prop_events, cfg), checked_events=checked)
             n_out = prop_outs.handle(p_outs, checked_events=checked)
-            n_ev = prop_evs.handle(without_outliers(find_evs(prop_events, prop_cfg, history=sharp_history), p_outs),
+            n_ev = prop_evs.handle(p_evs,
                                    checked_events=checked)
             tracker.observe(prop_events, now)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"

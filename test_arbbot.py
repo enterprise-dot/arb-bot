@@ -541,6 +541,17 @@ class PlusEV(unittest.TestCase):
         ev["sport_key"] = "americanfootball_nfl"
         self.assertEqual(len(find_evs([ev], Config(min_ev_pct=3), NOW)), 1)
 
+    def test_same_game_alerts_flagged(self):
+        from arbbot import note_related
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [ml] = find_evs([ev], EVCFG, NOW)
+        sp = replace(ml, market="spreads", line=-3.5, point=-3.5)
+        other = replace(ml, event_id="e2")
+        note_related([ml, sp, other])
+        self.assertEqual(ml.related, ["Home -3.5"])
+        self.assertEqual(other.related, [])
+        self.assertIn("Also alerted on this game: Home -3.5", ev_payload(ml)["embeds"][0]["description"])
+
     def test_payload(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
