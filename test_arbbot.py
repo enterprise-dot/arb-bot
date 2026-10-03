@@ -1,3 +1,5 @@
+import math
+import time
 import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -6,7 +8,9 @@ from arbbot import (LIVE, PREGAME, Alerter, Config, EVAlerter, OutlierAlerter, S
                     demo_events, devig, find_outliers, outlier_payload, without_outliers,
                     discord_payload, ev_payload, ev_record, find_arbs, find_evs, kelly_stake,
                     next_reset, seconds_until_active, settle, settle_pending,
-                    ClosingTracker, clv_pct, clv_record, clv_rows)
+                    ClosingTracker, clv_pct, clv_record, clv_rows,
+                    Parlay, ParlayAlerter, find_parlays, parlay_payload, market_label, append_csv,
+                    consensus_fair)
 
 NOW = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
 FRESH = NOW.isoformat().replace("+00:00", "Z")
@@ -624,6 +628,160 @@ class CLV(unittest.TestCase):
         self.assertTrue(s.closing_due("basketball_nba", NOW))
         s.last_odds["basketball_nba"] = (NOW - timedelta(minutes=0.5)).timestamp()
         self.assertFalse(s.closing_due("basketball_nba", NOW))          # already looked recently
+
+
+def prop_event(books, start="2026-10-03T18:00:00Z", market="player_points", player="LeBron James", line=25.5):
+    """books: {title: (over_price, under_price)}"""
+    ev = {"id": "p1", "sport_key": "basketball_nba", "sport_title": "NBA", "commence_time": start,
+          "home_team": "Lakers", "away_team": "Celtics", "bookmakers": []}
+    for title, (o, u) in books.items():
+        ev["bookmakers"].append({"key": title.lower(), "title": title, "last_update": FRESH, "markets": [
+            {"key": market, "last_update": FRESH, "outcomes": [
+                {"name": "Over", "description": player, "price": o, "point": line},
+                {"name": "Under", "description": player, "price": u, "point": line}]}]})
+    return ev
+
+
+class Props(unittest.TestCase):
+    def test_labels(self):
+        self.assertEqual(market_label("player_points", ("LeBron James", 25.5)), "LeBron James · Points 25.5")
+        self.assertEqual(market_label("spreads", -3.5), "Spread -3.5")
+        self.assertEqual(market_label("h2h", None), "Moneyline")
+
+    def test_prop_ev_from_pinnacle(self):
+        ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)})
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        [b] = find_evs([ev], Config().for_props(), NOW)
+        self.assertEqual(b.pick, "LeBron James Over 25.5 Points")
+        self.assertAlmostEqual(b.ev_pct, 7.5, places=1)
+        self.assertEqual(b.player, "LeBron James")
+
+    def test_players_never_mixed(self):
+        ev = prop_event({"Pinnacle": (1.91, 1.91)})
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        other = prop_event({"DK": (2.30, 1.60)}, player="Anthony Davis")["bookmakers"][0]
+        ev["bookmakers"].append(other)
+        self.assertEqual(find_evs([ev], Config().for_props(), NOW), [])
+
+    def test_consensus_when_no_sharp(self):
+        ev = prop_event({"A": (1.87, 1.95), "B": (1.91, 1.91), "C": (1.95, 1.87), "D": (1.89, 1.93),
+                         "E": (2.20, 1.68)})
+        [b] = find_evs([ev], Config().for_props(), NOW)
+        self.assertEqual((b.book, b.outcome), ("E", "Over"))
+        self.assertTrue(b.sharp_book.startswith("consensus of 5 books"))
+        self.assertEqual(find_evs([ev], Config(), NOW), [])   # main-line settings: no consensus
+        few = prop_event({"A": (1.91, 1.91), "E": (2.20, 1.68)})
+        self.assertEqual(find_evs([few], Config().for_props(), NOW), [])   # needs 4+ books
+
+    def test_prop_arb(self):
+        ev = prop_event({"A": (2.15, 1.70), "B": (1.70, 2.15)})
+        [arb] = find_arbs([ev], Config(min_profit_pct=0), NOW)
+        desc = discord_payload(arb)["embeds"][0]["description"]
+        self.assertIn("LeBron James Over 25.5", desc)
+        self.assertIn("LeBron James · Points 25.5", desc)
+
+    def test_prop_bet_ids_and_closing_line_key(self):
+        from arbbot import _bet_id, _row_line
+        row = {"event_id": "p1", "market": "player_points", "outcome": "Over", "point": "25.5",
+               "player": "LeBron James", "home_team": "Lakers"}
+        self.assertEqual(_bet_id(row), "p1|player_points|LeBron James|Over|25.5")
+        self.assertEqual(_row_line(row), ("LeBron James", 25.5))
+        old = {"event_id": "e1", "market": "h2h", "outcome": "Home", "point": ""}
+        self.assertEqual(_bet_id(old), "e1|h2h|Home|")   # unchanged for main lines
+
+    def test_csv_gains_new_columns_in_place(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            f = str(Path(d) / "log.csv")
+            append_csv(f, ["a", "b"], {"a": 1, "b": 2})
+            append_csv(f, ["a", "b", "player"], {"a": 3, "b": 4, "player": "X"})
+            lines = Path(f).read_text().splitlines()
+            self.assertEqual(lines, ["a,b,player", "1,2,", "3,4,X"])
+
+    def test_props_schedule_and_budget(self):
+        cfg = Config(sports=["basketball_nba"], prop_minutes=30, prop_hours=3)
+        s = sched_with({"basketball_nba": [("g1", NOW + timedelta(hours=2)), ("g2", NOW + timedelta(hours=5))]}, cfg)
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", "g1")])   # only inside the window
+        s.last_props["g1"] = time.time()
+        self.assertEqual(s.props_due(NOW), [])
+        self.assertEqual(cfg.prop_credits_per_call("basketball_nba"), 4)  # 4 markets, 10 books = 1 region
+        s.update_budget(NOW)
+        with_props = s.forecast
+        s.cfg = Config(sports=["basketball_nba"], props_enabled=False)
+        s.update_budget(NOW)
+        # g1 (in 2h): 2h of window left; g2 (in 5h): full 3h. (2 + 3)h x 2 checks/h x 4 credits = 40
+        self.assertAlmostEqual(with_props - s.forecast, 40, delta=2)
+
+    def test_prop_alerts_close_only_when_their_game_is_rechecked(self):
+        ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)})
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        a = EVAlerter(Config(), dry_run=True)
+        a.handle(find_evs([ev], Config().for_props(), NOW), checked_events={"p1"}, now=1000)
+        a.handle([], checked_events={"other-game"}, now=1060)
+        self.assertEqual(len(a.open), 1)
+        a.handle([], checked_events={"p1"}, now=1120)
+        self.assertEqual(len(a.open), 0)
+
+
+def ev_leg(event_id, book_prices, fair=0.5):
+    """An EVBet whose board has the given {book: price}."""
+    ev = ev_event([("Home", 1 / fair * 0.955, None), ("Away", 1 / (1 - fair) * 0.955, None)],
+                  {bk: [("Home", pr, None)] for bk, pr in book_prices.items()})
+    ev["id"] = event_id
+    ev["sport_key"] = "icehockey_nhl"
+    return find_evs([ev], Config(min_ev_pct=0.1, round_stakes=0), NOW)[0]
+
+
+class Parlays(unittest.TestCase):
+    def test_builds_same_book_different_games(self):
+        legs = [ev_leg("g1", {"DK": 2.10, "FD": 2.08}), ev_leg("g2", {"DK": 2.12}), ev_leg("g3", {"FD": 2.15})]
+        cfg = Config(parlay_min_ev_pct=5, parlay_leg_min_ev_pct=2)
+        ps = find_parlays(legs, cfg)
+        self.assertTrue(ps)
+        best = ps[0]
+        self.assertEqual(len({b.event_id for b, _, _ in best.legs}), len(best.legs))
+        self.assertTrue(all(pr == dict((r[0], r[1]) for r in b.board)[best.book] for b, pr, _ in best.legs))
+        self.assertAlmostEqual(best.price, math.prod(pr for _, pr, _ in best.legs))
+        self.assertAlmostEqual(best.ev_pct, (best.fair_prob * best.price - 1) * 100)
+
+    def test_no_same_game_and_no_reused_legs(self):
+        same = [ev_leg("g1", {"DK": 2.15}), ev_leg("g1", {"DK": 2.15})]
+        self.assertEqual(find_parlays(same, Config(parlay_min_ev_pct=1)), [])
+        legs = [ev_leg(f"g{i}", {"DK": 2.20}) for i in range(4)]
+        ps = find_parlays(legs, Config(parlay_min_ev_pct=1, parlay_max_legs=2, parlay_max_alerts=5))
+        used = [b.key for p in ps for b, _, _ in p.legs]
+        self.assertEqual(len(used), len(set(used)))
+        self.assertEqual(len(ps), 2)   # 4 legs -> two 2-leg parlays, no leg twice
+
+    def test_stake_cap_and_threshold(self):
+        legs = [ev_leg("g1", {"DK": 2.40}), ev_leg("g2", {"DK": 2.40})]
+        [p] = find_parlays(legs, Config(parlay_min_ev_pct=5, ev_bankroll=1000, parlay_max_stake_pct=1))
+        self.assertLessEqual(p.stake, 10)
+        self.assertEqual(find_parlays(legs, Config(parlay_min_ev_pct=99)), [])
+        self.assertEqual(find_parlays(legs, Config(parlays_enabled=False)), [])
+
+    def test_card_and_channel(self):
+        legs = [ev_leg("g1", {"DK": 2.40}), ev_leg("g2", {"DK": 2.40})]
+        [p] = find_parlays(legs, Config(parlay_min_ev_pct=5))
+        d = parlay_payload(p)["embeds"][0]
+        self.assertTrue(d["title"].startswith("📦 PARLAY"))
+        self.assertTrue(d["description"].startswith("👉 **DO THIS: one parlay ticket at DK.**"))
+        a = ParlayAlerter(Config(webhook_url="main", ev_webhook_url="ev"), dry_run=True)
+        self.assertEqual(a.webhook_for(p), "ev")
+        a2 = ParlayAlerter(Config(webhook_url="main", ev_webhook_url="ev", parlay_webhook_url="par"), dry_run=True)
+        self.assertEqual(a2.webhook_for(p), "par")
+
+
+class Channels(unittest.TestCase):
+    def test_routing(self):
+        cfg = Config(webhook_url="main", ev_webhook_url="ev")
+        [arb] = find_arbs(demo_events(), Config())
+        arb.is_live = False
+        self.assertEqual(Alerter(cfg, True).webhook_for(arb), "main")          # arbs stay put
+        self.assertEqual(EVAlerter(cfg, True).webhook_for(arb), "ev")
+        self.assertEqual(OutlierAlerter(cfg, True).webhook_for(arb), "ev")     # falls back to the EV channel
+        self.assertEqual(OutlierAlerter(Config(webhook_url="main", ev_webhook_url="ev",
+                                               outlier_webhook_url="out"), True).webhook_for(arb), "out")
 
 
 class ActiveHours(unittest.TestCase):

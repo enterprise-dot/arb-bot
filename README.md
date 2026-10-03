@@ -35,6 +35,27 @@ python arbbot.py --post-guide
 - **`arbs.csv`:** every gap and how long it stayed open. After a week, this tells you whether you can realistically catch them.
 - **Bot health in Discord:** 🟢 online, 🔴 crashed, ⚠️ credits running low, and a 📊 daily summary.
 
+## Channels
+
+Arbs post to `DISCORD_WEBHOOK_URL`. Set `DISCORD_EV_WEBHOOK_URL` to send +EV alerts (and props,
+outliers and parlays) to another channel; `DISCORD_OUTLIER_WEBHOOK_URL`,
+`DISCORD_PARLAY_WEBHOOK_URL` and `DISCORD_LIVE_WEBHOOK_URL` split them further.
+
+## 🎯 Player props
+
+Passing/rushing/receiving yards and receptions (NFL), points/rebounds/assists/threes (NBA), and
+points/shots/assists (NHL). Props are priced per game, so they're checked every 30 minutes in the
+3 hours before kickoff, and the budget autopilot counts them. Fair odds come from Pinnacle when it
+prices the prop, otherwise from the median of at least 4 books, and the minimum edge is 7%. Props
+appear as +EV, arb and outlier alerts. They're tracked for CLV but not graded win/loss (that needs
+player stats).
+
+## 📦 Parlays
+
+Built from the +EV bets open right now: 2-3 legs from different games at the same book, where each
+leg is +EV there. Parlay EV is the legs' edges multiplied together, so two 5% legs make a ~10%
+parlay. Stakes are capped at 1% of `EV_BANKROLL` because parlays swing a lot.
+
 ## 🚨 Outliers
 
 ```
