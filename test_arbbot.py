@@ -347,10 +347,44 @@ class PlusEV(unittest.TestCase):
         capped = Config(round_stakes=0, ev_bankroll=1000, kelly_fraction=1, ev_max_stake_pct=3)
         self.assertEqual(kelly_stake(0.6, 2.10, capped), 30.0)
 
+    def test_american_odds(self):
+        from arbbot import american
+        self.assertEqual(american(2.52), "+152")
+        self.assertEqual(american(1.65), "-154")
+        self.assertEqual(american(2.0), "+100")
+        self.assertEqual(american(1.909), "-110")
+
+    def test_sharp_quotes_and_board(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"B": [("Home", 2.10, None)], "C": [("Home", 1.95, None)], "D": [("Home", 1.80, None)]})
+        [b] = find_evs([ev], EVCFG, NOW)
+        self.assertEqual(b.sharp_quotes, [("Pinnacle", [1.91, 1.91])])
+        self.assertEqual([r[0] for r in b.board], ["B", "C", "D"])   # every book, best price first
+        self.assertAlmostEqual(b.board[2][2], (0.5 * 1.80 - 1) * 100)  # negative EV shown too
+        fields = {f["name"]: f["value"] for f in ev_payload(b)["embeds"][0]["fields"]}
+        self.assertIn("-110 / -110", fields["Sharp prices (this side / other side)"])
+        self.assertIn("+110", fields["Every book on this bet"])
+
+    def test_fair_movement_carried(self):
+        ev1 = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        ev2 = ev_event([("Home", 1.87, None), ("Away", 1.95, None)], {"B": [("Home", 2.20, None)]})
+        [b1], [b2] = find_evs([ev1], EVCFG, NOW), find_evs([ev2], EVCFG, NOW)
+        a = EVAlerter(EVCFG, dry_run=True)
+        a.handle([b1], now=1000)
+        a.handle([b2], now=1060)
+        cur = a.open[b2.key].arb
+        self.assertAlmostEqual(cur.first_fair_prob, 0.5)
+        self.assertIn("→", ev_payload(cur)["embeds"][0]["fields"][1]["value"])
+
+    def test_feed_freshness(self):
+        from arbbot import feed_freshness
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
+        self.assertIn("pre-game: half of prices under 0s", feed_freshness([ev], NOW))
+
     def test_payload(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
-        self.assertIn("+5.0% EV: Home ML @ 2.10 (B)", ev_payload(b)["embeds"][0]["title"])
+        self.assertIn("+5.0% EV: Home ML +110 (B)", ev_payload(b)["embeds"][0]["title"])
         self.assertTrue(ev_payload(b, gone_after=30)["embeds"][0]["title"].startswith("❌ GONE"))
 
 
@@ -395,7 +429,7 @@ class EVLifecycle(unittest.TestCase):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]},
                       start=start)
         ev["sport_key"] = "basketball_nba"
-        [b] = find_evs([ev], Config(min_ev_pct=3, max_age_seconds=10**9),
+        [b] = find_evs([ev], Config(min_ev_pct=3, max_age_seconds=10**9, pregame_max_age_seconds=10**9),
                        _parse(start) - timedelta(hours=1))
         a = EVAlerter(self.cfg, dry_run=True)
         a.handle([b], ["basketball_nba"], now=1000)   # logged right away

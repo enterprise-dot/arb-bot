@@ -9,8 +9,8 @@ Watches odds from many sportsbooks and pings Discord about two kinds of bets:
 ```
 💰 3.50% ARB | NBA | New York Knicks @ Boston Celtics (🔴 LIVE)
   Moneyline
-  • Boston Celtics @ 1.80 on FanDuel  → stake $57.50
-  • New York Knicks @ 2.45 on DraftKings  → stake $42.50
+  • Boston Celtics -125 on FanDuel  → stake $57.50
+  • New York Knicks +145 on DraftKings  → stake $42.50
   Total $100 → returns ≥ $103.50 (+$3.50)
 ```
 
@@ -31,9 +31,13 @@ Watches odds from many sportsbooks and pings Discord about two kinds of bets:
 
 ```
 📈 +5.4% EV | NHL | Bruins @ Rangers (starts 7:00 PM)
-  Bruins ML @ 2.45 on DraftKings  → stake $10
-  Fair odds 2.32 (Pinnacle no-vig)
+  Bruins ML +145 on DraftKings  → stake $10
+  Fair +132 → +130 (43.5%, Pinnacle no-vig, 1/1 sources)
+  Sharp: Pinnacle +125 / -145
 ```
+
+Each +EV card in Discord shows Pinnacle's prices on both sides, how the fair price has moved
+since the first alert, and a table of every book's price and edge on that bet.
 
 **How it works:** Pinnacle takes big bettors and keeps a thin margin, so its lines are the
 market's best guess at the real odds. The bot removes Pinnacle's margin (the "vig") to get each

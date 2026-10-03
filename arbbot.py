@@ -114,6 +114,7 @@ class Config:
     low_credits: int = 5000       # warn on Discord below this many credits
     log_file: str = "arbs.csv"    # every arb with how long it lasted ("" = off)
     summary_hour: int = 9         # local hour for the daily Discord summary (-1 = off)
+    odds_format: str = "american"  # "american" (+152 / -154) or "decimal" (2.52)
     # +EV
     ev_enabled: bool = True
     bet_at_sharp: bool = False      # true only if you can actually bet at the sharp book
@@ -174,6 +175,7 @@ class Config:
             low_credits=int(e("LOW_CREDITS", d.low_credits)),
             log_file=e("LOG_FILE", d.log_file),
             summary_hour=int(e("SUMMARY_HOUR", d.summary_hour)),
+            odds_format=e("ODDS_FORMAT", d.odds_format).strip().lower(),
             ev_enabled=e("EV_ENABLED", "true").lower() in ("1", "true", "yes"),
             sharp_books=e("SHARP_BOOKS", d.sharp_books),
             sharp_weights={k.strip(): float(v) for k, v in
@@ -460,6 +462,20 @@ def _line_label(arb: Arb) -> str:
     return f" {arb.line:+g}" if arb.market == "spreads" else f" {arb.line:g}"
 
 
+ODDS_FORMAT = "american"  # set from ODDS_FORMAT in .env at startup
+
+
+def american(dec: float) -> str:
+    """2.52 -> +152, 1.65 -> -154."""
+    if dec >= 2:
+        return f"+{round((dec - 1) * 100)}"
+    return f"-{round(100 / (dec - 1))}"
+
+
+def odds(dec: float) -> str:
+    return american(dec) if ODDS_FORMAT == "american" else f"{dec:.2f}"
+
+
 def money(x: float) -> str:
     """$58 for whole dollars, $57.50 otherwise."""
     return f"${x:,.0f}" if abs(x - round(x)) < 0.005 else f"${x:,.2f}"
@@ -473,7 +489,7 @@ def _fmt_secs(s: float) -> str:
 def format_text(arb: Arb) -> str:
     status = "🔴 LIVE" if arb.is_live else f"starts {arb.commence_time}"
     rows = "\n".join(
-        f"  • {l.outcome} @ {l.price:.2f} on {l.book}  → stake {money(l.stake)}"
+        f"  • {l.outcome} {odds(l.price)} on {l.book}  → stake {money(l.stake)}"
         + (f"\n    {l.link}" if l.link else "")
         for l in arb.legs
     )
@@ -497,7 +513,7 @@ def discord_payload(arb: Arb, mention: str = "", gone_after: float | None = None
     seen = f" · first seen <t:{int(first_seen)}:R>" if first_seen and not gone else ""
     fields = [
         {
-            "name": f"{l.outcome} @ {l.price:.2f}",
+            "name": f"{l.outcome} {odds(l.price)}",
             "value": f"**{l.book}**\nStake **{money(l.stake)}**"
                      + (f"\n[Open bet slip]({l.link})" if l.link and not gone else ""),
             "inline": True,
@@ -624,6 +640,9 @@ class Alerter:
     def mention(self) -> str:
         return self.cfg.discord_mention
 
+    def carry(self, old, new) -> None:
+        """Copy anything from the previous sighting the new one should remember."""
+
     def log_path(self) -> str:
         return self.cfg.log_file
 
@@ -679,6 +698,7 @@ class Alerter:
                 new += 1
             else:
                 changed = cur.arb.fingerprint != arb.fingerprint
+                self.carry(cur.arb, arb)
                 cur.arb, cur.last_seen = arb, now
                 cur.best_pct = max(cur.best_pct, self.value(arb))
                 if self.value(arb) >= cur.alerted_pct + self.cfg.realert_jump_pct:
@@ -794,6 +814,10 @@ class EVBet:
     sources_used: int = 1
     sources_total: int = 1
     unit_size: float = 0.0
+    sharp_quotes: list[tuple[str, list[float]]] = field(default_factory=list)  # (book, [this side, other side(s)])
+    board: list[tuple[str, float, float]] = field(default_factory=list)        # every book: (book, price, EV%)
+    first_fair_prob: float = 0.0     # fair probability when first alerted (to show movement)
+    first_sharp_quotes: list[tuple[str, list[float]]] = field(default_factory=list)
 
     @property
     def stake_label(self) -> str:
@@ -873,7 +897,8 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
             continue
         books = {bm["key"]: bm for bm in ev.get("bookmakers", [])}
 
-        # Each sharp book's no-vig probabilities, per line.
+        # Each sharp book's no-vig probabilities, per line (and its raw prices, for display).
+        raw_src: dict[tuple, dict[str, dict[str, float]]] = {}
         per_src: dict[tuple, dict[str, dict[str, float]]] = {}
         titles: dict[str, str] = {}
         for sk in sharp:
@@ -893,6 +918,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
                 for k, outs in groups.items():
                     if len(outs) >= 2:
                         names = list(outs)
+                        raw_src.setdefault(k, {})[sk] = outs
                         per_src.setdefault(k, {})[sk] = dict(
                             zip(names, devig([outs[n] for n in names], cfg.devig_method)))
 
@@ -913,8 +939,9 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
             sharp_name[k] = " + ".join(titles[sk] for sk in same)
             n_used[k] = len(same)
 
-        # Every soft-book price that beats fair by enough.
+        # Every soft-book price that beats fair by enough (and every price, for the board).
         offers: dict[tuple, list[tuple[float, str, str, float | None]]] = {}
+        boards: dict[tuple, list[tuple[str, float, float]]] = {}
         for key, bm in books.items():
             if key in sharp or (allowed and key not in allowed):
                 continue
@@ -925,9 +952,12 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
                     k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
                     p = fair.get(k, {}).get(oc["name"])
                     price = float(oc.get("price") or 0)
-                    if p is None or price <= 1.0 or price > cfg.ev_max_odds:
+                    if p is None or price <= 1.0:
                         continue
                     ev_pct = (p * price - 1) * 100
+                    boards.setdefault((k, oc["name"]), []).append((bm.get("title", key), price, ev_pct))
+                    if price > cfg.ev_max_odds:
+                        continue
                     if cfg.min_ev_pct <= ev_pct <= cfg.max_ev_pct:
                         link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
                         offers.setdefault((k, oc["name"]), []).append(
@@ -946,6 +976,9 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
                 fair_prob=fair[k][name], sharp_book=sharp_name[k], n_outcomes=len(fair[k]),
                 also=[(b, pr) for pr, b, _, _ in lst[1:]],
                 sources_used=n_used[k], sources_total=len(sharp), unit_size=cfg.unit_size,
+                sharp_quotes=[(titles[sk], [outs[name]] + [pr for n, pr in outs.items() if n != name])
+                              for sk, outs in raw_src.get(k, {}).items() if name in outs],
+                board=sorted(boards.get((k, name), []), key=lambda r: r[1], reverse=True),
             )
             # Fewer references -> less certainty -> smaller bet (the edge itself isn't changed).
             mult = cfg.single_source_stake if len(sharp) > 1 and n_used[k] == 1 else 1.0
@@ -955,37 +988,61 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
     return sorted(out, key=lambda b: b.ev_pct, reverse=True)
 
 
+def _quotes(quotes: list[tuple[str, list[float]]]) -> str:
+    return "; ".join(f"{bk} {' / '.join(odds(x) for x in prs)}" for bk, prs in quotes)
+
+
+def _fair_line(b: EVBet) -> str:
+    """'+140' or '+142 → +140 (-0.9%)' when the fair price moved since the first alert."""
+    now = odds(b.fair_odds)
+    if b.first_fair_prob and abs(b.first_fair_prob - b.fair_prob) > 1e-6:
+        change = (b.fair_prob / b.first_fair_prob - 1) * 100
+        return f"{odds(1 / b.first_fair_prob)} → {now} ({change:+.1f}% win chance)"
+    return now
+
+
+def _board(b: EVBet, rows: int = 12) -> str:
+    lines = [f"{bk[:14]:<14} {odds(pr):>6} {ev:+5.1f}%" for bk, pr, ev in b.board[:rows]]
+    return "```\n" + "\n".join(lines) + "\n```" if lines else ""
+
+
 def format_ev_text(b: EVBet) -> str:
     status = "🔴 LIVE" if b.is_live else f"starts {b.commence_time}"
-    also = f"\n  Also +EV at: {', '.join(f'{bk} {pr:.2f}' for bk, pr in b.also)}" if b.also else ""
+    also = f"\n  Also +EV at: {', '.join(f'{bk} {odds(pr)}' for bk, pr in b.also)}" if b.also else ""
+    sharp = f"\n  Sharp: {_quotes(b.sharp_quotes)}" if b.sharp_quotes else ""
     return (
         f"📈 +{b.ev_pct:.1f}% EV | {b.sport} | {b.matchup} ({status})\n"
-        f"  {b.pick} @ {b.price:.2f} on {b.book}  → stake {b.stake_label}"
+        f"  {b.pick} {odds(b.price)} on {b.book}  → stake {b.stake_label}"
         + (f"\n    {b.link}" if b.link else "")
-        + f"\n  Fair odds {b.fair_odds:.2f} ({b.sharp_book} no-vig, "
-          f"{b.sources_used}/{b.sources_total} sources){also}"
+        + f"\n  Fair {_fair_line(b)} ({b.fair_prob:.1%}, {b.sharp_book} no-vig, "
+          f"{b.sources_used}/{b.sources_total} sources){sharp}{also}"
     )
 
 
 def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
                first_seen: float | None = None) -> dict:
     gone = gone_after is not None
-    title = f"📈 +{b.ev_pct:.1f}% EV: {b.pick} @ {b.price:.2f} ({b.book})"
+    title = f"📈 +{b.ev_pct:.1f}% EV: {b.pick} {odds(b.price)} ({b.book})"
     if gone:
         title = f"❌ GONE after {_fmt_secs(gone_after)} · ~~+{b.ev_pct:.1f}%~~ {b.pick} ({b.book})"
     when = ("🔴 **LIVE**" if b.is_live
             else f"starts <t:{int(_parse_time(b.commence_time).timestamp())}:R>")
     seen = f" · first seen <t:{int(first_seen)}:R>" if first_seen and not gone else ""
     fields = [
-        {"name": "Bet", "value": f"**{b.pick} @ {b.price:.2f}**\n{b.book}"
+        {"name": "Bet", "value": f"**{b.pick} {odds(b.price)}**\n{b.book}"
                                  + (f"\n[Open bet slip]({b.link})" if b.link and not gone else ""), "inline": True},
-        {"name": "Fair odds", "value": f"{b.fair_odds:.2f} ({b.fair_prob:.1%})\n{b.sharp_book} no-vig"
+        {"name": "Fair odds", "value": f"**{_fair_line(b)}**\n{b.fair_prob:.1%} win chance"
                                        f"\nSources {b.sources_used}/{b.sources_total}", "inline": True},
         {"name": "Stake", "value": f"**{b.stake_label}**\nKelly-sized", "inline": True},
     ]
-    if b.also:
-        fields.append({"name": "Also +EV at",
-                       "value": ", ".join(f"{bk} {pr:.2f}" for bk, pr in b.also)[:1000], "inline": False})
+    if b.sharp_quotes:
+        moved = ""
+        if b.first_sharp_quotes and b.first_sharp_quotes != b.sharp_quotes:
+            moved = f"\nwas {_quotes(b.first_sharp_quotes)}"
+        fields.append({"name": "Sharp prices (this side / other side)",
+                       "value": (_quotes(b.sharp_quotes) + moved)[:1000], "inline": False})
+    if b.board and not gone:
+        fields.append({"name": "Every book on this bet", "value": _board(b)[:1020], "inline": False})
     payload = {
         "username": "Arb Bot",
         "embeds": [{
@@ -1028,6 +1085,10 @@ class EVAlerter(Alerter):
 
     def mention(self) -> str:
         return self.cfg.ev_mention
+
+    def carry(self, old, new) -> None:
+        new.first_fair_prob = old.first_fair_prob or old.fair_prob
+        new.first_sharp_quotes = old.first_sharp_quotes or old.sharp_quotes
 
     def log_path(self) -> str:
         return self.cfg.ev_log_file
@@ -1323,6 +1384,26 @@ class Scheduler:
 
 # --------------------------------------------------------------------------- main loop
 
+def feed_freshness(events: list[dict], now: datetime | None = None) -> str:
+    """How old the feed's prices are, split by live and pre-game games."""
+    now = now or datetime.now(timezone.utc)
+    ages: dict[str, list[float]] = {"live": [], "pre-game": []}
+    for ev in events:
+        group = "live" if _parse_time(ev["commence_time"]) <= now else "pre-game"
+        for bm in ev.get("bookmakers", []):
+            for mkt in bm.get("markets", []):
+                ts = mkt.get("last_update") or bm.get("last_update")
+                if ts:
+                    ages[group].append(max(0.0, (now - _parse_time(ts)).total_seconds()))
+    parts = []
+    for group, xs in ages.items():
+        if xs:
+            xs.sort()
+            mid, p90 = xs[len(xs) // 2], xs[min(len(xs) - 1, int(len(xs) * 0.9))]
+            parts.append(f"{group}: half of prices under {_fmt_secs(mid)} old, 90% under {_fmt_secs(p90)}")
+    return "; ".join(parts) or "no prices"
+
+
 def demo_events() -> list[dict]:
     """Sample data with one planted arb, re-stamped as fresh so it passes the age filter."""
     data = json.loads((HERE / "sample_odds.json").read_text())
@@ -1473,6 +1554,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             seen_books = {bm["key"] for ev in events for bm in ev.get("bookmakers", [])}
             if args.once:
                 wanted = set(_csv(cfg.bookmakers))
+                print(f"Feed freshness: {feed_freshness(events)}")
                 print(f"Books in the feed: {', '.join(sorted(seen_books)) or 'none'}")
                 if wanted - seen_books:
                     print(f"Not in the feed right now (check the key spelling): "
@@ -1510,6 +1592,8 @@ def main() -> None:
     args = p.parse_args()
 
     cfg = Config.from_env()
+    global ODDS_FORMAT
+    ODDS_FORMAT = cfg.odds_format
 
     if args.test_discord:
         if not cfg.webhook_url:
