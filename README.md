@@ -87,6 +87,20 @@ the other side elsewhere locks in a profit, the alert shows that hedge with stak
 Books can cancel bets on obvious pricing errors ("palpable errors"), and the bigger the gap,
 the more likely that is. Bet fast, and expect the occasional void.
 
+## How it keeps bets good
+
+- **Confidence on every +EV bet** (🟢 High / 🟡 Medium / 🟠 Low), from how tight Pinnacle's own
+  market is, whether the other books agree with Pinnacle, how close kickoff is, and whether the
+  edge is believable. Stakes scale 100% / 75% / 50%. `MIN_CONFIDENCE=medium` drops the low ones.
+- **Shaky prices are skipped**: a wide Pinnacle market (over 8% margin, 12% for props), or Pinnacle
+  and the rest of the market 10+ points apart (one of them is stale).
+- **Live arbs need both prices fresh**: priced within 60 seconds of each other, or it's usually
+  just one book lagging.
+- **CLV tracking** shows whether the bets beat the closing line, broken down by bet type, market,
+  book, sport and confidence (`--results`, and the daily summary card).
+- **Restarts don't repeat alerts**: open alerts are remembered, so an update edits the existing
+  cards instead of posting them again.
+
 ## +EV bets
 
 ```

@@ -237,7 +237,10 @@ Open the console the same way (Droplet → Access → Launch Droplet Console), t
 | Is it running? | `systemctl status arbbot` (look for "active (running)", press Q to exit) |
 | Stop it | `systemctl stop arbbot` |
 | Start it | `systemctl start arbbot` |
-| Change settings | `nano /opt/arb-bot/.env`, save, then `systemctl restart arbbot` |
+| Change a setting | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --set NAME=value`, then `systemctl restart arbbot` |
+| Connect a Discord channel | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --set-webhook ev` (paste the URL when asked) |
+| See sample alerts | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --test-discord` |
+| Post the how-to guide | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --post-guide` |
 | +EV win/loss record | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --results` |
 | Get the latest code | `cd /opt/arb-bot && sudo -u arbbot git pull && systemctl restart arbbot` |
 | See the arb log | `cat /opt/arb-bot/arbs.csv` |

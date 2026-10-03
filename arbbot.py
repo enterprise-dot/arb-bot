@@ -2508,6 +2508,7 @@ Bet **every** side shown, each at the book listed, using the exact amounts. You 
 
 📈 **+EV** (blue)
 Bet **one** side at the book shown, for the amount shown. It's a better price than it should be, but it won't win every time. It pays off over many bets.
+Each one has a **confidence**: 🟢 High, 🟡 Medium or 🟠 Low. Lower confidence already means a smaller stake. When unsure, skip the 🟠 ones.
 
 🚨 **OUTLIER** (orange, pings everyone)
 One book's price is way off from all the others. Bet it fast, before they fix it.
