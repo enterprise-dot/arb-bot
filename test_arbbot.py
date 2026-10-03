@@ -122,9 +122,12 @@ class FindArbs(unittest.TestCase):
 
     def test_arb_skip_lines(self):
         [arb] = find_arbs(demo_events(), Config())
-        worst = arb.worst_ok_price(0)          # Celtics leg, Knicks unchanged at 2.45
-        self.assertAlmostEqual(1 / worst + 1 / 2.45, 1 / 1.005)
+        worst = arb.worst_ok_price(0)          # Celtics leg, with the stakes as printed
+        # At the skip-line price, the printed Celtics stake still returns total + 0.5%.
+        self.assertAlmostEqual(worst * arb.legs[0].stake, arb.total_stake * 1.005)
         self.assertLess(worst, arb.legs[0].price)
+        arb.legs[0].stake = 10                 # a stake that can't cover the total at any lower price
+        self.assertIsNone(arb.worst_ok_price(0))
 
     def test_guide(self):
         from arbbot import guide_payload
@@ -171,7 +174,7 @@ class FindArbs(unittest.TestCase):
         desc = discord_payload(arb)["embeds"][0]["description"]
         self.assertTrue(desc.startswith("👉 **DO THIS NOW: place BOTH bets."))
         self.assertIn("1️⃣ Open **FanDuel** → bet **$57.50** on **Boston Celtics -125**", desc)
-        self.assertIn("skip if the price is worse than -142", desc)
+        self.assertIn("skip if the price is worse than -134", desc)
         self.assertIn("get back at least **$103.50**", desc)
 
 
@@ -428,6 +431,18 @@ class PlusEV(unittest.TestCase):
         self.assertEqual(kelly_stake(0.5, 2.10, Config(round_stakes=5, ev_bankroll=1000)), 10.0)
         capped = Config(round_stakes=0, ev_bankroll=1000, kelly_fraction=1, ev_max_stake_pct=3)
         self.assertEqual(kelly_stake(0.6, 2.10, capped), 30.0)
+        # Lower confidence shrinks the capped stake too (cap first, then the multiplier).
+        self.assertEqual(kelly_stake(0.6, 2.10, capped, mult=0.5), 15.0)
+        # Rounding never goes over the cap: $24 cap rounds down to $20, not up to $25.
+        odd_cap = Config(round_stakes=5, ev_bankroll=1000, kelly_fraction=1, ev_max_stake_pct=2.4)
+        self.assertEqual(kelly_stake(0.6, 2.10, odd_cap), 20.0)
+
+    def test_fingerprint_tracks_what_the_card_shows(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
+        [b] = find_evs([ev], EVCFG, NOW)
+        self.assertNotEqual(b.fingerprint, replace(b, fair_prob=b.fair_prob + 0.01).fingerprint)
+        self.assertNotEqual(b.fingerprint, replace(b, stake=b.stake + 5).fingerprint)
+        self.assertEqual(b.fingerprint, replace(b).fingerprint)
 
     def test_american_odds(self):
         from arbbot import american
@@ -1155,6 +1170,14 @@ class Credits(unittest.TestCase):
         self.assertEqual(next_reset(cfg, NOW).date().isoformat(), "2026-11-01")
         dec = datetime(2026, 12, 20, tzinfo=timezone.utc)
         self.assertEqual(next_reset(cfg, dec).date().isoformat(), "2027-01-01")
+        # Day 29-31 lands on the last day of shorter months, and still moves forward after it.
+        late = Config(billing_day=31)
+        nov = datetime(2026, 11, 5, tzinfo=timezone.utc)
+        self.assertEqual(next_reset(late, nov).date().isoformat(), "2026-11-30")
+        self.assertEqual(next_reset(late, datetime(2027, 1, 31, 1, tzinfo=timezone.utc)).date().isoformat(),
+                         "2027-02-28")
+        self.assertEqual(next_reset(Config(billing_day=30), datetime(2027, 2, 10, tzinfo=timezone.utc))
+                         .date().isoformat(), "2027-02-28")
 
 
 class SchedulerState(unittest.TestCase):
@@ -1243,7 +1266,7 @@ class Budget(unittest.TestCase):
         # (3000 left - 2% cushion) / days until reset. Early checks stretch to the cap first,
         # then live checks slow just enough to fit.
         self.assertGreater(s.scale, 1)
-        self.assertEqual(s.extra_scale, cfg.extra_max_stretch)
+        self.assertAlmostEqual(s.extra_scale, cfg.extra_max_stretch)
         spend = s.core_demand / s.scale + s.extra_demand / s.extra_scale
         self.assertAlmostEqual(spend, s.allowance, delta=1)
         self.assertGreater(s.interval(LIVE), 60)
@@ -1270,6 +1293,18 @@ class Budget(unittest.TestCase):
         self.assertGreater(s.extra_scale, cfg.extra_max_stretch)
         spend = s.core_demand / s.scale + s.extra_demand / s.extra_scale
         self.assertAlmostEqual(spend, s.allowance, delta=1)
+
+    def test_stretch_below_one_is_treated_as_one(self):
+        # EXTRA_MAX_STRETCH=0.5 would mean "check early games MORE often"; clamp it so the
+        # budget still balances.
+        cfg = Config(sports=["basketball_nba", "icehockey_nhl"], props_enabled=False, early_minutes=1,
+                     extra_max_stretch=0.5)
+        s = sched_with({"basketball_nba": [("g1", NOW)],
+                        "icehockey_nhl": [("h1", NOW + timedelta(hours=20))]}, cfg, remaining=31 * 1500)
+        s.update_budget(NOW)
+        self.assertGreaterEqual(s.extra_scale, 1.0)
+        spend = s.core_demand / s.scale + s.extra_demand / s.extra_scale
+        self.assertLessEqual(spend, s.allowance + 1)
 
     def test_weekends_get_more_credits(self):
         s = sched_with({"basketball_nba": []}, remaining=60_000)

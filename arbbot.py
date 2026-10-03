@@ -23,6 +23,7 @@ Standard library only. Run `python arbbot.py --help`.
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import gzip
 import itertools
@@ -62,7 +63,7 @@ CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 # ALERT_MODE=locks floors: only alerts worth acting on.
 LOCKS = {
-    "arb_pct": 2.0, "live_arb_pct": 3.0, "arb_dollars": 5.0,   # $2+ per $100 staked, guaranteed
+    "arb_pct": 2.0, "live_arb_pct": 3.0, "arb_dollars": 0.0,   # $2+ per $100 staked, guaranteed
     "ev_pct": 5.0, "prop_ev_pct": 8.0, "min_confidence": "high",
     "outlier_pct": 15.0, "parlay_ev_pct": 15.0, "parlay_legs": 2,
     "ev_per_hour": 6, "prop_per_hour": 6, "parlay_per_hour": 2,
@@ -515,9 +516,14 @@ class Arb:
             leg.stake = st
 
     def worst_ok_price(self, i: int, keep_pct: float = 0.5) -> float | None:
-        """Lowest price leg i can drop to (others unchanged) and still lock in keep_pct profit."""
-        room = 1 / (1 + keep_pct / 100) - sum(1 / l.price for j, l in enumerate(self.legs) if j != i)
-        return 1 / room if room > 0 else None
+        """Lowest price leg i can drop to and still lock in keep_pct profit, betting the printed
+        stakes (the other legs unchanged). If leg i wins it must pay back the whole total."""
+        leg = self.legs[i]
+        if leg.stake <= 0 or self.total_stake <= 0:  # stakes not set yet: assume a re-split
+            room = 1 / (1 + keep_pct / 100) - sum(1 / l.price for j, l in enumerate(self.legs) if j != i)
+            return 1 / room if room > 0 else None
+        worst = self.total_stake * (1 + keep_pct / 100) / leg.stake
+        return worst if worst < leg.price else None
 
     @property
     def total_stake(self) -> float:
@@ -1318,7 +1324,9 @@ class EVBet:
 
     @property
     def fingerprint(self) -> str:
-        return f"{self.key}|{self.book}@{self.price}"
+        """Everything on the card that can change; a different value means the card gets edited."""
+        hedge = ",".join(f"{o}:{bk}@{pr}" for o, bk, pr, _ in self.hedge)
+        return f"{self.key}|{self.book}@{self.price}|{self.fair_prob:.3f}|{self.stake}|{hedge}"
 
     @property
     def pick(self) -> str:
@@ -1359,12 +1367,18 @@ def devig(prices: list[float], method: str = "multiplicative") -> list[float]:
 
 
 def kelly_stake(fair_prob: float, price: float, cfg: Config, mult: float = 1.0) -> float:
+    """Fractional Kelly, capped at EV_MAX_STAKE_PCT of EV_BANKROLL, then scaled by mult
+    (confidence, single source) so smaller-confidence bets are smaller even at the cap."""
     edge = (fair_prob * price - 1) / (price - 1)
-    stake = cfg.ev_bankroll * cfg.kelly_fraction * max(0.0, edge) * mult
-    stake = min(stake, cfg.ev_bankroll * cfg.ev_max_stake_pct / 100)
+    cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
+    stake = min(cfg.ev_bankroll * cfg.kelly_fraction * max(0.0, edge), cap) * mult
     if cfg.round_stakes > 0 and stake >= cfg.round_stakes:
-        return float(round(stake / cfg.round_stakes) * cfg.round_stakes)
-    return float(round(stake)) if stake >= 1 else round(stake, 2)
+        r = round(stake / cfg.round_stakes) * cfg.round_stakes
+        if r > cap:
+            r = math.floor(cap / cfg.round_stakes) * cfg.round_stakes
+        return float(r)
+    r = float(round(stake)) if stake >= 1 else round(stake, 2)
+    return min(r, float(math.floor(cap)) if cap >= 1 else round(cap, 2))
 
 
 def sharp_fair(ev: dict, cfg: Config, now: datetime, is_live: bool):
@@ -1949,7 +1963,8 @@ class Parlay:
 
     @property
     def fingerprint(self) -> str:
-        return self.key + "|" + ",".join(f"{pr}" for _, pr, _ in self.legs)
+        legs = ",".join(f"{pr}:{b.fair_prob:.3f}" for b, pr, _ in self.legs)
+        return f"{self.key}|{legs}|{self.stake}"
 
     @property
     def stake_label(self) -> str:
@@ -2341,12 +2356,15 @@ def seconds_until_active(cfg: Config, now: datetime | None = None) -> float:
 
 
 def next_reset(cfg: Config, now: datetime) -> datetime:
-    """When the plan's credits next reset (BILLING_DAY at midnight UTC)."""
-    day = min(cfg.billing_day, 28)
-    cand = now.replace(day=day, hour=0, minute=0, second=0, microsecond=0)
+    """When the plan's credits next reset (BILLING_DAY at midnight UTC; the 31st means the
+    last day of shorter months)."""
+    def at(y: int, m: int) -> datetime:
+        day = max(1, min(cfg.billing_day, calendar.monthrange(y, m)[1]))
+        return now.replace(year=y, month=m, day=day, hour=0, minute=0, second=0, microsecond=0)
+    cand = at(now.year, now.month)
     if cand <= now:
         y, m = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
-        cand = cand.replace(year=y, month=m)
+        cand = at(y, m)
     return cand
 
 
@@ -2471,7 +2489,7 @@ class Scheduler:
             extra += STEP * early
         self.forecast = core + extra
         self.core_demand, self.extra_demand = core, extra
-        a, cap = self.allowance, self.cfg.extra_max_stretch
+        a, cap = self.allowance, max(1.0, self.cfg.extra_max_stretch)
         if a <= 0:
             self.scale = self.extra_scale = math.inf
         elif core + extra <= a:
@@ -2481,12 +2499,9 @@ class Scheduler:
         else:
             # Early checks at their max stretch; live/near-kickoff get the rest, never less
             # than half the budget (if needed, early checks stretch further to make room).
-            self.extra_scale = cap
-            room = a - extra / cap
-            if room < a / 2:
-                room = a / 2
-                self.extra_scale = extra / (a - room) if extra else cap
-            self.scale = max(1.0, core / room)
+            room = max(a - extra / cap, min(a / 2, core))
+            self.extra_scale = extra / (a - room) if extra and a > room else cap
+            self.scale = max(1.0, core / room) if room > 0 else 1.0
         self.budget_at = time.time()
 
     def _prop_tiers(self, now: datetime) -> list[tuple[str, str, bool]]:
