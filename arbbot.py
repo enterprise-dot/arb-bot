@@ -2464,12 +2464,17 @@ def main() -> None:
             sys.exit("Set DISCORD_WEBHOOK_URL in .env first.")
         events = demo_events()
         arb = find_arbs(events, cfg)[0]
-        samples = [discord_payload(arb)] + [ev_payload(b) for b in find_evs(events, cfg)[:1]] \
-            + [outlier_payload(o) for o in find_outliers(events, cfg)[:1]]
-        for payload in samples:
+        cfg.bad_webhooks()
+        ev_url = cfg.ev_webhook_url or cfg.webhook_url
+        samples = [(discord_payload(arb), cfg.webhook_url, "arb")] \
+            + [(ev_payload(b), ev_url, "+EV") for b in find_evs(events, cfg)[:1]] \
+            + [(outlier_payload(o), cfg.outlier_webhook_url or ev_url, "outlier") for o in find_outliers(events, cfg)[:1]]
+        ids = []
+        for payload, url, kind in samples:  # each to the channel real alerts of that kind use
             payload["embeds"][0]["footer"] = {"text": "SAMPLE ALERT (made-up prices, don't bet)"}
-        ids = [(_webhook(cfg.webhook_url, payload) or {}).get("id") for payload in samples]
-        print(f"Sent {len(samples)} sample alerts (arb, +EV, outlier). In 5 seconds the arb turns 'GONE'...")
+            ids.append((_webhook(url, payload) or {}).get("id"))
+            print(f"  sent the {kind} sample to {'the main channel' if url == cfg.webhook_url else 'its own channel'}")
+        print(f"Sent {len(samples)} sample alerts. In 5 seconds the arb turns 'GONE'...")
         time.sleep(5)
         if ids and ids[0]:
             _webhook(cfg.webhook_url, discord_payload(arb, gone_after=5), "PATCH", ids[0])
