@@ -140,6 +140,7 @@ class Config:
     # BOOKMAKERS is used for reference (true odds, market consensus). Empty = all of them.
     my_books: str = ""
     kalshi_fee_rate: float = 0.07   # Kalshi's trading fee factor (fee = rate x P x (1-P) per $1 contract)
+    us_state: str = ""              # two letters (e.g. nj); some books' links need it (sports.{state}.betmgm.com)
     poll_seconds: int = 60        # fastest check rate for sports with live games
     pregame_minutes: int = 15     # check rate before kickoff (0 = live games only)
     pregame_hours: float = 2.0    # how far before kickoff pre-game checks start
@@ -241,6 +242,7 @@ class Config:
             bookmakers=e("BOOKMAKERS", d.bookmakers),
             my_books=e("MY_BOOKS", ""),
             kalshi_fee_rate=float(e("KALSHI_FEE_RATE", d.kalshi_fee_rate)),
+            us_state=e("US_STATE", "").strip().lower(),
             poll_seconds=int(e("POLL_SECONDS", d.poll_seconds)),
             pregame_minutes=int(e("PREGAME_MINUTES", d.pregame_minutes)),
             pregame_hours=float(e("PREGAME_HOURS", d.pregame_hours)),
@@ -546,11 +548,27 @@ def is_fresh(mkt: dict, bm: dict, now: datetime, live: bool, cfg: Config,
     return (now - _parse_time(updated)).total_seconds() <= limit
 
 
+def _fill_links(obj: dict, state: str) -> None:
+    """Some books' links are per-state templates (sports.{state}.betmgm.com). Fill in US_STATE,
+    or drop the link if it isn't set (a broken link is worse than none)."""
+    link = obj.get("link")
+    if link and "{state}" in link:
+        obj["link"] = link.replace("{state}", state) if state else ""
+
+
 def apply_fees(events: list[dict], cfg: Config) -> list[dict]:
-    """Lower exchange prices by their trading fee, so every comparison uses what you'd really get.
+    """Prepare fresh feed data: fill in per-state links, and lower exchange prices by their
+    trading fee so every comparison uses what you'd really get.
 
     Kalshi: a contract costs P and pays $1; the fee is rate x P x (1 - P) on top, so the real
     decimal odds are 1 / (P + fee)."""
+    for ev in events:
+        for bm in ev.get("bookmakers", []):
+            _fill_links(bm, cfg.us_state)
+            for mkt in bm.get("markets", []):
+                _fill_links(mkt, cfg.us_state)
+                for oc in mkt.get("outcomes", []):
+                    _fill_links(oc, cfg.us_state)
     rate = cfg.kalshi_fee_rate
     if rate <= 0:
         return events

@@ -837,6 +837,23 @@ class MyBooks(unittest.TestCase):
         self.assertEqual(o.sources_used, 4)                   # but all books still set the market price
 
 
+class StateLinks(unittest.TestCase):
+    def ev(self):
+        e = event({"BetMGM": [("h2h", [("Home", 2.0, None), ("Away", 2.0, None)])]})
+        e["bookmakers"][0]["markets"][0]["outcomes"][0]["link"] = "https://sports.{state}.betmgm.com/x?o=1"
+        return e
+
+    def test_state_filled_in(self):
+        from arbbot import apply_fees
+        e = apply_fees([self.ev()], Config(us_state="nj"))[0]
+        self.assertEqual(e["bookmakers"][0]["markets"][0]["outcomes"][0]["link"], "https://sports.nj.betmgm.com/x?o=1")
+
+    def test_dropped_without_state(self):
+        from arbbot import apply_fees
+        e = apply_fees([self.ev()], Config())[0]
+        self.assertEqual(e["bookmakers"][0]["markets"][0]["outcomes"][0]["link"], "")
+
+
 class KalshiFees(unittest.TestCase):
     def kalshi_event(self, price):
         ev = event({"Kalshi": [("h2h", [("Home", price, None), ("Away", 2.0, None)])]})
