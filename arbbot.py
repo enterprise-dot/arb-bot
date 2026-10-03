@@ -182,6 +182,11 @@ class Config:
     sharp_disagree_pct: float = 3.0  # skip a line if two sharps' fair odds differ by more (points)
     single_source_stake: float = 0.5  # stake multiplier when only 1 of several sharps priced it
     devig_method: str = "power"     # "power" (handles long-shot bias) or "multiplicative"
+    # Bet-quality checks on +EV
+    max_sharp_hold_pct: float = 8.0       # skip if the sharp's own margin is wider than this
+    sharp_consensus_max_gap: float = 10.0  # skip if sharp and the other books' median differ by more (points)
+    min_confidence: str = "low"           # low / medium / high: alert only at or above this
+    confidence_stakes: str = "1,0.75,0.5"  # stake multiplier for high, medium, low
     unit_size: float = 0            # dollars per unit; > 0 shows stakes in units too
     ev_books: str = ""              # only alert for these books ("" = every non-sharp book)
     min_ev_pct: float = 4.0
@@ -284,6 +289,10 @@ class Config:
             sharp_disagree_pct=float(e("SHARP_DISAGREE_PCT", d.sharp_disagree_pct)),
             single_source_stake=float(e("SINGLE_SOURCE_STAKE", d.single_source_stake)),
             devig_method=e("DEVIG_METHOD", d.devig_method).strip().lower(),
+            max_sharp_hold_pct=float(e("MAX_SHARP_HOLD_PCT", d.max_sharp_hold_pct)),
+            sharp_consensus_max_gap=float(e("SHARP_CONSENSUS_MAX_GAP", d.sharp_consensus_max_gap)),
+            min_confidence=e("MIN_CONFIDENCE", d.min_confidence).strip().lower(),
+            confidence_stakes=e("CONFIDENCE_STAKES", d.confidence_stakes),
             unit_size=float(e("UNIT_SIZE", d.unit_size)),
             bet_at_sharp=e("BET_AT_SHARP", "false").lower() in ("1", "true", "yes"),
             ev_books=e("EV_BOOKS", ""),
@@ -361,8 +370,9 @@ class Config:
         return len(_csv(self.prop_markets.get(sport, ""))) * regions
 
     def for_props(self) -> "Config":
-        """The same settings with the prop thresholds swapped in."""
-        return replace(self, min_ev_pct=self.prop_min_ev_pct, consensus_min_books=self.prop_min_books)
+        """The same settings with the prop thresholds swapped in (prop markets carry more margin)."""
+        return replace(self, min_ev_pct=self.prop_min_ev_pct, consensus_min_books=self.prop_min_books,
+                       max_sharp_hold_pct=self.max_sharp_hold_pct + 4)
 
     def minutes_for(self, sport: str) -> int:
         if sport in self.game_minutes:
@@ -1115,6 +1125,8 @@ class EVBet:
     board: list[tuple[str, float, float, str]] = field(default_factory=list)   # every book: (book, price, EV%, link)
     hedge: list[tuple[str, str, float, str]] = field(default_factory=list)  # (outcome, book, price, link)
     hedge_pct: float = 0.0           # guaranteed profit % if the hedge is placed too
+    confidence: str = ""             # high / medium / low
+    confidence_notes: list[str] = field(default_factory=list)
     first_fair_prob: float = 0.0     # fair probability when first alerted (to show movement)
     first_sharp_quotes: list[tuple[str, list[float]]] = field(default_factory=list)
 
@@ -1279,6 +1291,45 @@ def consensus_fair(ev: dict, cfg: Config, now: datetime, is_live: bool, skip: se
     return out
 
 
+CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
+CONFIDENCE_BADGE = {"high": "🟢 High", "medium": "🟡 Medium", "low": "🟠 Low"}
+
+
+def rate_confidence(hold: float | None, gap: float | None, hours_to_start: float, ev_pct: float,
+                    prop: bool) -> tuple[str, list[str]]:
+    """How much to trust a +EV price. Points for: a tight sharp market, the other books agreeing
+    with the sharp, a game close enough that the sharp line has matured, and a believable edge."""
+    pts, notes = 0, []
+    tight, ok = (6.5, 9.0) if prop else (3.5, 6.0)
+    if hold is None:
+        pts += 1
+    elif hold <= tight:
+        pts += 2
+        notes.append(f"tight sharp market ({hold:.1f}% margin)")
+    elif hold <= ok:
+        pts += 1
+    else:
+        notes.append(f"wide sharp market ({hold:.1f}% margin)")
+    if gap is None:
+        pts += 1
+    elif gap <= 3:
+        pts += 2
+        notes.append("other books agree")
+    elif gap <= 6:
+        pts += 1
+    else:
+        notes.append(f"other books disagree by {gap:.0f} pts")
+    if hours_to_start <= 12:
+        pts += 1
+    else:
+        notes.append("early line (less tested)")
+    if ev_pct <= 12:
+        pts += 1
+    else:
+        notes.append("unusually big edge, double-check it")
+    return ("high" if pts >= 5 else "medium" if pts >= 3 else "low"), notes
+
+
 def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> list[EVBet]:
     if not cfg.ev_enabled:
         return []
@@ -1295,6 +1346,12 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
 
         fair, sharp_name, n_used, raw_src, titles = sharp_fair(ev, cfg, now, is_live)
         n_total = {k: len(sharp) for k in fair}
+        # The rest of the market, as a sanity check on the sharp's price.
+        market = consensus_fair(ev, replace(cfg, consensus_min_books=3), now, is_live, set(sharp))
+        holds = {}
+        for k, srcs in raw_src.items():
+            first = next(iter(srcs.values()))
+            holds[k] = (sum(1 / x for x in first.values()) - 1) * 100
         if cfg.consensus_min_books:
             for k, (probs, n) in consensus_fair(ev, cfg, now, is_live, set(sharp)).items():
                 if k not in fair:
@@ -1342,8 +1399,24 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
                               for sk, outs in raw_src.get(k, {}).items() if name in outs],
                 board=sorted(boards.get((k, name), []), key=lambda r: r[1], reverse=True),
             )
-            # Fewer references -> less certainty -> smaller bet (the edge itself isn't changed).
+            # Quality checks: skip prices whose fair value is shaky, rate the rest.
+            from_sharp = not sharp_name[k].startswith("consensus")
+            hold = holds.get(k) if from_sharp else None
+            gap = None
+            if from_sharp and k in market and name in market[k][0]:
+                gap = abs(market[k][0][name] - bet.fair_prob) * 100
+            if hold is not None and hold > cfg.max_sharp_hold_pct:
+                continue
+            if gap is not None and gap > cfg.sharp_consensus_max_gap:
+                continue  # sharp and market far apart: one side is stale, can't trust either
+            hours = (_parse_time(ev["commence_time"]) - now).total_seconds() / 3600
+            bet.confidence, bet.confidence_notes = rate_confidence(hold, gap, hours, bet.ev_pct, is_prop(k[1]))
+            if CONFIDENCE_ORDER[bet.confidence] < CONFIDENCE_ORDER.get(cfg.min_confidence, 0):
+                continue
+            # Less certainty -> smaller bet (the edge itself isn't changed).
             mult = cfg.single_source_stake if n_total[k] > 1 and n_used[k] == 1 else 1.0
+            stakes = [float(x) for x in _csv(cfg.confidence_stakes)] or [1, 1, 1]
+            mult *= dict(zip(("high", "medium", "low"), stakes + [1] * 3)).get(bet.confidence, 1)
             bet.stake = kelly_stake(bet.fair_prob, bet.price, cfg, mult)
             out.append(bet)
 
@@ -1378,6 +1451,8 @@ def format_ev_text(b: EVBet) -> str:
         + (f"\n    {b.link}" if b.link else "")
         + f"\n  Fair {_fair_line(b)} ({b.fair_prob:.1%}, {b.sharp_book} no-vig, "
           f"{b.sources_used}/{b.sources_total} sources){sharp}{also}"
+        + (f"\n  Confidence: {b.confidence}" + (f" ({', '.join(b.confidence_notes)})" if b.confidence_notes else "")
+           if b.confidence else "")
     )
 
 
@@ -1400,7 +1475,9 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
     parts = [
         f"👉 **DO THIS: bet this ONE side.** Good value, but it won't win every time.\n\n"
         f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**\n"
-        f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**",
+        f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**"
+        + (f"\nConfidence: **{CONFIDENCE_BADGE[b.confidence]}**"
+           + (f" · {', '.join(b.confidence_notes)}" if b.confidence_notes else "") if b.confidence else ""),
     ]
     if len([r for r in b.board if r[2] > 0]) > 1:
         parts.append("Can't use that book? Any 🟢 book below works too, at its price.")
@@ -1420,7 +1497,7 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
 
 EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
                  "home_team", "away_team", "commence_time", "live", "market", "outcome", "point",
-                 "n_outcomes", "book", "price", "fair_odds", "best_ev_pct", "stake", "player"]
+                 "n_outcomes", "book", "price", "fair_odds", "best_ev_pct", "stake", "player", "confidence"]
 
 
 class EVAlerter(Alerter):
@@ -1462,6 +1539,7 @@ class EVAlerter(Alerter):
             "point": "" if b.point is None else b.point, "n_outcomes": b.n_outcomes,
             "book": b.book, "price": b.price, "fair_odds": round(b.fair_odds, 3),
             "best_ev_pct": round(b.ev_pct, 2), "stake": b.stake, "player": b.player,
+            "confidence": b.confidence,
         }
 
 

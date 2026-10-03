@@ -276,7 +276,7 @@ def ev_event(sharp, books, start="2026-10-03T18:00:00Z", market="h2h"):
     return ev
 
 
-EVCFG = Config(min_ev_pct=3, round_stakes=0, ev_bankroll=1000, kelly_fraction=0.25)
+EVCFG = Config(min_ev_pct=3, round_stakes=0, ev_bankroll=1000, kelly_fraction=0.25, confidence_stakes="1,1,1")
 
 
 class PlusEV(unittest.TestCase):
@@ -322,7 +322,7 @@ class PlusEV(unittest.TestCase):
 
     def test_single_source_stake_cut(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
-        both = Config(min_ev_pct=3, round_stakes=0, sharp_books="pinnacle,betfair_ex_eu")
+        both = Config(min_ev_pct=3, round_stakes=0, sharp_books="pinnacle,betfair_ex_eu", confidence_stakes="1,1,1")
         [b] = find_evs([ev], both, NOW)
         self.assertEqual((b.sources_used, b.sources_total), (1, 2))
         self.assertEqual(b.stake, 6.0)   # half of the 11.4 one-sharp stake, rounded
@@ -330,7 +330,7 @@ class PlusEV(unittest.TestCase):
 
     def test_units_label(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
-        [b] = find_evs([ev], Config(min_ev_pct=3, round_stakes=0, unit_size=10), NOW)
+        [b] = find_evs([ev], Config(min_ev_pct=3, round_stakes=0, unit_size=10, confidence_stakes="1,1,1"), NOW)
         self.assertEqual(b.stake_label, "$11 (1.1u)")
 
     def test_finds_price_above_fair(self):
@@ -419,6 +419,43 @@ class PlusEV(unittest.TestCase):
         from arbbot import feed_freshness
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         self.assertIn("pre-game: half of prices under 0s", feed_freshness([ev], NOW))
+
+    def test_confidence_rating(self):
+        from arbbot import rate_confidence
+        self.assertEqual(rate_confidence(2.5, 1.0, 3, 5, False)[0], "high")
+        self.assertEqual(rate_confidence(5.0, 4.0, 3, 5, False)[0], "medium")
+        low, notes = rate_confidence(7.5, 8.0, 30, 15, False)
+        self.assertEqual(low, "low")
+        self.assertTrue(any("disagree" in n for n in notes))
+        self.assertEqual(rate_confidence(6.0, None, 3, 5, True)[0], "high")   # props allow more margin
+
+    def market_event(self, pin, others, soft=2.20):
+        books = {"Pinnacle": [("h2h", pin)], "Soft": [("h2h", [("Home", soft, None)])]}
+        for i, (h, a) in enumerate(others):
+            books[f"B{i}"] = [("h2h", [("Home", h, None), ("Away", a, None)])]
+        ev = event(books)
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        return ev
+
+    def test_skips_wide_sharp_market(self):
+        ev = self.market_event([("Home", 1.80, None), ("Away", 1.80, None)], [])   # 11% margin
+        self.assertEqual(find_evs([ev], Config(min_ev_pct=3), NOW), [])
+
+    def test_skips_when_market_disagrees_with_sharp(self):
+        # Pinnacle says 50/50; three other books all say Home ~67%: Pinnacle is probably stale.
+        ev = self.market_event([("Home", 1.97, None), ("Away", 1.97, None)],
+                               [(1.45, 2.85), (1.47, 2.80), (1.46, 2.82)])
+        self.assertEqual(find_evs([ev], Config(min_ev_pct=3, max_ev_pct=100), NOW), [])
+
+    def test_confidence_scales_stake_and_shows(self):
+        ev = self.market_event([("Home", 1.97, None), ("Away", 1.97, None)],
+                               [(1.95, 1.95), (1.96, 1.94), (1.94, 1.96)])
+        [b] = find_evs([ev], Config(min_ev_pct=3, round_stakes=0), NOW)
+        self.assertEqual(b.confidence, "high")
+        self.assertIn("Confidence: **🟢 High**", ev_payload(b)["embeds"][0]["description"])
+        lowcfg = Config(min_ev_pct=3, round_stakes=0, min_confidence="high")
+        wide = self.market_event([("Home", 1.88, None), ("Away", 1.88, None)], [])     # ~6.4% margin
+        self.assertEqual(find_evs([wide], lowcfg, NOW), [])
 
     def test_payload(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
