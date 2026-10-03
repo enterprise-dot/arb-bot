@@ -133,7 +133,10 @@ class FindArbs(unittest.TestCase):
         self.assertAlmostEqual(arb.exact_pct, 3.76, places=2)   # (1/(1/1.8+1/2.45)-1)*100
         self.assertAlmostEqual(arb.profit_pct, 3.50, places=2)  # $57.50 / $42.50 -> $103.50
         self.assertEqual([l.stake for l in arb.legs], [57.5, 42.5])
-        self.assertEqual(len(discord_payload(arb)["embeds"][0]["fields"]), 3)
+        desc = discord_payload(arb)["embeds"][0]["description"]
+        self.assertIn("**1. Boston Celtics -125**", desc)
+        self.assertIn("Bet **$57.50** at FanDuel", desc)
+        self.assertIn("get back at least $103.50", desc)
 
 
 class Stakes(unittest.TestCase):
@@ -159,7 +162,7 @@ class Stakes(unittest.TestCase):
         arb = self.arb(5, keep=50)
         self.assertLess(arb.profit_pct, arb.exact_pct)
         self.assertAlmostEqual(arb.profit_pct, arb.guaranteed_profit / arb.total_stake * 100)
-        self.assertIn("with exact stakes", discord_payload(arb)["embeds"][0]["fields"][-1]["value"])
+        self.assertIn("with exact stakes", discord_payload(arb)["embeds"][0]["description"])
 
     def test_falls_back_when_rounding_kills_profit(self):
         ev = event({
@@ -362,9 +365,21 @@ class PlusEV(unittest.TestCase):
         self.assertEqual(b.sharp_quotes, [("Pinnacle", [1.91, 1.91])])
         self.assertEqual([r[0] for r in b.board], ["B", "C", "D"])   # every book, best price first
         self.assertAlmostEqual(b.board[2][2], (0.5 * 1.80 - 1) * 100)  # negative EV shown too
-        fields = {f["name"]: f["value"] for f in ev_payload(b)["embeds"][0]["fields"]}
-        self.assertIn("-110 / -110", fields["Sharp prices (this side / other side)"])
-        self.assertIn("+110", fields["Every book on this bet"])
+        desc = ev_payload(b)["embeds"][0]["description"]
+        self.assertIn("**Pinnacle** -110 / -110", desc)
+        self.assertIn("🟢 B — **+110** · +5.0%", desc)
+        self.assertIn("⚪ D — **-125**", desc)
+
+    def test_every_book_row_links_to_its_bet(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"B": [("Home", 2.10, None)], "C": [("Home", 1.95, None)]})
+        ev["bookmakers"][1]["markets"][0]["outcomes"][0]["link"] = "https://b.example/slip"
+        ev["bookmakers"][2]["link"] = "https://c.example/game"
+        [b] = find_evs([ev], EVCFG, NOW)
+        p = ev_payload(b)["embeds"][0]
+        self.assertEqual(p["url"], "https://b.example/slip")              # title opens the best bet
+        self.assertIn("[B](https://b.example/slip) — **+110**", p["description"])
+        self.assertIn("[C](https://c.example/game) — **-105**", p["description"])
 
     def test_fair_movement_carried(self):
         ev1 = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
@@ -375,7 +390,7 @@ class PlusEV(unittest.TestCase):
         a.handle([b2], now=1060)
         cur = a.open[b2.key].arb
         self.assertAlmostEqual(cur.first_fair_prob, 0.5)
-        self.assertIn("→", ev_payload(cur)["embeds"][0]["fields"][1]["value"])
+        self.assertIn("→", ev_payload(cur)["embeds"][0]["description"])
 
     def test_feed_freshness(self):
         from arbbot import feed_freshness
@@ -385,7 +400,7 @@ class PlusEV(unittest.TestCase):
     def test_payload(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
-        self.assertIn("+5.0% EV: Home ML +110 (B)", ev_payload(b)["embeds"][0]["title"])
+        self.assertEqual("📈 +5.0% EV · Home ML +110 at B", ev_payload(b)["embeds"][0]["title"])
         self.assertTrue(ev_payload(b, gone_after=30)["embeds"][0]["title"].startswith("❌ GONE"))
 
 
@@ -486,7 +501,7 @@ class Outliers(unittest.TestCase):
         self.assertAlmostEqual(outs[0].hedge_pct, (1 / (1 / 1.85 + 1 / 4.00) - 1) * 100)
         title = outlier_payload(outs[0])["embeds"][0]["title"]
         self.assertTrue(title.startswith("🚨 OUTLIER"))
-        self.assertTrue(any("Lock it in" in f["name"] for f in outlier_payload(outs[0])["embeds"][0]["fields"]))
+        self.assertIn("lock in +", outlier_payload(outs[0])["embeds"][0]["description"])
 
     def test_needs_enough_books_and_edge(self):
         ev = outlier_event(1.30, 3.60)                     # only slightly off: not an outlier
