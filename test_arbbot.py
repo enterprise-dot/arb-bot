@@ -123,8 +123,11 @@ class FindArbs(unittest.TestCase):
     def test_arb_skip_lines(self):
         [arb] = find_arbs(demo_events(), Config())
         worst = arb.worst_ok_price(0)          # Celtics leg, with the stakes as printed
-        # At the skip-line price, the printed Celtics stake still returns total + 0.5%.
-        self.assertAlmostEqual(worst * arb.legs[0].stake, arb.total_stake * 1.005)
+        # At the skip-line price, the printed Celtics stake still returns total + 0.5%, rounded
+        # up to a price the card can show (-133, not -134, which would keep less).
+        exact = arb.total_stake * 1.005 / arb.legs[0].stake
+        self.assertGreaterEqual(worst, exact - 1e-9)
+        self.assertLess(worst - exact, 0.01)
         self.assertLess(worst, arb.legs[0].price)
         arb.legs[0].stake = 10                 # a stake that can't cover the total at any lower price
         self.assertIsNone(arb.worst_ok_price(0))
@@ -174,7 +177,7 @@ class FindArbs(unittest.TestCase):
         desc = discord_payload(arb)["embeds"][0]["description"]
         self.assertTrue(desc.startswith("👉 **DO THIS NOW: place BOTH bets."))
         self.assertIn("1️⃣ Open **FanDuel** → bet **$57.50** on **Boston Celtics -125**", desc)
-        self.assertIn("skip if the price is worse than -134", desc)
+        self.assertIn("skip if the price is worse than -133", desc)
         self.assertIn("get back at least **$103.50**", desc)
 
 
@@ -1750,7 +1753,7 @@ class BetResults(unittest.TestCase):
         self.log_ev("g1")
         res = Results(self.cfg, dry_run=False)
         sent = []
-        res.send = lambda payload: sent.append(payload["embeds"][0])
+        res.send = lambda payload: sent.append(payload["embeds"][0]) or True
         api = self.scores({"g1": (4, 2)})
         self.assertEqual(res.run(api, self.LATER), 1)
         self.assertTrue(sent[0]["title"].startswith("📋 1 result in · 1-0"))
@@ -1762,7 +1765,7 @@ class BetResults(unittest.TestCase):
         self.assertIn("❌", sent[-1]["description"])
         # After a restart nothing is re-posted.
         again = Results(self.cfg, dry_run=False)
-        again.send = lambda payload: sent.append(payload["embeds"][0])
+        again.send = lambda payload: sent.append(payload["embeds"][0]) or True
         self.assertEqual(again.run(api, self.LATER), 0)
 
     def test_first_run_does_not_flood_old_results(self):
@@ -1779,7 +1782,7 @@ class BetResults(unittest.TestCase):
         self.log_ev("g1")
         res = Results(self.cfg, dry_run=False)
         sent = []
-        res.send = lambda payload: sent.append(payload["embeds"][0])
+        res.send = lambda payload: sent.append(payload["embeds"][0]) or True
         res.daily(self.scores({"g1": (4, 2)}), date(2026, 10, 3), self.LATER)
         self.assertTrue(sent[0]["title"].startswith("📅 Results for Sat Oct 3 · 1-0"))
         self.assertEqual(res.run(self.scores({}), self.LATER), 0)           # not posted again one by one
@@ -1948,11 +1951,14 @@ class ReviewFixes(unittest.TestCase):
         ev = event({"A": [("h2h", [("Home", 2.02, None), ("Away", 1.80, None)])],
                     "B": [("h2h", [("Home", 1.80, None), ("Away", 1.995, None)])]})
         [arb] = find_arbs([ev], Config(alert_mode="balanced", min_profit_pct=0.3, bankroll=100), NOW)
+        from arbbot import american
         for i, leg in enumerate(arb.legs):
             worst = arb.worst_ok_price(i)
             self.assertIsNotNone(worst)
-            self.assertLess(worst, leg.price)
-            self.assertGreaterEqual(worst * leg.stake, arb.total_stake - 0.01)   # never a losing line
+            self.assertLessEqual(worst, leg.price)
+            a = int(american(worst))                                    # the line as the card prints it
+            shown = 1 + a / 100 if a > 0 else 1 + 100 / -a
+            self.assertGreaterEqual(shown * leg.stake, arb.total_stake - 1e-6)   # never a losing line
 
     def test_stake_rounding_corner_cases(self):
         from arbbot import round_stake
@@ -2010,6 +2016,225 @@ class ReviewFixes(unittest.TestCase):
             self.assertNotIn("BANKROLL", os.environ)
         problem, _ = check_settings({"MY_BOOKS": "fanduel", "BANKROLL": "abc"})
         self.assertTrue(problem.startswith("BANKROLL"))
+
+
+class ResultsReviewFixes(unittest.TestCase):
+    """Issues found by the independent review of the results channel."""
+    START, LATER = BetResults.START, BetResults.LATER
+    setUp, tearDown, scores = BetResults.setUp, BetResults.tearDown, BetResults.scores
+    log_ev, log_parlay = BetResults.log_ev, BetResults.log_parlay
+
+    def test_parlay_realerted_at_a_new_price_counts_once(self):
+        legs = [ev_leg("g1", {"DK": 2.20}), ev_leg("g2", {"DK": 2.20})]
+        cfg = Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1)
+        a = ParlayAlerter(self.cfg, dry_run=True)
+        a.handle(find_parlays(legs, cfg), now=1000)
+        a.handle([], now=1060)                                           # gone...
+        legs[0].board = [(bk, 2.25, ev, ln, ok) for bk, _, ev, ln, ok in legs[0].board]
+        a.handle(find_parlays(legs, cfg), now=1120)                      # ...back at a new price
+        self.assertEqual(len(Path(self.cfg.parlay_log_file).read_text().splitlines()), 3)
+        rows = settle_pending(self.cfg, self.scores({"g1": (1, 3)}), self.LATER)
+        self.assertEqual([r["result"] for r in rows], ["loss"])          # one ticket, one result
+
+    def test_parlay_graded_when_its_last_game_ends(self):
+        from arbbot import Results
+        early = ev_leg("g1", {"DK": 2.20})
+        early.sport_key = "soccer_epl"                                   # ends tonight
+        late = ev_leg("g2", {"DK": 2.20})
+        late.commence_time = "2026-10-04T18:00:00Z"                      # ends tomorrow night
+        for b in (early, late):
+            EVAlerter(self.cfg, dry_run=True).handle([b], now=1000)
+        [p] = find_parlays([early, late], Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1))
+        ParlayAlerter(self.cfg, dry_run=True).handle([p], now=1000)
+        games = {"g1": ("soccer_epl", datetime(2026, 10, 3, 20, 0, tzinfo=timezone.utc)),
+                 "g2": ("icehockey_nhl", datetime(2026, 10, 4, 21, 0, tzinfo=timezone.utc))}
+        clock = [None]
+        class Api:   # a game is final only once it's over, and only in its own sport's scores
+            calls = []
+            def scores(self, sport, days_from=3):
+                Api.calls.append(sport)
+                return [{"id": gid, "completed": True,
+                         "scores": [{"name": "Home", "score": "3"}, {"name": "Away", "score": "1"}]}
+                        for gid, (sp, over) in games.items() if sp == sport and over <= clock[0]]
+        res = Results(self.cfg, dry_run=False)
+        res.send = lambda payload: True
+        t = datetime(2026, 10, 3, 22, 0, tzinfo=timezone.utc)
+        while t < datetime(2026, 10, 5, 6, 0, tzinfo=timezone.utc):      # every 30 minutes
+            clock[0] = t
+            res.run(Api(), t)
+            t += timedelta(minutes=30)
+        graded = sorted((r["kind"], r["result"]) for r in _read(self.cfg.ev_results_file))
+        self.assertEqual(graded, [("ev", "win"), ("ev", "win"), ("parlay", "win")])
+        self.assertLessEqual(len(Api.calls), 4)                          # not every 30 minutes
+
+    def test_parlay_with_a_prop_leg_loses_on_its_main_leg(self):
+        from arbbot import day_bets, day_summary
+        from datetime import date
+        ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)}, start=self.START)
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        [prop] = find_evs([ev], self.cfg.for_props(), NOW)
+        main = ev_leg("g1", {"DK": 2.20})
+        [p] = find_parlays([main, prop], Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1))
+        ParlayAlerter(self.cfg, dry_run=True).handle([p], now=1000)
+        before = day_summary(day_bets(self.cfg, date(2026, 10, 3)))
+        self.assertIn("1 parlay with a prop leg", before)
+        self.assertNotIn("prop to check", before)
+        [row] = settle_pending(self.cfg, self.scores({"g1": (1, 4)}), self.LATER)
+        self.assertEqual(row["result"], "loss")
+        self.assertEqual(ev_record(self.cfg, kinds=("parlay",)), "no graded bets yet")  # wins can't be graded
+        rows = day_bets(self.cfg, date(2026, 10, 3))
+        self.assertEqual(rows[0]["result"], "loss")
+
+    def test_command_line_post_is_not_repeated_by_the_bot(self):
+        from arbbot import Results
+        from datetime import date
+        self.log_ev("g1")
+        service = Results(self.cfg, dry_run=False)
+        service.send = lambda payload: self.fail("posted twice")
+        settle_pending(self.cfg, self.scores({"g1": (4, 2)}), self.LATER)
+        cli = Results(self.cfg, dry_run=False)
+        cli.send = lambda payload: True
+        self.assertTrue(cli.recap(date(2026, 10, 3), self.LATER))
+        self.assertEqual(service.run(self.scores({}), self.LATER), 0)
+
+    def test_failed_post_is_tried_again(self):
+        from arbbot import Results
+        self.log_ev("g1")
+        res = Results(self.cfg, dry_run=False)
+        replies = [False, True]
+        res.send = lambda payload: replies.pop(0)
+        api = self.scores({"g1": (4, 2)})
+        self.assertEqual(res.run(api, self.LATER), 0)
+        self.assertEqual(res.run(api, self.LATER), 1)
+        self.assertEqual(replies, [])
+
+    def test_recap_survives_a_restart(self):
+        from arbbot import Results
+        from datetime import date
+        self.log_ev("g1")
+        res = Results(self.cfg, dry_run=False)
+        res.send = lambda payload: True
+        self.assertTrue(res.recap_due(date(2026, 10, 3)))
+        res.daily(self.scores({"g1": (4, 2)}), date(2026, 10, 3), self.LATER)
+        again = Results(self.cfg, dry_run=False)
+        self.assertFalse(again.recap_due(date(2026, 10, 3)))
+        self.assertTrue(again.recap_due(date(2026, 10, 4)))
+
+
+def _read(name):
+    import csv
+    with open(name, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+class CardStability(unittest.TestCase):
+    """Cards are edited for visible changes only, never for a reshuffle."""
+
+    def test_related_and_board_order_dont_depend_on_rank_or_feed_order(self):
+        from arbbot import note_related
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [ml] = find_evs([ev], EVCFG, NOW)
+        over = replace(ml, market="totals", line=220.5, point=220.5, outcome="Over")
+        spread = replace(ml, market="spreads", line=-3.5, point=-3.5)
+        a = EVAlerter(EVCFG, dry_run=True)
+        note_related([([ml, over, spread], a, set())])
+        first = list(spread.related)
+        note_related([([over, ml, spread], a, set())])
+        self.assertEqual(spread.related, first)
+        books = {"FanDuel": [("Home", 1.95, None)], "BetMGM": [("Home", 1.95, None)], "DK": [("Home", 2.10, None)]}
+        one = find_evs([ev_event([("Home", 1.91, None), ("Away", 1.91, None)], books)], EVCFG, NOW)[0]
+        two = find_evs([ev_event([("Home", 1.91, None), ("Away", 1.91, None)], dict(reversed(books.items())))],
+                       EVCFG, NOW)[0]
+        self.assertEqual([r[0] for r in one.board], [r[0] for r in two.board])
+
+    def test_parlay_legs_keep_one_order(self):
+        a, b = ev_leg("g1", {"DK": 2.08}), ev_leg("g2", {"DK": 2.20})
+        cfg = Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1)
+        [p1] = find_parlays([a, b], cfg)
+        [p2] = find_parlays([a, b], cfg, keep={p1.key})
+        self.assertEqual([x[0].key for x in p1.legs], [x[0].key for x in p2.legs])
+
+    def test_restart_with_the_same_prices_leaves_cards_alone(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cfg = replace(EVCFG, webhook_url="https://main", state_dir=d, ev_log_file="")
+            sent = []
+            def make():
+                a = EVAlerter(cfg, dry_run=False)
+                def fake(payload, message_id=None, url=""):
+                    sent.append(("PATCH" if message_id else "POST", payload["embeds"][0].get("description", "")))
+                    a.send_retryable = False
+                    return message_id or "m1"
+                a._discord = fake
+                return a
+            def bet(sharp):
+                ev = ev_event([("Home", sharp[0], None), ("Away", sharp[1], None)], {"B": [("Home", 2.20, None)]})
+                return find_evs([ev], cfg, NOW)[0]
+            t0 = time.time()
+            a = make()
+            a.handle([bet((1.91, 1.91))], ["Test"], now=t0)
+            a.handle([bet((1.89, 1.93))], ["Test"], now=t0 + 60)           # the sharp line moved
+            self.assertIn("(was", sent[-1][1])
+            n = len(sent)
+            b = make()                                                     # restart
+            b.handle([bet((1.89, 1.93))], ["Test"], now=t0 + 120)          # same prices as before
+            self.assertEqual(len(sent), n)                                 # no edit, no new alert
+            b.handle([bet((1.88, 1.94))], ["Test"], now=t0 + 180)          # a real change...
+            self.assertEqual(sent[-1][0], "PATCH")
+            self.assertIn("(was -110 / -110)", sent[-1][1])                # ...keeps the original line
+
+
+class SkipLinesNeverLose(unittest.TestCase):
+    def test_every_printed_skip_line_still_breaks_even(self):
+        from arbbot import american
+        cfg = Config(alert_mode="balanced", min_profit_pct=0.01, bankroll=100, round_stakes=5)
+        checked = 0
+        for plus in range(100, 200, 3):
+            for minus in range(-200, -100, 3):
+                hp, ap = 1 + plus / 100, 1 + 100 / -minus
+                ev = event({"A": [("h2h", [("Home", hp, None), ("Away", 1.30, None)])],
+                            "B": [("h2h", [("Home", 1.30, None), ("Away", ap, None)])]})
+                for arb in find_arbs([ev], cfg, NOW):
+                    for i, leg in enumerate(arb.legs):
+                        worst = arb.worst_ok_price(i)
+                        if worst is None:
+                            continue
+                        a = int(american(worst))
+                        shown = 1 + a / 100 if a > 0 else 1 + 100 / -a
+                        self.assertGreaterEqual(shown * leg.stake, arb.total_stake - 1e-6, (plus, minus, i))
+                        checked += 1
+        self.assertGreater(checked, 50)
+
+
+class ParlayBooks(unittest.TestCase):
+    def test_outlier_legs_stay_inside_ev_books(self):
+        def game(gid):
+            books = {"Pinnacle": [("h2h", [("Home", 1.95, None), ("Away", 1.95, None)])],
+                     "DraftKings": [("h2h", [("Home", 1.91, None), ("Away", 1.91, None)])],
+                     "BetMGM": [("h2h", [("Home", 1.91, None), ("Away", 1.91, None)])],
+                     "Caesars": [("h2h", [("Home", 1.90, None), ("Away", 1.92, None)])],
+                     "FanDuel": [("h2h", [("Home", 2.30, None), ("Away", 1.62, None)])]}
+            ev = event(books)
+            for bm in ev["bookmakers"]:
+                bm["key"] = {"Pinnacle": "pinnacle", "DraftKings": "draftkings", "BetMGM": "betmgm",
+                             "Caesars": "williamhill_us", "FanDuel": "fanduel"}[bm["title"]]
+            ev["id"] = gid
+            return ev
+        cfg = Config(alert_mode="balanced", my_books="draftkings,fanduel", ev_books="draftkings",
+                     parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1)
+        outs = find_outliers([game("g1"), game("g2")], cfg, NOW)
+        self.assertTrue(outs)
+        self.assertEqual(find_parlays(outs, cfg), [])                     # FanDuel isn't an EV book
+        loose = replace(cfg, ev_books="")
+        self.assertTrue(find_parlays(find_outliers([game("g1"), game("g2")], loose, NOW), loose))
+
+    def test_prop_minutes_only_checked_with_props_on(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"PROP_MINUTES": "0", "PROPS_ENABLED": "false"}):
+            Config.from_env()
+        with mock.patch.dict(os.environ, {"PROP_MINUTES": "0"}), self.assertRaisesRegex(ValueError, "PROP_MINUTES"):
+            Config.from_env()
 
 
 if __name__ == "__main__":
