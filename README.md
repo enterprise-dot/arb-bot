@@ -147,9 +147,20 @@ grows by 2.5 points or more while it's open (`REALERT_JUMP_PCT`), you get a fres
 finish, the bot grades them with the final scores (`ev_results.csv`) and posts each result to a
 **results channel**: ✅ won / ❌ lost / ➖ push with the profit at the stake shown, plus the day's
 record so far. Every morning it posts the whole previous day. Parlays are graded leg by leg (a
-pushed leg drops out, like at the books). Player props need a box score, which the odds feed
-doesn't have, so they're listed as 🎯 for you to check. Grading costs 2 credits per sport with a
+pushed leg drops out, like at the books). Grading main lines costs 2 credits per sport with a
 finished bet, at most every `RESULTS_MINUTES` (30).
+
+**Player props are graded from ESPN box scores** (free, no credits): points, rebounds, assists,
+threes (NBA), goals, assists, points, shots on goal (NHL), passing/rushing/receiving yards and
+receptions (NFL, college), hits and pitcher strikeouts (MLB). Before trusting a box score the bot
+checks it adds up (players' points = the final score, goals = the score, runs = the score,
+receptions = completions); if it doesn't, those props are left as 🎯 for you. A player who didn't
+play is a push (books void those). Total bases isn't in the box score, so it stays manual.
+Check it against real games any time with `python arbbot.py --check-props`. `PROP_GRADING=off`
+turns it off.
+
+**Scoreboard:** one message at the top of the results channel that the bot keeps editing: today,
+the last 7 days and all time, by bet type and live vs pre-game, plus bet quality (CLV). Pin it.
 
 Make a `#results` channel and connect it: `python arbbot.py --set-webhook results`. Without it,
 results go to the bot health channel. On the command line:

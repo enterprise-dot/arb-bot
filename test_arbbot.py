@@ -14,6 +14,15 @@ from arbbot import (LIVE, PREGAME, EARLY, FAR, Alerter, Config, EVAlerter, Outli
                     Parlay, ParlayAlerter, find_parlays, parlay_payload, market_label, append_csv,
                     consensus_fair)
 
+import arbbot as _arbbot
+
+
+def _no_network(path):
+    raise OSError("tests don't use the network")
+
+
+_arbbot._espn_get = _no_network   # box-score tests install a fake ESPN
+
 NOW = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
 FRESH = NOW.isoformat().replace("+00:00", "Z")
 
@@ -2070,6 +2079,9 @@ class ResultsReviewFixes(unittest.TestCase):
     def test_parlay_with_a_prop_leg_loses_on_its_main_leg(self):
         from arbbot import day_bets, day_summary
         from datetime import date
+        from unittest import mock
+        mock.patch("arbbot.PROP_GRADING", False).start()   # a prop leg the bot can't grade
+        self.addCleanup(mock.patch.stopall)
         ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)}, start=self.START)
         ev["bookmakers"][0]["key"] = "pinnacle"
         [prop] = find_evs([ev], self.cfg.for_props(), NOW)
@@ -2094,7 +2106,7 @@ class ResultsReviewFixes(unittest.TestCase):
         settle_pending(self.cfg, self.scores({"g1": (4, 2)}), self.LATER)
         cli = Results(self.cfg, dry_run=False)
         cli.send = lambda payload: True
-        self.assertTrue(cli.recap(date(2026, 10, 3), self.LATER))
+        self.assertEqual(cli.recap(date(2026, 10, 3), self.LATER), "sent")
         self.assertEqual(service.run(self.scores({}), self.LATER), 0)
 
     def test_failed_post_is_tried_again(self):
@@ -2235,6 +2247,369 @@ class ParlayBooks(unittest.TestCase):
             Config.from_env()
         with mock.patch.dict(os.environ, {"PROP_MINUTES": "0"}), self.assertRaisesRegex(ValueError, "PROP_MINUTES"):
             Config.from_env()
+
+
+def espn_fake(games):
+    """A fake ESPN: games = [{"sport": league path, "id", "date", "home": (id, display, location, name, score),
+    "away": (...), "final": bool, "groups": {team id: [(group name, labels, keys, [(player, [stats], dnp)])]}}]"""
+    def team(t):
+        tid, display, location, name, _ = t
+        return {"id": tid, "displayName": display, "location": location, "name": name}
+    def get(path):
+        league, _, rest = path.rpartition("/")
+        if rest.startswith("scoreboard"):
+            day = rest.split("dates=")[1][:8]
+            return {"events": [{"id": g["id"], "date": g["date"], "status": {"type": {"completed": g["final"]}},
+                                "competitions": [{"competitors": [
+                {"homeAway": "home", "team": team(g["home"]), "score": str(g["home"][4])},
+                {"homeAway": "away", "team": team(g["away"]), "score": str(g["away"][4])}]}]}
+                for g in games if g["sport"] == league and g["date"][:10].replace("-", "") == day]}
+        eid = rest.split("event=")[1]
+        g = next(g for g in games if g["id"] == eid)
+        return {"header": {"competitions": [{
+                    "status": {"type": {"completed": g["final"], "state": "post" if g["final"] else "in"}},
+                    "competitors": [{"id": t[0], "team": team(t), "score": str(t[4])} for t in (g["home"], g["away"])]}]},
+                "boxscore": {"players": [{"team": {"id": tid}, "statistics": [
+                    {"name": gname, "labels": labels, "keys": keys, "athletes": [
+                        {"athlete": {"displayName": who}, "stats": stats, "didNotPlay": dnp}
+                        for who, stats, dnp in athletes]}
+                    for gname, labels, keys, athletes in groups]} for tid, groups in g["groups"].items()]}}
+    return get
+
+
+NHL_LABELS, NHL_KEYS = ["G", "A", "+/-", "S", "BS"], ["goals", "assists", "plusMinus", "shotsTotal", "blockedShots"]
+
+
+def nhl_game(cbj_goals=3, final=True, kj=("1", "1", "+1", "4", "0"), kj_dnp=False):
+    return {"sport": "hockey/nhl", "id": "401", "date": "2026-10-03T23:00Z", "final": final,
+            "home": ("29", "Columbus Blue Jackets", "Columbus", "Blue Jackets", 3),
+            "away": ("129", "Utah Mammoth", "Utah", "Mammoth", 2),
+            "groups": {"29": [("forwards", NHL_LABELS, NHL_KEYS, [
+                ("Kent Johnson", list(kj), kj_dnp),
+                ("Zach Werenski", [str(cbj_goals - 1), "2", "+2", "5", "1"], False)])],
+                       "129": [("forwards", NHL_LABELS, NHL_KEYS, [
+                ("Clayton Keller", ["2", "0", "-1", "6", "0"], False),
+                ("Mitchell Marner", ["0", "1", "0", "2", "1"], False)])]}}
+
+
+class PropGrading(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from unittest import mock
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.cfg = Config(min_ev_pct=3, round_stakes=0, ev_log_file=str(d / "ev.csv"),
+                          outlier_log_file=str(d / "out.csv"), parlay_log_file=str(d / "par.csv"),
+                          ev_results_file=str(d / "res.csv"), closing_file=str(d / "close.csv"), log_file="")
+        self.games = [nhl_game()]
+        mock.patch("arbbot._espn_get", side_effect=lambda path: espn_fake(self.games)(path)).start()
+        self.addCleanup(mock.patch.stopall)
+        _arbbot._ESPN_CACHE.clear()
+        _arbbot._BOX_CACHE.clear()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def row(self, player="Kent Johnson", market="player_assists", outcome="Over", point="0.5", price="2.95",
+            sport="icehockey_nhl", home="Columbus Blue Jackets", away="Utah Mammoth"):
+        return {"event_id": "nhl1", "sport_key": sport, "home_team": home, "away_team": away,
+                "commence_time": "2026-10-03T23:00:00Z", "market": market, "outcome": outcome,
+                "point": point, "player": player, "stake": "15", "price": price, "kind": "ev"}
+
+    def test_grades_over_under_from_the_box_score(self):
+        from arbbot import grade_prop
+        self.assertEqual(grade_prop(self.row()), (("win", 29.25), "1"))                    # 1 assist > 0.5
+        self.assertEqual(grade_prop(self.row(market="player_shots_on_goal", outcome="Under", point="2.5"))[0][0],
+                         "loss")                                                            # 4 shots
+        self.assertEqual(grade_prop(self.row(market="player_points", point="2.0"))[0][0], "push")  # 1+1
+
+    def test_box_score_that_doesnt_add_up_is_not_trusted(self):
+        from arbbot import grade_prop
+        self.games = [nhl_game(cbj_goals=6)]                  # players' goals 6 vs a final score of 3
+        res, why = grade_prop(self.row())
+        self.assertIsNone(res)
+        self.assertIn("didn't check out", why)
+
+    def test_not_final_dnp_and_unknown_players(self):
+        from arbbot import grade_prop
+        self.games = [nhl_game(final=False)]
+        self.assertEqual(grade_prop(self.row()), (None, "not final yet"))
+        _arbbot._ESPN_CACHE.clear()
+        self.games = [nhl_game(kj=(), kj_dnp=True)]
+        self.assertEqual(grade_prop(self.row()), (("push", 0.0), "DNP"))                   # didn't play: void
+        self.assertIsNone(grade_prop(self.row(player="Nobody Here"))[0])
+        # "Mitch Marner" on the odds feed is "Mitchell Marner" on ESPN.
+        self.assertEqual(grade_prop(self.row(player="Mitch Marner"))[1], "1")
+
+    def test_game_matching(self):
+        from arbbot import espn_event_id
+        self.assertEqual(espn_event_id("icehockey_nhl", "Columbus Blue Jackets", "Utah Mammoth",
+                                       "2026-10-03T23:00:00Z"), "401")
+        self.assertEqual(espn_event_id("icehockey_nhl", "Utah Mammoth", "Columbus Blue Jackets",   # neutral site
+                                       "2026-10-03T23:00:00Z"), "401")
+        self.assertIsNone(espn_event_id("icehockey_nhl", "Columbus Blue Jackets", "Utah Mammoth",
+                                        "2026-10-06T23:00:00Z"))                           # another day
+        clippers = {"sport": "basketball/nba", "id": "9", "date": "2026-10-03T23:00Z", "final": True,
+                    "home": ("12", "LA Clippers", "LA", "Clippers", 100), "away": ("1", "Atlanta Hawks", "Atlanta", "Hawks", 90),
+                    "groups": {}}
+        self.games.append(clippers)
+        self.assertEqual(espn_event_id("basketball_nba", "Los Angeles Clippers", "Atlanta Hawks",
+                                       "2026-10-03T23:00:00Z"), "9")
+
+    def test_other_sports_read_the_right_columns(self):
+        from arbbot import grade_prop
+        nba_l = ["MIN", "FG", "3PT", "FT", "REB", "AST", "PTS"]
+        nba_k = ["minutes", "fieldGoalsMade-fieldGoalsAttempted", "threePointFieldGoalsMade-threePointFieldGoalsAttempted",
+                 "freeThrowsMade-freeThrowsAttempted", "rebounds", "assists", "points"]
+        self.games.append({"sport": "basketball/nba", "id": "7", "date": "2026-10-03T23:00Z", "final": True,
+                           "home": ("2", "Boston Celtics", "Boston", "Celtics", 30), "away": ("18", "New York Knicks", "New York", "Knicks", 12),
+                           "groups": {"2": [("", nba_l, nba_k, [("Jayson Tatum", ["38", "10-21", "3-8", "5-6", "8", "5", "28"], False),
+                                                               ("Jaylen Brown", ["30", "1-3", "0-1", "0-0", "2", "1", "2"], False)])],
+                                      "18": [("", nba_l, nba_k, [("Jalen Brunson", ["36", "5-9", "2-4", "0-0", "1", "6", "12"], False)])]}})
+        row = self.row(player="Jayson Tatum", market="player_threes", point="2.5", sport="basketball_nba",
+                       home="Boston Celtics", away="New York Knicks")
+        self.assertEqual(grade_prop(row), (("win", 29.25), "3"))                            # 3 of 8 threes
+        pra = dict(row, market="player_points_rebounds_assists", point="40.5", outcome="Under")
+        self.assertEqual(grade_prop(pra)[1], "41")
+        nfl = lambda g, labels, keys, rows: (g, labels, keys, rows)
+        self.games.append({"sport": "football/nfl", "id": "5", "date": "2026-10-04T17:00Z", "final": True,
+                           "home": ("2", "Buffalo Bills", "Buffalo", "Bills", 27), "away": ("20", "New York Jets", "New York", "Jets", 20),
+                           "groups": {"2": [nfl("passing", ["C/ATT", "YDS", "TD"], ["completions/passingAttempts", "passingYards", "passingTouchdowns"],
+                                                [("Josh Allen", ["22/30", "260", "2"], False)]),
+                                            nfl("rushing", ["CAR", "YDS", "TD"], ["rushingAttempts", "rushingYards", "rushingTouchdowns"],
+                                                [("Josh Allen", ["8", "41", "1"], False), ("James Cook", ["15", "70", "0"], False)]),
+                                            nfl("receiving", ["REC", "YDS", "TD"], ["receptions", "receivingYards", "receivingTouchdowns"],
+                                                [("Khalil Shakir", ["9", "110", "1"], False), ("James Cook", ["13", "150", "1"], False)])],
+                                      "20": [nfl("passing", ["C/ATT", "YDS", "TD"], ["completions/passingAttempts", "passingYards", "passingTouchdowns"],
+                                                 [("Justin Fields", ["15/25", "180", "1"], False)]),
+                                             nfl("receiving", ["REC", "YDS", "TD"], ["receptions", "receivingYards", "receivingTouchdowns"],
+                                                 [("Garrett Wilson", ["15", "180", "1"], False)])]}})
+        bills = dict(home="Buffalo Bills", away="New York Jets", sport="americanfootball_nfl")
+        bills_row = lambda **kw: dict(self.row(**bills), commence_time="2026-10-04T17:00:00Z", **kw)
+        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_rush_yds", point="39.5"))[1], "41")
+        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_pass_yds", point="39.5"))[1], "260")
+        self.assertEqual(grade_prop(bills_row(player="Khalil Shakir", market="player_anytime_td", outcome="Yes",
+                                              point=""))[0][0], "win")                     # no rushing line: 0 + 1
+        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_pass_completions", point="21.5"))[1], "22")
+        self.games.append({"sport": "baseball/mlb", "id": "3", "date": "2026-10-03T23:00Z", "final": True,
+                           "home": ("19", "Los Angeles Dodgers", "Los Angeles", "Dodgers", 4), "away": ("25", "San Diego Padres", "San Diego", "Padres", 1),
+                           "groups": {"19": [("batting", ["H-AB", "AB", "R", "H", "RBI", "HR"], ["hits-atBats", "atBats", "runs", "hits", "RBIs", "homeRuns"],
+                                              [("Shohei Ohtani", ["2-4", "4", "4", "2", "3", "1"], False)]),
+                                             ("pitching", ["IP", "H", "R", "ER", "BB", "K"], ["fullInnings.partInnings", "hits", "runs", "earnedRuns", "walks", "strikeouts"],
+                                              [("Yoshinobu Yamamoto", ["6.1", "4", "1", "1", "2", "9"], False)])],
+                                      "25": [("batting", ["H-AB", "AB", "R", "H", "RBI", "HR"], ["hits-atBats", "atBats", "runs", "hits", "RBIs", "homeRuns"],
+                                              [("Manny Machado", ["1-4", "4", "1", "1", "1", "1"], False)])]}})
+        dodgers = lambda **kw: dict(self.row(sport="baseball_mlb", home="Los Angeles Dodgers", away="San Diego Padres"), **kw)
+        self.assertEqual(grade_prop(dodgers(player="Shohei Ohtani", market="batter_hits", point="1.5"))[1], "2")
+        self.assertEqual(grade_prop(dodgers(player="Yoshinobu Yamamoto", market="pitcher_strikeouts", point="7.5"))[1], "9")
+        self.assertEqual(grade_prop(dodgers(player="Yoshinobu Yamamoto", market="pitcher_outs", point="18.5"))[1], "19")
+
+    def test_props_graded_and_posted_like_everything_else(self):
+        from arbbot import day_bets, result_line
+        from datetime import date
+        ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)}, start="2026-10-03T23:00:00Z",
+                        market="player_assists", player="Kent Johnson", line=0.5)
+        ev.update(id="nhl1", sport_key="icehockey_nhl", home_team="Columbus Blue Jackets", away_team="Utah Mammoth")
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        [b] = find_evs([ev], self.cfg.for_props(), NOW)
+        EVAlerter(self.cfg, dry_run=True).handle([b], now=1000)
+        later = datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc)
+        [row] = settle_pending(self.cfg, self.scores_unused(), later)
+        self.assertEqual((row["result"], row["actual"]), ("win", "1"))
+        [r] = day_bets(self.cfg, date(2026, 10, 3))
+        line = result_line(r, self.cfg, later)
+        self.assertTrue(line.startswith("✅ **Kent Johnson Over 0.5 Assists"))
+        self.assertIn("Box score: 1", line)
+
+    def scores_unused(self):
+        test = self
+        class Api:
+            def scores(self, sport, days_from=3):
+                test.fail("props don't need Odds API scores")
+        return Api()
+
+    def test_check_props_report(self):
+        import io, contextlib
+        from arbbot import check_props
+        cfg = replace(self.cfg, prop_sports=["icehockey_nhl", "tennis_atp"])
+        EVAlerter(self.cfg, dry_run=True)   # nothing logged yet
+        append_csv(self.cfg.ev_log_file, _arbbot.EV_LOG_FIELDS, {
+            **self.row(), "first_seen": "2026-10-03T20:00:00+00:00", "sport": "NHL",
+            "matchup": "Utah Mammoth @ Columbus Blue Jackets", "live": False, "n_outcomes": 2, "book": "DK"})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            check_props(cfg, datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc))
+        text = out.getvalue()
+        self.assertIn("✅ box score checks out", text)
+        self.assertIn("Assists: Zach Werenski 2", text)
+        self.assertIn("Shots on Goal: Clayton Keller 6", text)
+        self.assertIn("ATP: no box scores", text)
+        self.assertIn("Kent Johnson Over 0.5 Assists", text)
+        self.assertIn("✅ win (box score: 1)", text)
+        self.assertFalse(Path(self.cfg.ev_results_file).exists())          # a check saves nothing
+
+    def test_unsupported_props_stay_manual(self):
+        from arbbot import gradable
+        self.assertFalse(gradable(self.row(market="batter_total_bases", sport="baseball_mlb")))
+        self.assertTrue(gradable(self.row()))
+
+
+
+class MyBooksAreTheLimit(unittest.TestCase):
+    def test_ev_books_never_go_outside_my_books(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"Hard Rock Bet": [("Home", 2.20, None)], "FanDuel": [("Home", 2.10, None)]})
+        ev["bookmakers"][1]["key"], ev["bookmakers"][2]["key"] = "hardrockbet", "fanduel"
+        both = Config(min_ev_pct=3, my_books="fanduel,draftkings", ev_books="hardrockbet,fanduel,ballybet")
+        [b] = find_evs([ev], both, NOW)
+        self.assertEqual(b.book, "FanDuel")                               # not Hard Rock, even though it's better
+        self.assertEqual([r[0] for r in b.board], ["FanDuel"])
+        self.assertEqual(find_evs([ev], Config(min_ev_pct=3, ev_books="hardrockbet"), NOW)[0].book, "Hard Rock Bet")
+        self.assertEqual(find_evs([ev], Config(min_ev_pct=3, my_books="fanduel", ev_books="hardrockbet"), NOW), [])
+
+
+
+class OutlierGuards(unittest.TestCase):
+    def test_the_book_that_moved_last_is_not_an_outlier(self):
+        ev = outlier_event(1.85, 1.95)
+        self.assertEqual(len(find_outliers([ev], Config(), NOW)), 1)            # all quotes the same age
+        older = (NOW - timedelta(seconds=40)).isoformat().replace("+00:00", "Z")
+        for bm in ev["bookmakers"]:
+            if bm["title"] != "Stale":                                          # everyone else is 40s behind:
+                bm["last_update"] = older                                       # Stale just reacted to the play
+                for m in bm["markets"]:
+                    m["last_update"] = older
+        self.assertEqual(find_outliers([ev], Config(), NOW), [])
+
+    def test_the_sharp_book_has_to_agree(self):
+        books = {"Pinnacle": [("h2h", [("Home", 1.80, None), ("Away", 2.10, None)])],   # sharp: Home ~54%
+                 "DK": [("h2h", [("Home", 1.24, None), ("Away", 4.00, None)])],          # the soft books
+                 "FD": [("h2h", [("Home", 1.26, None), ("Away", 3.90, None)])],          # are the stale ones
+                 "MGM": [("h2h", [("Home", 1.25, None), ("Away", 3.95, None)])],
+                 "Stale": [("h2h", [("Home", 1.85, None), ("Away", 1.95, None)])]}
+        ev = event(books, start="2026-10-03T11:00:00Z")
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        self.assertNotIn("Stale", [o.book for o in find_outliers([ev], Config(), NOW)])
+
+
+
+class Scoreboard(unittest.TestCase):
+    START, LATER = BetResults.START, BetResults.LATER
+    setUp, tearDown, scores = BetResults.setUp, BetResults.tearDown, BetResults.scores
+    log_ev, log_parlay = BetResults.log_ev, BetResults.log_parlay
+
+    def wire(self, res):
+        from unittest import mock
+        self.calls = []
+        def fake(url, payload, method="POST", message_id=None):
+            self.calls.append((method, message_id))
+            if method == "PATCH" and message_id in self.deleted:
+                raise urllib.error.HTTPError(url, 404, "Unknown Message", {}, None)
+            return {"id": f"b{len(self.calls)}"}
+        self.deleted = set()
+        mock.patch("arbbot._webhook", side_effect=fake).start()
+        self.addCleanup(mock.patch.stopall)
+        return res
+
+    def test_one_message_kept_up_to_date(self):
+        from arbbot import Results
+        self.log_ev("g1")
+        res = self.wire(Results(self.cfg, dry_run=False))
+        res.send = lambda payload: True
+        res.tick(self.scores({}), self.LATER)                       # nothing graded yet: the board goes up
+        self.assertEqual(self.calls, [("POST", None)])
+        res.tick(self.scores({}), self.LATER)                       # nothing changed: no edit
+        self.assertEqual(len(self.calls), 1)
+        res.tick(self.scores({"g1": (4, 2)}), self.LATER)           # a result: the same message is edited
+        self.assertEqual(self.calls[-1], ("PATCH", "b1"))
+        again = self.wire(Results(self.cfg, dry_run=False))          # restart: still the same message
+        self.log_ev("g2")
+        again.send = lambda payload: True
+        again.tick(self.scores({"g2": (0, 1)}), self.LATER)
+        self.assertEqual(self.calls[-1], ("PATCH", "b1"))
+        self.deleted.add("b1")                                       # someone deleted it: a new one goes up
+        self.log_ev("g3")
+        again.tick(self.scores({"g3": (2, 1)}), self.LATER)
+        self.assertEqual(self.calls[-2:], [("PATCH", "b1"), ("POST", None)])
+
+    def test_board_and_command_line_show_the_same_numbers(self):
+        import io, contextlib
+        from arbbot import scoreboard_text, Results, run
+        self.log_ev("g1")
+        self.log_parlay(["g2", "g3"])
+        settle_pending(self.cfg, self.scores({"g1": (4, 2), "g2": (1, 3), "g3": (1, 3)}), self.LATER)
+        text = scoreboard_text(self.cfg, self.LATER)
+        self.assertIn("Today · Sat Oct 3", text)
+        self.assertIn("📈 +EV: 1-0", text)
+        self.assertIn("📦 Parlays: 0-1", text)
+        self.assertIn("Last 7 days", text)
+        self.assertIn("All time", text)
+        self.assertTrue(ev_record(self.cfg).startswith("1 bets, 1-0-0"))   # +EV only, not outliers or parlays
+
+    def test_arbs_counted_once_each(self):
+        from arbbot import arbs_on, LOG_FIELDS
+        from datetime import date
+        for at, pct, secs in (("20:00", 3.5, 40), ("20:05", 3.1, 20), ("21:00", 2.0, 300)):
+            append_csv(self.cfg.log_file, LOG_FIELDS, {"first_seen": f"2026-10-03T{at}:00+00:00", "seconds_open": secs,
+                                                       "matchup": "A @ B" if at < "21" else "C @ D", "market": "h2h",
+                                                       "line": "", "best_profit_pct": pct})
+        line = arbs_on(self.cfg, date(2026, 10, 3))
+        self.assertIn("2 different (3 alerts)", line)
+        self.assertIn("+$5.50", line)                                 # 3.5% + 2.0% of $100, once each
+        self.assertIn("half were gone within 40s", line)
+
+
+
+class RecapRetries(unittest.TestCase):
+    START, LATER = BetResults.START, BetResults.LATER
+    setUp, tearDown, scores = BetResults.setUp, BetResults.tearDown, BetResults.scores
+    log_ev = BetResults.log_ev
+
+    def test_failed_recap_doesnt_regrade_or_retry_every_pass(self):
+        from arbbot import Results
+        from datetime import date
+        self.log_ev("g1")
+        res = Results(self.cfg, dry_run=False)
+        res.send = lambda payload: False                             # Discord down
+        res.update_board = lambda now=None: None
+        api = self.scores({})                                        # the game never shows as final
+        day = date(2026, 10, 3)
+        self.assertTrue(res.recap_due(day))
+        res.daily(api, day, self.LATER)
+        self.assertFalse(res.recap_due(day))                         # not again on the next pass...
+        res.recap_tried -= 3600                                      # ...but after RESULTS_MINUTES
+        self.assertTrue(res.recap_due(day))
+        res.daily(api, day, self.LATER)
+        self.assertEqual(len(api.calls), 1)                          # the full grading pass ran once
+
+    def test_card_posted_by_hand_midday_doesnt_cancel_the_morning_recap(self):
+        from arbbot import Results
+        from datetime import date
+        self.log_ev("g1")
+        res = Results(self.cfg, dry_run=False)
+        res.send = lambda payload: True
+        self.assertEqual(res.recap(date(2026, 10, 3), self.LATER, finished=False), "sent")
+        self.assertTrue(Results(self.cfg, dry_run=False).recap_due(date(2026, 10, 3)))
+        self.assertEqual(res.recap(date(2026, 10, 1), self.LATER), "nothing")   # no bets that day
+
+    def test_equal_prices_pick_the_same_book_whatever_the_feed_order(self):
+        books = {"Pinnacle": [("h2h", [("Home", 1.91, None), ("Away", 1.91, None)])],
+                 "DK": [("h2h", [("Home", 1.91, None), ("Away", 1.91, None)])],
+                 "MGM": [("h2h", [("Home", 1.91, None), ("Away", 1.91, None)])],
+                 "CZR": [("h2h", [("Home", 1.90, None), ("Away", 1.92, None)])],
+                 "FanDuel": [("h2h", [("Home", 2.40, None), ("Away", 1.55, None)])],
+                 "Fanatics": [("h2h", [("Home", 2.40, None), ("Away", 1.60, None)])]}
+        ev = event(books, start="2026-10-03T11:00:00Z")
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        first = [o.book for o in find_outliers([ev], Config(), NOW)]
+        ev["bookmakers"] = ev["bookmakers"][:4] + ev["bookmakers"][4:][::-1]
+        self.assertEqual([o.book for o in find_outliers([ev], Config(), NOW)], first)
+        a = event({"FanDuel": [("h2h", [("Home", 2.15, None), ("Away", 1.80, None)])],
+                   "BetMGM": [("h2h", [("Home", 2.15, None), ("Away", 1.75, None)])],
+                   "DK": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])]})
+        legs = [l.book for l in find_arbs([a], Config(min_profit_pct=0), NOW)[0].legs]
+        a["bookmakers"] = a["bookmakers"][::-1]
+        self.assertEqual([l.book for l in find_arbs([a], Config(min_profit_pct=0), NOW)[0].legs], legs)
 
 
 if __name__ == "__main__":

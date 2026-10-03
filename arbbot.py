@@ -34,6 +34,7 @@ import re
 import os
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -243,6 +244,7 @@ class Config:
     status_webhook_url: str = ""  # health messages; defaults to the alerts webhook
     results_webhook_url: str = ""  # graded bets (what hit); defaults to the health channel
     results_minutes: int = 30     # look for finished games to grade this often (0 = daily only)
+    prop_grading: str = "espn"    # grade player props from ESPN box scores ("off" = check them yourself)
     low_credits: int = 5000       # warn on Discord below this many credits
     log_file: str = "arbs.csv"    # every arb with how long it lasted ("" = off)
     state_dir: str = "state"      # open alerts survive restarts (no duplicate posts) ("" = off)
@@ -390,6 +392,7 @@ class Config:
             status_webhook_url=e("DISCORD_STATUS_WEBHOOK_URL", ""),
             results_webhook_url=e("DISCORD_RESULTS_WEBHOOK_URL", ""),
             results_minutes=num("RESULTS_MINUTES", d.results_minutes, int),
+            prop_grading=(e("PROP_GRADING") or d.prop_grading).strip().lower(),
             low_credits=num("LOW_CREDITS", d.low_credits, int),
             log_file=e("LOG_FILE", d.log_file),
             state_dir=e("STATE_DIR", d.state_dir),
@@ -521,6 +524,14 @@ class Config:
         """Can alerts tell you to bet at this book?"""
         mine = _csv(self.my_books)
         return not mine or book_key in mine
+
+    def ev_allowed(self) -> set[str]:
+        """Books +EV-style alerts (and parlays) may use: EV_BOOKS, but never outside MY_BOOKS
+        (an old EV_BOOKS list must not send you to a book you don't have). Empty = no limit."""
+        ev, mine = set(_csv(self.ev_books)), set(_csv(self.my_books))
+        if ev and mine:
+            return (ev & mine) or {"(none of EV_BOOKS is in MY_BOOKS)"}
+        return ev or mine
 
     def credits_per_call(self) -> int:
         """The Odds API charges markets x regions; every 10 bookmakers count as one region."""
@@ -822,10 +833,11 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
                     per_line[k] = per_line.get(k, 0) + 1
                     slot = best.setdefault(k, {})
                     cur = slot.get(oc["name"])
-                    if cur is None or price > cur.price:
+                    title = bm.get("title", bm["key"])
+                    if cur is None or price > cur.price or (price == cur.price and title < cur.book):
                         link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
                         ts = mkt.get("last_update") or bm.get("last_update")
-                        slot[oc["name"]] = Leg(oc["name"], price, bm.get("title", bm["key"]), link=link,
+                        slot[oc["name"]] = Leg(oc["name"], price, title, link=link,
                                                updated=_parse_time(ts) if ts else None)
                 for k, n in per_line.items():
                     n_outcomes[k] = max(n_outcomes.get(k, 0), n)
@@ -1726,7 +1738,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
         return []
     now = now or datetime.now(timezone.utc)
     sharp = _csv(cfg.sharp_books)
-    allowed = set(_csv(cfg.ev_books) or _csv(cfg.my_books))
+    allowed = cfg.ev_allowed()
     out: list[EVBet] = []
 
     for ev in events:
@@ -1963,7 +1975,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
         return []
     now = now or datetime.now(timezone.utc)
     reference_only = set() if cfg.bet_at_sharp else set(_csv(cfg.sharp_books))
-    ev_allowed = set(_csv(cfg.ev_books) or _csv(cfg.my_books))
+    ev_allowed = cfg.ev_allowed()
     out: list[EVBet] = []
 
     for ev in events:
@@ -1975,11 +1987,13 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
         titles: dict[str, str] = {}
         links: dict[tuple, str] = {}
         points: dict[tuple, float | None] = {}
+        stamps: dict[tuple, datetime] = {}   # (line, book) -> when that book last moved it
         for bm in ev.get("bookmakers", []):
             titles[bm["key"]] = bm.get("title", bm["key"])
             for mkt in bm.get("markets", []):
                 if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue
+                stamp = mkt.get("last_update") or bm.get("last_update")
                 for oc in mkt.get("outcomes", []):
                     price = float(oc.get("price") or 0)
                     if price <= 1.0:
@@ -1988,7 +2002,10 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
                     lines.setdefault(k, {}).setdefault(bm["key"], {})[oc["name"]] = price
                     links[(k, bm["key"], oc["name"])] = oc.get("link") or mkt.get("link") or bm.get("link") or ""
                     points[(k, oc["name"])] = oc.get("point")
+                    if stamp:
+                        stamps[(k, bm["key"])] = _parse_time(stamp)
 
+        sharp = sharp_fair(ev, cfg, now, is_live)[0] if lines else {}
         for k, books in lines.items():
             n_out = max(len(o) for o in books.values())
             full = {bk: o for bk, o in books.items() if len(o) == n_out and n_out >= 2}
@@ -2007,6 +2024,17 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
                     price = o[name]
                     edge = (fair_p * price - 1) * 100
                     if edge < cfg.outlier_min_pct:
+                        continue
+                    # A real outlier is a book that hasn't caught up. If this book moved its price
+                    # AFTER most of the others, it's probably the one that's right (in a live game it
+                    # reacted first) and the rest are behind: betting it is no edge at all.
+                    mine = stamps.get((k, bk))
+                    theirs = sorted(t for (kk, ob), t in stamps.items() if kk == k and ob != bk and ob in full)
+                    if mine and theirs and mine > theirs[len(theirs) // 2]:
+                        continue
+                    # And when the sharp book prices this line, it has to agree the price is good.
+                    sp = sharp.get(k, {}).get(name)
+                    if sp is not None and (sp * price - 1) * 100 < cfg.min_ev_pct:
                         continue
                     board = sorted(((titles[b], oo[name], (fair_p * oo[name] - 1) * 100,
                                      links.get((k, b, name), ""), True)
@@ -2043,7 +2071,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
     # the best price per bet (otherwise a worse book would overwrite the best one's alert) and
     # list the rest under "also".
     best: dict[tuple, EVBet] = {}
-    for b in sorted(out, key=lambda b: b.ev_pct, reverse=True):
+    for b in sorted(out, key=lambda b: (-b.ev_pct, b.book)):   # ties by book name: stable cards
         k = (b.event_id, b.market, b.line, b.outcome)
         if k in best:
             best[k].also.append((b.book, b.price))
@@ -2363,7 +2391,7 @@ class ParlayAlerter(Alerter):
 # --------------------------------------------------------------------------- +EV results
 
 RESULT_FIELDS = EV_LOG_FIELDS + ["home_score", "away_score", "result", "profit", "kind",
-                                 "closing_fair_odds", "clv_pct", "manual_legs"]
+                                 "closing_fair_odds", "clv_pct", "manual_legs", "actual"]
 
 
 def settle(bet: dict, home_score: float, away_score: float) -> tuple[str, float]:
@@ -2458,8 +2486,9 @@ def _legs(r: dict) -> list[dict]:
 
 
 def gradable(r: dict) -> bool:
-    """Final scores can grade it: player props need box scores, which the odds feed doesn't have."""
-    return not any(l.get("player") for l in _legs(r))
+    """Can the bot grade it? Main lines from final scores; player props from box scores, for the
+    sports and stats it knows how to read (PROP_GRADING=espn)."""
+    return all(not l.get("player") or box_supported(l) for l in _legs(r))
 
 
 def settle_parlay(r: dict, finals: dict[str, dict[str, float]],
@@ -2481,7 +2510,7 @@ def settle_parlay(r: dict, finals: dict[str, dict[str, float]],
                               pts[leg["home_team"]], pts[leg["away_team"]])[0])
     stake = float(r["stake"])
     if "loss" in results:
-        return "loss", -stake
+        return "loss", -stake   # see parlay_unresolved() for a loss with legs still unknown
     if None in results or "unknown" in results:
         return None
     price = math.prod(float(l["price"]) for l, res in zip(r["_legs"], results) if res == "win")
@@ -2533,13 +2562,22 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
     graded = []
     for r in pending.values():
         extra = {}
-        if r["kind"] == "parlay":
+        if r.get("player"):
+            # Player props: from the box score (free, ESPN), once the game should be over.
+            if not recent(end(r)):
+                continue
+            res, said = grade_prop(r)
+            if res is None:
+                continue
+            extra = {"actual": said}
+        elif r["kind"] == "parlay":
             res = settle_parlay(r, finals, known)
             if res is None:
                 continue
-            if not gradable(r):
-                extra["manual_legs"] = 1   # lost on a main-line leg; a prop leg can't be graded, so
-                                           # it stays out of the record (wins can't be counted)
+            if any(_bet_id(l) not in known and (l.get("player") or l["event_id"] not in finals)
+                   for l in r["_legs"]):
+                extra["manual_legs"] = 1   # lost on one leg while another can't be graded: it stays
+                                           # out of the record (its wins couldn't be counted either)
         else:
             pts = finals.get(r["event_id"])
             if not pts or r["home_team"] not in pts or r["away_team"] not in pts:
@@ -2577,7 +2615,7 @@ def record_line(rows: list[dict]) -> str:
     return f"{w}-{l}" + (f"-{pu}" if pu else "") + f" · {signed_money(profit)} on {money(staked)} staked{roi}"
 
 
-def ev_record(cfg: Config, days: int | None = None, kinds: tuple[str, ...] = ("ev", "outlier", "")) -> str:
+def ev_record(cfg: Config, days: int | None = None, kinds: tuple[str, ...] = ("ev", "")) -> str:
     rows = [r for r in _read_csv(cfg.ev_results_file) if r.get("kind", "") in kinds and not r.get("manual_legs")]
     if days is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -2594,6 +2632,321 @@ def ev_record(cfg: Config, days: int | None = None, kinds: tuple[str, ...] = ("e
     roi = profit / staked * 100 if staked else 0
     return (f"{len(rows)} bets, {w}-{l}-{pu}, {'+' if profit >= 0 else '-'}${abs(profit):,.2f} "
             f"on ${staked:,.0f} staked (ROI {roi:+.1f}%, avg edge {avg_ev:.1f}%)")
+
+
+# --------------------------------------------------------------------------- player props: box scores
+
+PROP_GRADING = True   # set from PROP_GRADING in .env at startup
+ESPN_BASE = os.environ.get("ESPN_API_BASE", "https://site.api.espn.com/apis/site/v2/sports")
+ESPN_LEAGUES = {   # Odds API sport -> (ESPN league path, extra scoreboard query)
+    "americanfootball_nfl": ("football/nfl", ""),
+    "americanfootball_ncaaf": ("football/college-football", "groups=80&limit=500"),
+    "basketball_nba": ("basketball/nba", ""),
+    "basketball_wnba": ("basketball/wnba", ""),
+    "basketball_ncaab": ("basketball/mens-college-basketball", "groups=50&limit=500"),
+    "icehockey_nhl": ("hockey/nhl", ""),
+    "baseball_mlb": ("baseball/mlb", ""),
+}
+
+
+def _t(labels, keys=(), cats=None, part=None, optional=False):
+    """One box-score column: its labels and keys, the stat groups it's in (None = any),
+    which part of "10-21" / "12/20" (0 or 1), or "outs" for innings pitched."""
+    return (cats, labels, keys, part, optional)
+
+
+_PTS, _REB, _AST = _t(("PTS",), ("points",)), _t(("REB",), ("rebounds", "totalRebounds")), _t(("AST",), ("assists",))
+_G, _A = _t(("G",), ("goals",)), _t(("A",), ("assists",))
+BOX_STATS = {   # (sport family, prop market) -> columns added together
+    ("basketball", "player_points"): [_PTS],
+    ("basketball", "player_rebounds"): [_REB],
+    ("basketball", "player_assists"): [_AST],
+    ("basketball", "player_threes"): [_t(("3PT",), ("threePointFieldGoalsMade-threePointFieldGoalsAttempted",), part=0)],
+    ("basketball", "player_blocks"): [_t(("BLK",), ("blocks",))],
+    ("basketball", "player_steals"): [_t(("STL",), ("steals",))],
+    ("basketball", "player_turnovers"): [_t(("TO",), ("turnovers",))],
+    ("basketball", "player_points_rebounds_assists"): [_PTS, _REB, _AST],
+    ("basketball", "player_points_rebounds"): [_PTS, _REB],
+    ("basketball", "player_points_assists"): [_PTS, _AST],
+    ("basketball", "player_rebounds_assists"): [_REB, _AST],
+    ("icehockey", "player_goals"): [_G],
+    ("icehockey", "player_assists"): [_A],
+    ("icehockey", "player_points"): [_G, _A],
+    ("icehockey", "player_shots_on_goal"): [_t(("S", "SOG"), ("shotsTotal", "shots", "shotsOnGoal"))],
+    ("icehockey", "player_blocked_shots"): [_t(("BS",), ("blockedShots",))],
+    ("icehockey", "player_total_saves"): [_t(("SV",), ("saves",))],
+    ("americanfootball", "player_pass_yds"): [_t(("YDS",), ("passingYards",), ("passing",))],
+    ("americanfootball", "player_pass_tds"): [_t(("TD",), ("passingTouchdowns",), ("passing",))],
+    ("americanfootball", "player_pass_completions"): [_t(("C/ATT",), ("completions/passingAttempts",), ("passing",), 0)],
+    ("americanfootball", "player_pass_attempts"): [_t(("C/ATT",), ("completions/passingAttempts",), ("passing",), 1)],
+    ("americanfootball", "player_pass_interceptions"): [_t(("INT",), ("interceptions",), ("passing",))],
+    ("americanfootball", "player_rush_yds"): [_t(("YDS",), ("rushingYards",), ("rushing",))],
+    ("americanfootball", "player_rush_attempts"): [_t(("CAR",), ("rushingAttempts",), ("rushing",))],
+    ("americanfootball", "player_receptions"): [_t(("REC",), ("receptions",), ("receiving",))],
+    ("americanfootball", "player_reception_yds"): [_t(("YDS",), ("receivingYards",), ("receiving",))],
+    ("americanfootball", "player_anytime_td"): [_t(("TD",), ("rushingTouchdowns",), ("rushing",), optional=True),
+                                                _t(("TD",), ("receivingTouchdowns",), ("receiving",), optional=True)],
+    ("baseball", "batter_hits"): [_t(("H",), ("hits",), ("batting",))],
+    ("baseball", "batter_home_runs"): [_t(("HR",), ("homeRuns",), ("batting",))],
+    ("baseball", "batter_rbis"): [_t(("RBI",), ("RBIs", "rbis"), ("batting",))],
+    ("baseball", "batter_runs_scored"): [_t(("R",), ("runs",), ("batting",))],
+    ("baseball", "batter_walks"): [_t(("BB",), ("walks",), ("batting",))],
+    ("baseball", "batter_strikeouts"): [_t(("K", "SO"), ("strikeouts",), ("batting",))],
+    ("baseball", "pitcher_strikeouts"): [_t(("K", "SO"), ("strikeouts",), ("pitching",))],
+    ("baseball", "pitcher_hits_allowed"): [_t(("H",), ("hits",), ("pitching",))],
+    ("baseball", "pitcher_walks"): [_t(("BB",), ("walks",), ("pitching",))],
+    ("baseball", "pitcher_earned_runs"): [_t(("ER",), ("earnedRuns",), ("pitching",))],
+    ("baseball", "pitcher_outs"): [_t(("IP",), ("fullInnings.partInnings", "inningsPitched"), ("pitching",), "outs")],
+}
+# Total bases isn't in the ESPN box score (no doubles/triples column), so it stays a manual check.
+
+
+def _family(sport_key: str) -> str:
+    return sport_key.split("_", 1)[0]
+
+
+def box_supported(leg: dict) -> bool:
+    return (PROP_GRADING and leg.get("sport_key") in ESPN_LEAGUES
+            and (_family(leg["sport_key"]), leg.get("market")) in BOX_STATS)
+
+
+def _words(name: str) -> list[str]:
+    """Lowercase ASCII words without punctuation or Jr./III: "D'Andre Swift Jr." -> ["dandre", "swift"]."""
+    s = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode().lower()
+    return [w for w in re.sub(r"[^a-z0-9 ]", "", s.replace("-", " ").replace(".", " ")).split()
+            if w not in ("jr", "sr", "ii", "iii", "iv", "v")]
+
+
+def _norm(name: str) -> str:
+    return "".join(_words(name))
+
+
+_ESPN_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _espn_get(path: str) -> dict:
+    """GET an ESPN site-API JSON page (free, no key)."""
+    req = urllib.request.Request(f"{ESPN_BASE}/{path}", headers={
+        "User-Agent": "Mozilla/5.0 (arbbot results)", "Accept-Encoding": "gzip", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read()
+        if resp.headers.get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
+        return json.loads(raw)
+
+
+def _espn(path: str, ttl: float = 600) -> dict:
+    hit = _ESPN_CACHE.get(path)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    data = _espn_get(path)
+    _ESPN_CACHE[path] = (time.time(), data)
+    return data
+
+
+def _team_match(odds_name: str, team: dict) -> int:
+    """2 = same full name, 1 = same nickname ("Los Angeles Clippers" / "LA Clippers"), 0 = no."""
+    n = _norm(odds_name)
+    full = {_norm(team.get("displayName", "")), _norm(f"{team.get('location', '')} {team.get('name', '')}")}
+    if n in full - {""}:
+        return 2
+    nick = _norm(team.get("name", "") or team.get("shortDisplayName", ""))
+    return 1 if nick and n.endswith(nick) else 0
+
+
+def espn_event_id(sport_key: str, home: str, away: str, commence: str) -> str | None:
+    """The ESPN game for an Odds API game: both teams match, within 12 hours of the start."""
+    league, extra = ESPN_LEAGUES[sport_key]
+    start = _parse_time(commence)
+    days = sorted({start.astimezone(ZoneInfo("America/New_York")).date(), start.date()})
+    found: list[tuple[int, str]] = []
+    for d in days:
+        sb = _espn(f"{league}/scoreboard?dates={d:%Y%m%d}" + (f"&{extra}" if extra else ""))
+        for ev in sb.get("events", []):
+            try:
+                comp = ev["competitions"][0]
+                teams = [c["team"] for c in comp["competitors"]]
+                when = _parse_time(ev.get("date") or comp.get("date"))
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            if abs(when - start) > timedelta(hours=12) or len(teams) != 2:
+                continue
+            a, b = teams
+            score = max(min(_team_match(home, a), _team_match(away, b)),   # either way round:
+                        min(_team_match(home, b), _team_match(away, a)))   # neutral sites
+            if score:
+                found.append((score, ev["id"]))
+    best = [eid for sc, eid in set(found) if sc == max((x for x, _ in found), default=0)]
+    return best[0] if len(best) == 1 else None   # nickname-only matches must be unambiguous
+
+
+def _num(raw: str, part=None) -> float | None:
+    raw = (raw or "").strip()
+    if not raw or raw in ("--", "-"):
+        return None
+    try:
+        if part == "outs":   # innings pitched: 6.1 = 6 innings and 1 out
+            whole, _, frac = raw.partition(".")
+            return int(whole) * 3 + int(frac or 0)
+        if part is not None:
+            return float(re.split(r"[-/]", raw)[part])
+        return float(raw)
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_box(summary: dict) -> dict:
+    """ESPN game summary -> {"final", "teams": {team id: {"name", "score", "players": {norm name:
+    {"name", "dnp", "groups": {group name: {LABEL or key: raw}}}}}}}"""
+    comp = (summary.get("header", {}).get("competitions") or [{}])[0]
+    status = comp.get("status", {}).get("type", {})
+    teams: dict[str, dict] = {}
+    for c in comp.get("competitors", []):
+        tid = str(c.get("id") or c.get("team", {}).get("id"))
+        teams[tid] = {"name": c.get("team", {}).get("displayName", ""), "score": _num(str(c.get("score", ""))),
+                      "players": {}}
+    for side in summary.get("boxscore", {}).get("players", []):
+        tid = str(side.get("team", {}).get("id"))
+        team = teams.setdefault(tid, {"name": side.get("team", {}).get("displayName", ""), "score": None,
+                                      "players": {}})
+        for group in side.get("statistics", []):
+            gname = (group.get("name") or group.get("text") or "").lower()
+            labels = [str(x).upper() for x in (group.get("labels") or group.get("names") or [])]
+            keys = [str(x) for x in (group.get("keys") or [])]
+            for a in group.get("athletes", []):
+                who = a.get("athlete", {})
+                name = who.get("displayName") or who.get("fullName") or ""
+                if not name:
+                    continue
+                p = team["players"].setdefault(_norm(name), {"name": name, "dnp": True, "groups": {}})
+                stats = a.get("stats") or []
+                if stats and not a.get("didNotPlay"):
+                    p["dnp"] = False
+                    cols = p["groups"].setdefault(gname, {})
+                    for i, raw in enumerate(stats):
+                        if i < len(labels):
+                            cols.setdefault(labels[i], raw)
+                        if i < len(keys):
+                            cols.setdefault(keys[i], raw)
+    return {"final": bool(status.get("completed")) or status.get("state") == "post", "teams": teams}
+
+
+def _read(player: dict, terms: list) -> float | None:
+    total, found = 0.0, False
+    for cats, labels, keys, part, optional in terms:
+        value = None
+        for gname, cols in player["groups"].items():
+            if cats and not any(c in gname for c in cats):
+                continue
+            raw = next((cols[x] for x in [*labels, *keys] if x in cols), None)
+            if raw is not None:
+                value = _num(raw, part)
+                break
+        if value is None and not optional:
+            return None
+        if value is not None:
+            total, found = total + value, True
+    return total if found or all(t[4] for t in terms) else None
+
+
+def box_checks(sport_key: str, box: dict) -> list[str]:
+    """Self-checks that the columns were read right; returns the problems (empty = trust it).
+    Points add up to the score (NBA), goals to the score (NHL, give or take a shootout goal),
+    runs to the score (MLB), receptions to completions (football)."""
+    fam, problems = _family(sport_key), []
+    for team in box["teams"].values():
+        players = [p for p in team["players"].values() if not p["dnp"]]
+        if not players:
+            problems.append(f"{team['name']}: no players in the box score")
+            continue
+        def total(terms):
+            vals = [_read(p, terms) for p in players]
+            return sum(v for v in vals if v is not None), sum(v is not None for v in vals)
+        score = team["score"]
+        if fam == "basketball":
+            pts, n = total([_PTS])
+            if not n or score is None or pts != score:
+                problems.append(f"{team['name']}: players' points {pts:g} vs score {score}")
+        elif fam == "icehockey":
+            goals, n = total([_G])
+            if score is None or not 0 <= score - goals <= 1:
+                problems.append(f"{team['name']}: players' goals {goals:g} vs score {score}")
+        elif fam == "baseball":
+            runs, n = total([_t(("R",), ("runs",), ("batting",))])
+            if not n or score is None or runs != score:
+                problems.append(f"{team['name']}: players' runs {runs:g} vs score {score}")
+        elif fam == "americanfootball":
+            rec, n1 = total(BOX_STATS[("americanfootball", "player_receptions")])
+            comp, n2 = total(BOX_STATS[("americanfootball", "player_pass_completions")])
+            if not n1 or not n2 or rec != comp:
+                problems.append(f"{team['name']}: receptions {rec:g} vs completions {comp:g}")
+    return problems
+
+
+_BOX_CACHE: dict[str, dict] = {}
+
+
+def game_box(sport_key: str, home: str, away: str, commence: str) -> tuple[dict | None, str]:
+    """(box score, "") once the game is final and the box passed its checks, else (None, why)."""
+    eid = espn_event_id(sport_key, home, away, commence)
+    if not eid:
+        return None, "couldn't find the game on ESPN"
+    if eid in _BOX_CACHE:
+        return _BOX_CACHE[eid], ""
+    league, _ = ESPN_LEAGUES[sport_key]
+    box = parse_box(_espn(f"{league}/summary?event={eid}", ttl=300))
+    if not box["final"]:
+        return None, "not final yet"
+    if problems := box_checks(sport_key, box):
+        return None, "box score didn't check out: " + "; ".join(problems)
+    _BOX_CACHE[eid] = box
+    return box, ""
+
+
+def find_player(box: dict, name: str) -> dict | None:
+    """Exact name, else a unique same-last-name-and-first-initial match ("Mitch"/"Mitchell")."""
+    every = [(k, p) for t in box["teams"].values() for k, p in t["players"].items()]
+    exact = [p for k, p in every if k == _norm(name)]
+    if len(exact) == 1:
+        return exact[0]
+    want = _words(name)
+    if len(want) < 2 or exact:
+        return None
+    close = [p for _, p in every if len(w := _words(p["name"])) >= 2
+             and w[-1] == want[-1] and w[0][0] == want[0][0]]
+    return close[0] if len(close) == 1 else None
+
+
+def settle_prop(row: dict, value: float) -> tuple[str, float]:
+    """Over/Under the line, or Yes/No (anytime TD: at least one)."""
+    point = float(row["point"]) if row.get("point") not in ("", None) else None
+    side = row["outcome"].lower()
+    if point is None:
+        res = "win" if (value >= 1) == (side != "no") else "loss"
+    else:
+        diff = (value - point) if side != "under" else (point - value)
+        res = "win" if diff > 0 else ("push" if diff == 0 else "loss")
+    stake, price = float(row["stake"]), float(row["price"])
+    return res, round(stake * (price - 1) if res == "win" else (-stake if res == "loss" else 0.0), 2)
+
+
+def grade_prop(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
+    """((result, profit), what the box score said) or (None, why not yet)."""
+    try:
+        box, why = game_box(row["sport_key"], row["home_team"], row["away_team"], row["commence_time"])
+    except Exception as e:  # noqa: BLE001 - ESPN down or changed: leave it for later / manual
+        return None, f"ESPN error: {e!r:.120}"
+    if box is None:
+        return None, why
+    p = find_player(box, row["player"])
+    if p is None:
+        return None, f"{row['player']} isn't in the box score"
+    if p["dnp"]:
+        return ("push", 0.0), "DNP"   # didn't play: books void the bet
+    value = _read(p, BOX_STATS[(_family(row["sport_key"]), row["market"])])
+    if value is None:
+        return None, f"no {MARKET_NAMES.get(row['market'], row['market'])} for {p['name']} in the box score"
+    return settle_prop(row, value), f"{value:g}"
 
 
 # --------------------------------------------------------------------------- results by day
@@ -2633,6 +2986,7 @@ def day_bets(cfg: Config, day) -> list[dict]:
         g = graded.get(bid, {})
         out.append({**r, "result": g.get("result", ""), "profit": g.get("profit", ""),
                     "home_score": g.get("home_score", ""), "away_score": g.get("away_score", ""),
+                    "actual": g.get("actual", ""), "manual_legs": g.get("manual_legs", ""),
                     "clv_pct": g.get("clv_pct") or r.get("clv_pct", "")})
     return sorted(out, key=lambda r: r["commence_time"])
 
@@ -2650,15 +3004,19 @@ def result_line(r: dict, cfg: Config, now: datetime | None = None, discord: bool
     start = _parse_time(r["commence_time"])
     if r.get("result") in RESULT_ICON:
         icon, tail = RESULT_ICON[r["result"]], f"→ {b(signed_money(float(r['profit'])))}"
-    elif not gradable(r):
-        what = "has a prop leg: check it yourself" if r.get("kind") == "parlay" else "check the box score yourself"
-        icon, tail = "🎯", f"· {what}" if start <= now else "· not started yet"
+        if r.get("actual") == "DNP":
+            tail += " (didn't play: void)"
     elif start > now:
         ts = int(start.timestamp())
         icon, tail = "⏰", (f"· starts <t:{ts}:t>" if discord
                            else f"· starts {start.astimezone(ZoneInfo(cfg.timezone)):%-I:%M %p}")
+    elif not gradable(r) or stuck(r, cfg, now):
+        what = ("has a prop leg: check it yourself" if r.get("kind") == "parlay"
+                else "couldn't grade it automatically: check the box score" if r.get("player") and gradable(r)
+                else "check the box score yourself")
+        icon, tail = "🎯", f"· {what}"
     else:
-        icon, tail = "⏳", "· waiting for the final"
+        icon, tail = "⏳", "· waiting for the box score" if r.get("player") else "· waiting for the final"
     if r.get("kind") == "parlay":
         where, icon2 = r.get("outcome", ""), "📦"
     else:
@@ -2666,21 +3024,33 @@ def result_line(r: dict, cfg: Config, now: datetime | None = None, discord: bool
         if r.get("home_score") not in ("", None):
             where = (f"Final: {r['away_team']} {float(r['away_score']):g}, "
                      f"{r['home_team']} {float(r['home_score']):g}")
+        elif r.get("actual") not in ("", None, "DNP"):
+            where = f"Box score: {r['actual']} · {r.get('matchup', '')}"   # the pick already names the stat
     if r.get("clv_pct") not in ("", None):
         where += f" · CLV {float(r['clv_pct']):+.1f}%"
     return f"{icon} {head} {tail}\n     {icon2} {where}"
 
 
-def day_summary(rows: list[dict]) -> str:
+def stuck(r: dict, cfg: Config, now: datetime) -> bool:
+    """Ungraded 3+ hours after the game should have ended: the bot couldn't (a prop it couldn't
+    find in the box score, a postponed game...), so it's on you."""
+    return not r.get("result") and max(
+        _parse_time(l["commence_time"]) + timedelta(minutes=cfg.minutes_for(l["sport_key"]) + 180)
+        for l in _legs(r)) < now
+
+
+def day_summary(rows: list[dict], cfg: Config | None = None, now: datetime | None = None) -> str:
     """Record for the day, per kind, plus what's still to come."""
     lines = [f"**All:** {record_line(rows)}"]
     for kind, label in KIND_LABEL.items():
         group = [r for r in rows if _kind(r) == kind and r.get("result")]
         if group:
             lines.append(f"{label}: {record_line(group)}")
-    waiting = sum(1 for r in rows if not r.get("result") and gradable(r))
-    props = sum(1 for r in rows if not r.get("result") and not gradable(r) and r.get("kind") != "parlay")
-    mixed = sum(1 for r in rows if not r.get("result") and not gradable(r) and r.get("kind") == "parlay")
+    now = now or datetime.now(timezone.utc)
+    manual = [r for r in rows if not r.get("result") and (not gradable(r) or (cfg and stuck(r, cfg, now)))]
+    waiting = sum(1 for r in rows if not r.get("result")) - len(manual)
+    props = sum(1 for r in manual if r.get("kind") != "parlay")
+    mixed = sum(1 for r in manual if r.get("kind") == "parlay")
     notes = [f"⏳ {waiting} still to finish" if waiting else "",
              f"🎯 {props} prop{'s' if props != 1 else ''} to check yourself" if props else "",
              f"📦 {mixed} parlay{'s' if mixed != 1 else ''} with a prop leg to check yourself" if mixed else ""]
@@ -2690,14 +3060,21 @@ def day_summary(rows: list[dict]) -> str:
 
 
 def arbs_on(cfg: Config, day) -> str:
-    """Arbs alerted that day, and the profit they locked in at BANKROLL (if you placed them all)."""
+    """Arbs alerted that day: how many different ones (an arb that closes and reopens is logged
+    each time), what they'd have locked in placed once each at BANKROLL, and how long they lasted."""
     rows = [r for r in _read_csv(cfg.log_file) if r.get("first_seen")
             and local_day(cfg, r["first_seen"]) == day]
     if not rows:
         return ""
-    locked = sum(float(r.get("best_profit_pct") or 0) for r in rows) * cfg.bankroll / 100
-    return (f"💰 **Arbs:** {len(rows)} alerted · about {signed_money(locked)} locked in if you placed "
-            f"them all at {money(cfg.bankroll)} (an arb wins either way)")
+    first: dict[tuple, dict] = {}
+    for r in rows:
+        first.setdefault((r.get("matchup"), r.get("market"), r.get("line")), r)
+    locked = sum(float(r.get("best_profit_pct") or 0) for r in first.values()) * cfg.bankroll / 100
+    lasted = sorted(float(r["seconds_open"]) for r in rows if r.get("seconds_open") not in ("", None))
+    gone = f" · half were gone within {_fmt_secs(lasted[len(lasted) // 2])}" if lasted else ""
+    alerts = f" ({len(rows)} alerts)" if len(rows) != len(first) else ""
+    return (f"💰 **Arbs:** {len(first)} different{alerts} · about {signed_money(locked)} if you'd placed each "
+            f"once at {money(cfg.bankroll)}{gone}")
 
 
 def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: list[dict],
@@ -2714,11 +3091,74 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
                                  if graded else "")
     arbs = arbs_on(cfg, day)
     desc = (body + DIVIDER + f"**{day:%a %b %-d}** (every alert at the stake it showed)\n"
-            + day_summary(day_rows) + (f"\n{arbs}" if arbs else ""))
+            + day_summary(day_rows, cfg, now) + (f"\n{arbs}" if arbs else ""))
     color = 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else GREY)
     return _card(title, desc, color,
                  footer="Results assume every alert was bet at the stake shown. Props need a box score, "
                         "so check those in your book's app.")
+
+
+def _graded(cfg: Config, since: datetime | None = None) -> list[dict]:
+    rows = [r for r in _read_csv(cfg.ev_results_file)
+            if r.get("result") in ("win", "loss", "push") and not r.get("manual_legs")]
+    return [r for r in rows if not since or _parse_time(r["commence_time"]) >= since]
+
+
+def record_block(rows: list[dict]) -> list[str]:
+    """All, each kind, and live vs pre-game."""
+    if not rows:
+        return ["no graded bets yet"]
+    lines = [f"**All:** {record_line(rows)}"]
+    for kind, label in KIND_LABEL.items():
+        group = [r for r in rows if _kind(r) == kind]
+        if group:
+            lines.append(f"{label}: {record_line(group)}")
+    live = [r for r in rows if str(r.get("live")).lower() == "true"]
+    if live and len(live) < len(rows):
+        pre = [r for r in rows if str(r.get("live")).lower() != "true"]
+        lines.append(f"🔴 Live: {record_line(live)}")
+        lines.append(f"⏰ Pre-game: {record_line(pre)}")
+    return lines
+
+
+def scoreboard_text(cfg: Config, now: datetime | None = None) -> str:
+    """Today so far, the last 7 days, all time, and bet quality (CLV): the same numbers as
+    arbbot.py --results, kept up to date in one Discord message."""
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(ZoneInfo(cfg.timezone)).date()
+    rows = day_bets(cfg, today)
+    arbs = arbs_on(cfg, today)
+    parts = [f"__**Today · {today:%a %b %-d}**__\n" + day_summary(rows, cfg, now) + (f"\n{arbs}" if arbs else ""),
+             "__**Last 7 days**__\n" + "\n".join(record_block(_graded(cfg, now - timedelta(days=7)))),
+             "__**All time**__\n" + "\n".join(record_block(_graded(cfg)))]
+    ever = clv_rows(cfg)
+    if ever:
+        good = sum(r["clv_pct"] for r in ever) > 0 and sum(r["beat_close"] for r in ever) * 2 > len(ever)
+        rows_per_group = 4 if len("\n\n".join(parts)) < 2500 else 2   # Discord cards hold 4,096 characters
+        table = []
+        for group, items in clv_breakdown(cfg).items():
+            if items:
+                table.append(group)
+                table += [f"  {name[:16]:<16}{n:>4}  {avg:+5.1f}%  {beat:3.0f}%"
+                          for name, n, avg, beat in items[:rows_per_group]]
+        parts.append("__**📐 Bet quality (CLV)**__\n"
+                     f"All time: {clv_record(cfg)} · last 7 days: {clv_record(cfg, 7)}\n"
+                     + ("✅ Beating the closing line: the edge looks real." if good
+                        else "⚠️ Not beating the closing line yet. Give it more bets.")
+                     + "\n```\n                    bets   CLV  beat\n" + "\n".join(table) + "\n```")
+    return "\n\n".join(parts)
+
+
+def scoreboard_payload(cfg: Config, now: datetime | None = None) -> dict:
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(ZoneInfo(cfg.timezone)).date()
+    profit = _record([r for r in day_bets(cfg, today) if r.get("result")])[3]
+    text = scoreboard_text(cfg, now)
+    if len(text) > 4000:   # very long: drop the CLV table rather than cut a section in half
+        text = text.split("\n```")[0][:4000]
+    return _card("📊 Scoreboard", text,
+                 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else 0x5865F2),
+                 footer="Every alert at the stake it showed. Updates by itself as games finish. Pin this message.")
 
 
 class Results:
@@ -2734,7 +3174,10 @@ class Results:
         self.last = 0.0
         self.path = data_path(cfg.state_dir) / "results_posted.json" if cfg.state_dir and not self.dry_run else None
         self.posted: dict[str, str] = {}   # bet id -> game start (to prune)
-        self.recap_day = ""                # last day whose full recap went out (YYYY-MM-DD)
+        self.recap_days: list[str] = []    # days whose full recap went out (YYYY-MM-DD)
+        self.graded_day = ""               # last day the full (not just recent) grading pass ran
+        self.recap_tried = 0.0             # last recap attempt, so a failing one isn't retried nonstop
+        self.board: dict[str, str] = {}    # the scoreboard message: {"id", "hash"}
         if self.path and not self.path.exists():
             # First run: everything already graded counts as posted, so there's no flood.
             self.posted = {_bet_id(r): r["commence_time"] for r in _read_csv(cfg.ev_results_file)}
@@ -2750,7 +3193,9 @@ class Results:
         except (OSError, ValueError):
             return
         self.posted.update(data.get("posted", {}))
-        self.recap_day = max(self.recap_day, data.get("recap_day", ""))
+        self.recap_days = sorted(set(self.recap_days) | set(data.get("recap_days", [])))[-14:]
+        if data.get("board", {}).get("id") and not self.board.get("id"):
+            self.board = data["board"]
 
     def _save(self, now: datetime | None = None) -> None:
         if not self.path:
@@ -2761,7 +3206,7 @@ class Results:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"posted": self.posted, "recap_day": self.recap_day}))
+            tmp.write_text(json.dumps({"posted": self.posted, "recap_days": self.recap_days, "board": self.board}))
             tmp.replace(self.path)
         except OSError as e:
             print(f"  ! Couldn't save results state: {e}", file=sys.stderr)
@@ -2804,6 +3249,42 @@ class Results:
         self._save(now)
         return sent
 
+    def tick(self, api: "OddsAPI", now: datetime | None = None) -> int:
+        """The regular pass from the main loop: grade and post results, then the scoreboard."""
+        n = self.run(api, now)
+        self.update_board(now)
+        return n
+
+    def update_board(self, now: datetime | None = None) -> None:
+        """Keep the scoreboard message current: edit it when the numbers change, post a new one
+        if it was deleted (or the results channel changed)."""
+        payload = scoreboard_payload(self.cfg, now)
+        emb = {k: v for k, v in payload["embeds"][0].items() if k != "timestamp"}
+        digest = hashlib.sha1(json.dumps(emb, sort_keys=True).encode()).hexdigest()[:16]
+        if digest == self.board.get("hash"):
+            return
+        if self.dry_run:
+            print(f"[scoreboard]\n{emb['description']}", flush=True)
+            self.board["hash"] = digest
+            return
+        try:
+            if self.board.get("id"):
+                try:
+                    _webhook(self.url, payload, "PATCH", self.board["id"])
+                except urllib.error.HTTPError as e:
+                    if e.code != 404:
+                        raise
+                    self.board.pop("id")   # deleted: post a fresh one
+            if not self.board.get("id"):
+                msg = _webhook(self.url, payload)
+                if not msg:
+                    return
+                self.board["id"] = msg["id"]
+            self.board["hash"] = digest
+            self._save(now)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! Scoreboard update failed: {e}", file=sys.stderr)
+
     def send(self, payload: dict) -> bool:
         emb = payload["embeds"][0]
         print(f"[results] {emb['title']}\n{emb['description']}", flush=True)
@@ -2816,28 +3297,100 @@ class Results:
             return False
 
     def daily(self, api: "OddsAPI", day, now: datetime | None = None) -> None:
-        """Daily pass: grade everything still open (not just recent games), post the full card
-        for `day`, and count that day's bets as posted so they don't also come one by one."""
-        try:
-            settle_pending(self.cfg, api, now)
-        except Exception as e:  # noqa: BLE001
-            print(f"! Grading bets failed: {e}", file=sys.stderr)
+        """Daily pass: grade everything still open (not just recent games) once, post the full
+        card for `day`, and count that day's bets as posted so they don't also come one by one.
+        A failed post is tried again at most every RESULTS_MINUTES (10 at the least)."""
+        self.recap_tried = time.time()
+        if self.graded_day != day.isoformat():
+            self.graded_day = day.isoformat()
+            try:
+                settle_pending(self.cfg, api, now)
+            except Exception as e:  # noqa: BLE001
+                print(f"! Grading bets failed: {e}", file=sys.stderr)
         self.recap(day, now)
+        self.update_board(now)
 
     def recap_due(self, day) -> bool:
+        if time.time() - self.recap_tried < max(600, self.cfg.results_minutes * 60):
+            return False
         self._load()
-        return self.recap_day < day.isoformat()
+        return day.isoformat() not in self.recap_days
 
-    def recap(self, day, now: datetime | None = None) -> bool:
-        """The whole day's bets and record. Marks them posted (and the day done) once it's sent."""
+    def recap(self, day, now: datetime | None = None, finished: bool = True) -> str:
+        """The whole day's bets and record: "sent", "nothing" (no bets that day) or "failed".
+        Once sent, that day's bets count as posted; a finished day also counts as recapped (a
+        card posted by hand mid-day doesn't stop the bot's full one the next morning)."""
         rows = day_bets(self.cfg, day)
+        outcome = "nothing"
         if rows or arbs_on(self.cfg, day):
             if not self.send(results_payload(self.cfg, f"📅 Results for {day:%a %b %-d}", rows, rows, day, now)):
-                return False
+                return "failed"
+            outcome = "sent"
         self.mark([r for r in _read_csv(self.cfg.ev_results_file) if local_day(self.cfg, r["commence_time"]) == day])
-        self.recap_day = max(self.recap_day, day.isoformat())
+        if finished:
+            self.recap_days = sorted(set(self.recap_days) | {day.isoformat()})[-14:]
         self._save(now)
-        return True
+        return outcome
+
+
+def check_props(cfg: Config, now: datetime | None = None) -> None:
+    """Show what the bot reads from the latest finished game's box score in each prop sport, and
+    what it would do with your ungraded prop bets. Uses no Odds API credits."""
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(ZoneInfo("America/New_York")).date()
+    print("Checking player-prop grading against ESPN box scores...\n")
+    for sport in cfg.prop_sports:
+        if sport not in ESPN_LEAGUES:
+            print(f"{short(sport)}: no box scores for this sport, so its props are checked by hand.\n")
+            continue
+        league, extra = ESPN_LEAGUES[sport]
+        done = []
+        try:
+            for d in (today - timedelta(days=1), today):
+                sb = _espn(f"{league}/scoreboard?dates={d:%Y%m%d}" + (f"&{extra}" if extra else ""))
+                for ev in sb.get("events", []):
+                    status = (ev.get("status") or ev.get("competitions", [{}])[0].get("status") or {}).get("type", {})
+                    if status.get("completed"):
+                        done.append(ev)
+            if not done:
+                print(f"{short(sport)}: no finished games yesterday or today to check.\n")
+                continue
+            ev = done[-1]
+            box = parse_box(_espn(f"{league}/summary?event={ev['id']}", ttl=300))
+        except Exception as e:  # noqa: BLE001
+            print(f"{short(sport)}: couldn't reach ESPN ({e!r:.150})\n")
+            continue
+        problems = box_checks(sport, box)
+        names = " vs ".join(f"{t['name']} {t['score']:g}" if t["score"] is not None else t["name"]
+                            for t in box["teams"].values())
+        print(f"{short(sport)}: {names}")
+        print("  ✅ box score checks out" if not problems else "  ⚠️ " + "; ".join(problems)
+              + " (props in games like this are left for you to check)")
+        for market in _csv(cfg.prop_markets.get(sport, "").replace("|", ",")):
+            terms = BOX_STATS.get((_family(sport), market))
+            label = MARKET_NAMES.get(market, market)
+            if not terms:
+                print(f"  {label}: not in the box score, so you check these yourself")
+                continue
+            top = sorted(((v, p["name"]) for t in box["teams"].values() for p in t["players"].values()
+                          if not p["dnp"] and (v := _read(p, terms)) is not None), reverse=True)[:3]
+            print(f"  {label}: " + (", ".join(f"{n} {v:g}" for v, n in top) or "nothing found"))
+        print()
+    graded = {_bet_id(r) for r in _read_csv(cfg.ev_results_file)}
+    mine = [r for bid, r in logged_bets(cfg, since=now - timedelta(days=3)).items()
+            if r.get("player") and bid not in graded]
+    if mine:
+        print("Your ungraded prop bets (nothing is saved by this check):")
+        for r in mine[:20]:
+            over = _parse_time(r["commence_time"]) + timedelta(minutes=cfg.minutes_for(r["sport_key"])) <= now
+            if not box_supported(r):
+                verdict = "checked by hand (this stat isn't in the box score)"
+            elif not over:
+                verdict = "game not over yet"
+            else:
+                res, said = grade_prop(r)
+                verdict = (f"{RESULT_ICON[res[0]]} {res[0]} (box score: {said})" if res else f"⏳ {said}")
+            print(f"  {row_pick(r)} {odds(float(r['price']))}: {verdict}")
 
 
 def print_day(cfg: Config, day, now: datetime | None = None) -> None:
@@ -2847,7 +3400,7 @@ def print_day(cfg: Config, day, now: datetime | None = None) -> None:
         print("  No +EV, outlier, prop or parlay alerts for games that day.")
     for r in rows:
         print("  " + result_line(r, cfg, now, discord=False).replace("\n", "\n  "))
-    print("\n" + day_summary(rows).replace("**", ""))
+    print("\n" + day_summary(rows, cfg, now).replace("**", ""))
     if arbs := arbs_on(cfg, day):
         print(arbs.replace("**", ""))
 
@@ -3401,7 +3954,7 @@ One ticket with 2-3 +EV bets from different games, all at the same book. Every l
 The chance is over. Ignore it.
 
 📋 **RESULTS** (in the results channel)
-As games finish, the bot posts what hit: ✅ won, ❌ lost, ➖ push, with the profit at the stake shown, and the day's record so far. 🎯 props need a box score, so check those in your book's app.
+As games finish, the bot posts what hit: ✅ won, ❌ lost, ➖ push, with the profit at the stake shown, and the day's record so far. Props are graded from the box score too. 🎯 means check that one yourself. The pinned 📊 Scoreboard keeps the running record.
 
 **Every time**
 1. Tap the book name to open it. Check the price matches the alert, or is better.
@@ -3588,22 +4141,19 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         print(f"Graded {n} new bet(s).")
         if args.post_results:
             res = Results(cfg, dry_run=args.dry_run)
-            if res.dry_run:
-                res.recap(day)
+            outcome = res.recap(day, finished=day < today)
+            if outcome == "nothing":
+                print(f"No alerts for games on {day:%a %b %-d}, so there's nothing to post.")
+            elif res.dry_run:
                 print("(dry run: not sent)")
-            elif res.recap(day):
+            elif outcome == "sent":
                 print("Posted to Discord. The bot won't post these results again.")
             else:
                 sys.exit("Couldn't post to Discord (see the error above). Try again in a minute.")
             return
         print_day(cfg, day)
-        print()
-        print(f"+EV record, last 7 days (every alert, at the alerted price): {ev_record(cfg, 7)}")
-        print(f"+EV record, all time: {ev_record(cfg)}")
-        print(f"CLV (price you got vs the closing fair line), last 7 days: {clv_record(cfg, 7)}")
-        print(f"CLV, all time: {clv_record(cfg)}")
-        print("CLV by group, all time (positive and beating the close more than half the time = real edge):")
-        print(clv_report(cfg))
+        board = scoreboard_text(cfg).split("\n\n", 1)[1]     # the day itself is printed above
+        print("\n" + re.sub(r"__|\*\*|```\n?", "", board))
         return
 
     mode = "dry run (console only)" if alerter.dry_run else "sending to Discord"
@@ -3637,7 +4187,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             if cfg.props_enabled:
                 sections.append(("🎯 **Props**", f"{prop_evs.summary()}; {prop_outs.summary()}"))
             if cfg.outliers_enabled:
-                sections.append(("🚨 **Outliers**", out_alerter.summary()))
+                sections.append(("🚨 **Outliers**", f"{out_alerter.summary()}\nIf you bet every alert: last 7 days "
+                                 f"{ev_record(cfg, 7, kinds=('outlier',))}"))
             if cfg.parlays_enabled:
                 sections.append(("📦 **Parlays**", parlay_alerter.summary()))
             status.send_card(summary_payload(cfg, sections, api.remaining))
@@ -3761,7 +4312,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 and results.recap_due(yesterday)):
             results.daily(api, yesterday, now)   # yesterday's full card, once (survives restarts)
         if not args.once and results.due():
-            n_res = results.run(api, now)
+            n_res = results.tick(api, now)
             if n_res:
                 print(f"  📋 {n_res} bet result(s) posted", flush=True)
 
@@ -3787,6 +4338,8 @@ def main() -> None:
                    help="paste a Discord webhook URL for a channel: " + ", ".join(sorted(WEBHOOK_SETTINGS)))
     p.add_argument("--post-guide", action="store_true",
                    help="post a how-to-use guide to your Discord channel (then pin it)")
+    p.add_argument("--check-props", action="store_true",
+                   help="check that player props can be graded from ESPN box scores (free, no credits)")
     p.add_argument("--post-results", nargs="?", const="today", metavar="DAY",
                    help="post a day's results card to the results channel (today, yesterday or YYYY-MM-DD)")
     p.add_argument("--results", nargs="?", const="today", metavar="DAY",
@@ -3833,8 +4386,13 @@ def main() -> None:
             except Exception:  # noqa: BLE001 - already exiting with the reason printed
                 pass
         sys.exit(2)
-    global ODDS_FORMAT
+    global ODDS_FORMAT, PROP_GRADING
     ODDS_FORMAT = cfg.odds_format
+    PROP_GRADING = cfg.prop_grading != "off"
+
+    if args.check_props:
+        check_props(cfg)
+        return
 
     if args.post_guide:
         if not cfg.webhook_url:
