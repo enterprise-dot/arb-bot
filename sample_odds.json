@@ -173,5 +173,120 @@
         ]
       }
     ]
+  },
+  {
+    "id": "demo-nhl-1",
+    "sport_key": "icehockey_nhl",
+    "sport_title": "NHL",
+    "commence_time": "2026-10-03T00:00:00Z",
+    "home_team": "New York Rangers",
+    "away_team": "Boston Bruins",
+    "bookmakers": [
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "New York Rangers",
+                "price": 1.25
+              },
+              {
+                "name": "Boston Bruins",
+                "price": 4.1
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "New York Rangers",
+                "price": 1.24
+              },
+              {
+                "name": "Boston Bruins",
+                "price": 4.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "fanduel",
+        "title": "FanDuel",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "New York Rangers",
+                "price": 1.26
+              },
+              {
+                "name": "Boston Bruins",
+                "price": 3.9
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "betmgm",
+        "title": "BetMGM",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "New York Rangers",
+                "price": 1.25
+              },
+              {
+                "name": "Boston Bruins",
+                "price": 3.95
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "williamhill_us",
+        "title": "Caesars",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "New York Rangers",
+                "price": 1.85
+              },
+              {
+                "name": "Boston Bruins",
+                "price": 1.95
+              }
+            ]
+          }
+        ]
+      }
+    ]
   }
 ]

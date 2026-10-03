@@ -98,6 +98,7 @@ class Config:
     events_refresh_minutes: int = 10
     game_minutes: dict[str, int] = field(default_factory=dict)  # per-sport override
     min_profit_pct: float = 0.5
+    min_profit_dollars: float = 0.0  # skip arbs that lock in less than this (at BANKROLL)
     max_profit_pct: float = 15.0  # above this it's almost always a stale/bad line
     max_age_seconds: int = 120    # live games: ignore prices not updated this recently
     pregame_max_age_seconds: int = 900  # pre-game lines can sit unchanged for a while
@@ -135,6 +136,14 @@ class Config:
     ev_mention: str = ""
     ev_log_file: str = "ev_bets.csv"
     ev_results_file: str = "ev_results.csv"
+    # Outliers: one book far off every other book's price
+    outliers_enabled: bool = True
+    outlier_min_pct: float = 10.0   # edge vs the other books' median fair price
+    outlier_min_books: int = 3      # need at least this many other books to compare against
+    outlier_live: bool = True       # live is where stale books show up most
+    outlier_mention: str = ""
+    outlier_webhook_url: str = ""
+    outlier_log_file: str = "outliers.csv"
     live_only: bool = False       # only alert on games in progress
     active_hours: str = ""        # e.g. "08:00-22:00"; empty = always on
     timezone: str = "America/New_York"
@@ -159,6 +168,7 @@ class Config:
             game_minutes={k.strip(): int(v) for k, v in
                           (p.split("=") for p in _csv(e("GAME_MINUTES", "")))},
             min_profit_pct=float(e("MIN_PROFIT_PCT", d.min_profit_pct)),
+            min_profit_dollars=float(e("MIN_PROFIT_DOLLARS", d.min_profit_dollars)),
             max_profit_pct=float(e("MAX_PROFIT_PCT", d.max_profit_pct)),
             max_age_seconds=int(e("MAX_AGE_SECONDS", d.max_age_seconds)),
             pregame_max_age_seconds=int(e("PREGAME_MAX_AGE_SECONDS", d.pregame_max_age_seconds)),
@@ -196,6 +206,13 @@ class Config:
             ev_mention=e("EV_MENTION", ""),
             ev_log_file=e("EV_LOG_FILE", d.ev_log_file),
             ev_results_file=e("EV_RESULTS_FILE", d.ev_results_file),
+            outliers_enabled=e("OUTLIERS_ENABLED", "true").lower() in ("1", "true", "yes"),
+            outlier_min_pct=float(e("OUTLIER_MIN_PCT", d.outlier_min_pct)),
+            outlier_min_books=int(e("OUTLIER_MIN_BOOKS", d.outlier_min_books)),
+            outlier_live=e("OUTLIER_LIVE", "true").lower() in ("1", "true", "yes"),
+            outlier_mention=e("OUTLIER_MENTION", ""),
+            outlier_webhook_url=e("DISCORD_OUTLIER_WEBHOOK_URL", ""),
+            outlier_log_file=e("OUTLIER_LOG_FILE", d.outlier_log_file),
             live_only=e("LIVE_ONLY", "false").lower() in ("1", "true", "yes"),
             active_hours=e("ACTIVE_HOURS", "").strip(),
             timezone=e("TIMEZONE", d.timezone),
@@ -445,7 +462,7 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
             min_pct = cfg.min_live_profit_pct if is_live else cfg.min_profit_pct
             if min_pct <= arb.exact_pct <= cfg.max_profit_pct:
                 arb.set_stakes(cfg.bankroll, cfg.round_stakes, cfg.round_keep_pct)
-                if arb.profit_pct >= min_pct:
+                if arb.profit_pct >= min_pct and arb.guaranteed_profit >= cfg.min_profit_dollars:
                     arbs.append(arb)
 
     return sorted(arbs, key=lambda a: a.profit_pct, reverse=True)
@@ -816,6 +833,8 @@ class EVBet:
     unit_size: float = 0.0
     sharp_quotes: list[tuple[str, list[float]]] = field(default_factory=list)  # (book, [this side, other side(s)])
     board: list[tuple[str, float, float]] = field(default_factory=list)        # every book: (book, price, EV%)
+    hedge: list[tuple[str, str, float]] = field(default_factory=list)  # (outcome, book, price) to lock it in
+    hedge_pct: float = 0.0           # guaranteed profit % if the hedge is placed too
     first_fair_prob: float = 0.0     # fair probability when first alerted (to show movement)
     first_sharp_quotes: list[tuple[str, list[float]]] = field(default_factory=list)
 
@@ -1105,6 +1124,145 @@ class EVAlerter(Alerter):
         }
 
 
+# --------------------------------------------------------------------------- outliers
+
+def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) -> list[EVBet]:
+    """One book's price far above what every other book thinks (e.g. +400 where the rest
+    are around -400). Usually a book that hasn't moved yet. Fair odds here are the median of
+    all the OTHER books' no-vig prices, so it works even when Pinnacle is slow or missing."""
+    if not cfg.outliers_enabled:
+        return []
+    now = now or datetime.now(timezone.utc)
+    reference_only = set() if cfg.bet_at_sharp else set(_csv(cfg.sharp_books))
+    out: list[EVBet] = []
+
+    for ev in events:
+        is_live = _parse_time(ev["commence_time"]) <= now
+        if (cfg.live_only and not is_live) or (is_live and not cfg.outlier_live):
+            continue
+        # (market, line) -> book key -> {outcome: price}, fresh full markets only
+        lines: dict[tuple, dict[str, dict[str, float]]] = {}
+        titles: dict[str, str] = {}
+        links: dict[tuple, str] = {}
+        points: dict[tuple, float | None] = {}
+        for bm in ev.get("bookmakers", []):
+            titles[bm["key"]] = bm.get("title", bm["key"])
+            for mkt in bm.get("markets", []):
+                if not is_fresh(mkt, bm, now, is_live, cfg):
+                    continue
+                for oc in mkt.get("outcomes", []):
+                    price = float(oc.get("price") or 0)
+                    if price <= 1.0:
+                        continue
+                    k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
+                    lines.setdefault(k, {}).setdefault(bm["key"], {})[oc["name"]] = price
+                    links[(k, bm["key"], oc["name"])] = oc.get("link") or mkt.get("link") or bm.get("link") or ""
+                    points[(k, oc["name"])] = oc.get("point")
+
+        for k, books in lines.items():
+            n_out = max(len(o) for o in books.values())
+            full = {bk: o for bk, o in books.items() if len(o) == n_out and n_out >= 2}
+            names = set().union(*full.values()) if full else set()
+            full = {bk: o for bk, o in full.items() if set(o) == names}
+            probs = {bk: dict(zip(o, devig(list(o.values()), cfg.devig_method))) for bk, o in full.items()}
+            for name in names:
+                for bk, o in full.items():
+                    if bk in reference_only:
+                        continue
+                    others = sorted(probs[ob][name] for ob in probs if ob != bk)
+                    if len(others) < cfg.outlier_min_books:
+                        continue
+                    mid = len(others) // 2
+                    fair_p = others[mid] if len(others) % 2 else (others[mid - 1] + others[mid]) / 2
+                    price = o[name]
+                    edge = (fair_p * price - 1) * 100
+                    if edge < cfg.outlier_min_pct:
+                        continue
+                    board = sorted(((titles[b], oo[name], (fair_p * oo[name] - 1) * 100)
+                                    for b, oo in full.items()), key=lambda r: r[1], reverse=True)
+                    bet = EVBet(
+                        event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
+                        sport_key=ev.get("sport_key", ""), matchup=f"{ev['away_team']} @ {ev['home_team']}",
+                        home_team=ev["home_team"], away_team=ev["away_team"],
+                        commence_time=ev["commence_time"], is_live=is_live,
+                        market=k[0], line=k[1], outcome=name, point=points.get((k, name)),
+                        book=titles[bk], price=price, link=links.get((k, bk, name), ""),
+                        fair_prob=fair_p, sharp_book=f"median of {len(others)} other books",
+                        n_outcomes=n_out, sources_used=len(others), sources_total=len(others),
+                        unit_size=cfg.unit_size, board=board,
+                    )
+                    bet.stake = kelly_stake(fair_p, price, cfg)
+                    # Can the other side(s) be bet elsewhere to lock in a profit?
+                    hedge = []
+                    for other in sorted(names - {name}):
+                        cands = [(oo[other], b) for b, oo in full.items()
+                                 if b != bk and b not in reference_only]
+                        if cands:
+                            pr, b = max(cands)
+                            hedge.append((other, titles[b], pr))
+                    if len(hedge) == len(names) - 1:
+                        margin = 1 / price + sum(1 / pr for _, _, pr in hedge)
+                        if margin < 1:
+                            bet.hedge, bet.hedge_pct = hedge, (1 / margin - 1) * 100
+                    out.append(bet)
+    return sorted(out, key=lambda b: b.ev_pct, reverse=True)
+
+
+def without_outliers(evs: list[EVBet], outs: list[EVBet]) -> list[EVBet]:
+    """Drop +EV alerts for bets that already have an outlier alert."""
+    taken = {(o.event_id, o.market, o.line, o.outcome) for o in outs}
+    return [b for b in evs if (b.event_id, b.market, b.line, b.outcome) not in taken]
+
+
+def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
+                    first_seen: float | None = None) -> dict:
+    p = ev_payload(b, mention, gone_after, first_seen)
+    emb = p["embeds"][0]
+    if gone_after is None:
+        emb["title"] = f"🚨 OUTLIER +{b.ev_pct:.0f}%: {b.pick} {odds(b.price)} ({b.book})"[:256]
+        emb["color"] = 0xE67E22
+        emb["footer"] = {"text": "One book is way off the market. Usually it hasn't moved yet. Bet fast, "
+                                 "and know that books can void obvious pricing errors."}
+    else:
+        emb["title"] = emb["title"].replace("📈", "🚨")
+    for f in emb["fields"]:
+        if f["name"] == "Fair odds":
+            f["value"] = f["value"].replace("Sources", "Books compared")
+    if b.hedge and gone_after is None:
+        total = 100.0
+        legs = [(b.pick, b.book, b.price)] + [(o, bk, pr) for o, bk, pr in b.hedge]
+        margin = sum(1 / pr for _, _, pr in legs)
+        lines = [f"{o} {odds(pr)} on {bk}: {money(round(total / pr / margin, 2))}" for o, bk, pr in legs]
+        emb["fields"].insert(3, {
+            "name": f"🔒 Lock it in: +{b.hedge_pct:.1f}% guaranteed (per $100)",
+            "value": "\n".join(lines) + "\nOr bet just the outlier side for the bigger expected edge.",
+            "inline": False})
+    return p
+
+
+class OutlierAlerter(EVAlerter):
+    noun = "outliers"
+
+    def text(self, item) -> str:
+        t = format_ev_text(item).replace("📈", "🚨 OUTLIER", 1)
+        if item.hedge:
+            t += (f"\n  🔒 Lock in +{item.hedge_pct:.1f}%: also bet "
+                  + ", ".join(f"{o} {odds(pr)} on {bk}" for o, bk, pr in item.hedge))
+        return t
+
+    def payload(self, item, mention="", gone_after=None, first_seen=None) -> dict:
+        return outlier_payload(item, mention, gone_after, first_seen)
+
+    def mention(self) -> str:
+        return self.cfg.outlier_mention
+
+    def log_path(self) -> str:
+        return self.cfg.outlier_log_file
+
+    def webhook_for(self, item) -> str:
+        return self.cfg.outlier_webhook_url or super().webhook_for(item)
+
+
 # --------------------------------------------------------------------------- +EV results
 
 RESULT_FIELDS = EV_LOG_FIELDS + ["home_score", "away_score", "result", "profit"]
@@ -1264,7 +1422,8 @@ class Scheduler:
     def state(self, sport: str, now: datetime) -> str | None:
         dur = timedelta(minutes=self.cfg.minutes_for(sport))
         soon = timedelta(hours=self.cfg.pregame_hours)
-        want_live = self.cfg.arb_live or (self.cfg.ev_enabled and self.cfg.ev_live)
+        want_live = (self.cfg.arb_live or (self.cfg.ev_enabled and self.cfg.ev_live)
+                     or (self.cfg.outliers_enabled and self.cfg.outlier_live))
         pregame = False
         for gid, start in self.games[sport]:
             if gid in self.ended:
@@ -1453,13 +1612,16 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
 def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     alerter = Alerter(cfg, dry_run=args.dry_run)
     ev_alerter = EVAlerter(cfg, dry_run=args.dry_run)
+    out_alerter = OutlierAlerter(cfg, dry_run=args.dry_run)
 
     if args.demo:
         events = demo_events()
-        arbs, evs = find_arbs(events, cfg), find_evs(events, cfg)
+        outs = find_outliers(events, cfg)
+        arbs, evs = find_arbs(events, cfg), without_outliers(find_evs(events, cfg), outs)
         alerter.handle(arbs)
         ev_alerter.handle(evs)
-        print(f"[demo] {len(arbs)} arb(s), {len(evs)} +EV bet(s) in sample data")
+        out_alerter.handle(outs)
+        print(f"[demo] {len(arbs)} arb(s), {len(evs)} +EV bet(s), {len(outs)} outlier(s) in sample data")
         return
 
     api = OddsAPI(cfg)
@@ -1497,6 +1659,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 and local.date() != summary_day):
             summary_day = local.date()
             msg = f"📊 Last 24h: {alerter.summary()}."
+            if cfg.outliers_enabled:
+                msg += f"\n🚨 {out_alerter.summary()}."
+                out_alerter.reset_stats()
             if cfg.ev_enabled:
                 try:
                     settle_pending(cfg, api)
@@ -1542,11 +1707,14 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             events = sched.fetch(due, now)
             arbs = find_arbs(events, cfg)
             sent = alerter.handle(arbs, checked_sports=due)
-            evs = find_evs(events, cfg)
+            outs = find_outliers(events, cfg)
+            out_sent = out_alerter.handle(outs, checked_sports=due)
+            evs = without_outliers(find_evs(events, cfg), outs)  # the outlier alert covers those
             ev_sent = ev_alerter.handle(evs, checked_sports=due)
             status.check_credits(api.remaining)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             ev_note = f" | {len(evs)} +EV, {ev_sent} new" if cfg.ev_enabled else ""
+            ev_note += f" | {len(outs)} outliers, {out_sent} new" if cfg.outliers_enabled else ""
             print(f"[{datetime.now():%H:%M:%S}] checked {', '.join(short(s) for s in due)} "
                   f"({len(events)} games, {time.time() - t0:.1f}s) | {len(arbs)} arbs, {sent} new"
                   f"{ev_note} | credits left {left}", flush=True)

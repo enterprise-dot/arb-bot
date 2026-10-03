@@ -2,7 +2,8 @@ import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from arbbot import (LIVE, PREGAME, Alerter, Config, EVAlerter, Scheduler, demo_events, devig,
+from arbbot import (LIVE, PREGAME, Alerter, Config, EVAlerter, OutlierAlerter, Scheduler,
+                    demo_events, devig, find_outliers, outlier_payload, without_outliers,
                     discord_payload, ev_payload, ev_record, find_arbs, find_evs, kelly_stake,
                     next_reset, seconds_until_active, settle, settle_pending)
 
@@ -456,6 +457,69 @@ def _parse(ts):
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+def outlier_event(stale_home, stale_away, start="2026-10-03T11:00:00Z"):
+    books = {"Pinnacle": [("h2h", [("Home", 1.25, None), ("Away", 4.10, None)])],
+             "DK": [("h2h", [("Home", 1.24, None), ("Away", 4.00, None)])],
+             "FD": [("h2h", [("Home", 1.26, None), ("Away", 3.90, None)])],
+             "MGM": [("h2h", [("Home", 1.25, None), ("Away", 3.95, None)])],
+             "Stale": [("h2h", [("Home", stale_home, None), ("Away", stale_away, None)])]}
+    ev = event(books, start=start)
+    ev["bookmakers"][0]["key"] = "pinnacle"
+    return ev
+
+
+class Outliers(unittest.TestCase):
+    def test_finds_book_far_off_market_live(self):
+        [o] = find_outliers([outlier_event(1.85, 1.95)], Config(), NOW)
+        self.assertEqual((o.book, o.outcome, o.price), ("Stale", "Home", 1.85))
+        self.assertGreater(o.ev_pct, 40)
+        self.assertEqual(o.sources_used, 4)   # compared with the 4 other books
+
+    def test_no_upper_cap_and_hedge(self):
+        # Your example: one book has the favorite at +400 while the market has it near -400.
+        [o] = find_outliers([outlier_event(5.0, 1.15)], Config(), NOW)
+        self.assertEqual((o.outcome, o.price), ("Home", 5.0))
+        self.assertGreater(o.ev_pct, 100)   # far beyond the old 25% "too good to be true" cap
+        outs = find_outliers([outlier_event(1.85, 1.95)], Config(), NOW)
+        self.assertTrue(outs[0].hedge)
+        self.assertEqual(outs[0].hedge[0][:2], ("Away", "DK"))   # best other-side price, not Pinnacle
+        self.assertAlmostEqual(outs[0].hedge_pct, (1 / (1 / 1.85 + 1 / 4.00) - 1) * 100)
+        title = outlier_payload(outs[0])["embeds"][0]["title"]
+        self.assertTrue(title.startswith("🚨 OUTLIER"))
+        self.assertTrue(any("Lock it in" in f["name"] for f in outlier_payload(outs[0])["embeds"][0]["fields"]))
+
+    def test_needs_enough_books_and_edge(self):
+        ev = outlier_event(1.30, 3.60)                     # only slightly off: not an outlier
+        self.assertEqual(find_outliers([ev], Config(), NOW), [])
+        self.assertEqual(find_outliers([outlier_event(1.85, 1.95)], Config(outlier_min_books=5), NOW), [])
+        self.assertEqual(find_outliers([outlier_event(1.85, 1.95)], Config(outlier_live=False), NOW), [])
+        self.assertEqual(find_outliers([outlier_event(1.85, 1.95)], Config(outliers_enabled=False), NOW), [])
+
+    def test_sharp_book_itself_never_flagged(self):
+        ev = outlier_event(1.25, 4.00)
+        ev["bookmakers"][0]["markets"][0]["outcomes"][0]["price"] = 1.90   # Pinnacle is the odd one
+        self.assertEqual(find_outliers([ev], Config(), NOW), [])
+
+    def test_ev_alert_suppressed_when_outlier_covers_it(self):
+        ev = outlier_event(1.85, 1.95, start="2026-10-03T18:00:00Z")    # pre-game: both would fire
+        outs = find_outliers([ev], Config(), NOW)
+        evs = find_evs([ev], Config(min_ev_pct=3, max_ev_pct=100, ev_max_odds=10), NOW)
+        self.assertTrue(evs)
+        self.assertEqual(without_outliers(evs, outs), [])
+
+
+class ArbDollarMinimum(unittest.TestCase):
+    def test_min_profit_dollars(self):
+        ev = event({
+            "A": [("h2h", [("Home", 2.10, None), ("Away", 1.80, None)])],
+            "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])],
+        })   # ~6% edge -> about $6 on $100
+        self.assertEqual(len(find_arbs([ev], Config(min_profit_pct=0, min_profit_dollars=5), NOW)), 1)
+        self.assertEqual(find_arbs([ev], Config(min_profit_pct=0, min_profit_dollars=10), NOW), [])
+        self.assertEqual(len(find_arbs([ev], Config(min_profit_pct=0, min_profit_dollars=10,
+                                                    bankroll=300), NOW)), 1)
+
+
 class ActiveHours(unittest.TestCase):
     def at(self, hhmm):  # a New York local time on a fixed day, as UTC
         from zoneinfo import ZoneInfo
@@ -549,7 +613,7 @@ class SchedulerState(unittest.TestCase):
         self.assertIsNone(s.state("basketball_nba", NOW))
 
     def test_no_live_checks_when_nothing_live_is_wanted(self):
-        cfg = Config(sports=["basketball_nba"], arb_live=False, ev_live=False)
+        cfg = Config(sports=["basketball_nba"], arb_live=False, ev_live=False, outlier_live=False)
         s = sched_with({"basketball_nba": [("g1", NOW - timedelta(minutes=30)),
                                            ("g2", NOW + timedelta(hours=1))]}, cfg)
         self.assertEqual(s.state("basketball_nba", NOW), PREGAME)   # skips the live game

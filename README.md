@@ -27,6 +27,23 @@ Watches odds from many sportsbooks and pings Discord about two kinds of bets:
 - **`arbs.csv`:** every gap and how long it stayed open. After a week, this tells you whether you can realistically catch them.
 - **Bot health in Discord:** 🟢 online, 🔴 crashed, ⚠️ credits running low, and a 📊 daily summary.
 
+## 🚨 Outliers
+
+```
+🚨 OUTLIER +45% | NHL | Bruins @ Rangers (🔴 LIVE)
+  Rangers ML -118 on Caesars  → stake $30
+  Fair -361 (78.3%, median of 4 other books)
+  🔒 Lock in +26.5%: also bet Bruins +300 on DraftKings
+```
+
+When one book is far off every other book, it usually just hasn't updated yet. The bot compares
+each price with the **median of all the other books** (so it works even if Pinnacle is slow),
+alerts at a 10%+ edge (`OUTLIER_MIN_PCT`), has no upper limit, and covers live games. If betting
+the other side elsewhere locks in a profit, the alert shows that hedge with stakes per $100.
+
+Books can cancel bets on obvious pricing errors ("palpable errors"), and the bigger the gap,
+the more likely that is. Bet fast, and expect the occasional void.
+
 ## +EV bets
 
 ```
