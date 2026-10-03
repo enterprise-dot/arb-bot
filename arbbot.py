@@ -1480,7 +1480,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 if not sharp_seen and sharp_checks == 5:
                     status.send(f"⚠️ No {cfg.sharp_books} odds in the feed, so +EV alerts can't work. "
                                 f"Add {_csv(cfg.sharp_books)[0]} to BOOKMAKERS in .env.")
-        elif not idle_logged:
+        elif not idle_logged and not any(sched.state(s, now) for s in cfg.sports):
+            # Only when nothing is on at all, not just between checks of a live game.
             idle_logged = True
             print(f"[{datetime.now():%H:%M:%S}] No games live or starting soon. Waiting (no credits used).",
                   flush=True)
