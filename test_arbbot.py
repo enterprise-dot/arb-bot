@@ -512,6 +512,34 @@ class PlusEV(unittest.TestCase):
         wide = self.market_event([("Home", 1.88, None), ("Away", 1.88, None)], [])     # ~6.4% margin
         self.assertEqual(find_evs([wide], lowcfg, NOW), [])
 
+    def test_sharp_movement_changes_confidence(self):
+        from arbbot import SharpHistory, rate_confidence
+        self.assertEqual(rate_confidence(5.0, 4.0, 3, 5, False)[0], "medium")           # 4 points
+        self.assertEqual(rate_confidence(5.0, 4.0, 3, 5, False, move=2.5)[0], "high")    # +1: toward us
+        self.assertEqual(rate_confidence(5.0, 7.0, 3, 5, False)[0], "medium")           # 3 points
+        self.assertEqual(rate_confidence(5.0, 7.0, 3, 5, False, move=-2.5)[0], "low")    # -1: away from us
+        self.assertEqual(rate_confidence(5.0, 7.0, 3, 5, False, move=-1.0)[0], "medium") # small moves ignored
+        h = SharpHistory(60)
+        self.assertIsNone(h.record(("e", "h2h", None, "Home"), NOW, 0.50))
+        self.assertAlmostEqual(h.record(("e", "h2h", None, "Home"), NOW + timedelta(minutes=20), 0.53), 3.0)
+        self.assertAlmostEqual(h.record(("e", "h2h", None, "Home"), NOW + timedelta(minutes=90), 0.53), 0.0)
+
+    def test_history_flows_into_alerts(self):
+        from arbbot import SharpHistory
+        h = SharpHistory(60)
+        early = ev_event([("Home", 2.02, None), ("Away", 1.82, None)], {"B": [("Home", 2.20, None)]})
+        find_evs([early], EVCFG, NOW - timedelta(minutes=30), history=h)     # Pinnacle had Home ~47%
+        later = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [b] = find_evs([later], EVCFG, NOW, history=h)                      # now 50%: moving toward Home
+        self.assertTrue(any("moving this way" in n for n in b.confidence_notes))
+
+    def test_sport_minimum_edge(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})  # 5% edge
+        ev["sport_key"] = "americanfootball_ncaaf"
+        self.assertEqual(find_evs([ev], Config(min_ev_pct=3), NOW), [])          # college needs 6%
+        ev["sport_key"] = "americanfootball_nfl"
+        self.assertEqual(len(find_evs([ev], Config(min_ev_pct=3), NOW)), 1)
+
     def test_payload(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)

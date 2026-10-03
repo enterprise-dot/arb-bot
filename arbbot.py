@@ -58,6 +58,9 @@ DEFAULT_GAME_MINUTES = [
 ]
 FALLBACK_GAME_MINUTES = 180
 
+# Bigger minimum edge where the sharp line is less reliable (lots of small games).
+DEFAULT_SPORT_MIN_EV = {"americanfootball_ncaaf": 6.0, "basketball_ncaab": 6.0}
+
 DEFAULT_BUDGET_WEIGHTS = {"mon": 1.2, "tue": 0.6, "wed": 0.6, "thu": 1.2, "fri": 1.0, "sat": 2.0, "sun": 2.2}
 WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -195,6 +198,8 @@ class Config:
     max_sharp_hold_pct: float = 8.0       # skip if the sharp's own margin is wider than this
     sharp_consensus_max_gap: float = 10.0  # skip if sharp and the other books' median differ by more (points)
     min_confidence: str = "low"           # low / medium / high: alert only at or above this
+    sport_min_ev: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SPORT_MIN_EV))
+    move_window_minutes: int = 60         # how far back to look for sharp line movement
     confidence_stakes: str = "1,0.75,0.5"  # stake multiplier for high, medium, low
     unit_size: float = 0            # dollars per unit; > 0 shows stakes in units too
     ev_books: str = ""              # only alert for these books ("" = every non-sharp book)
@@ -306,6 +311,9 @@ class Config:
             max_sharp_hold_pct=float(e("MAX_SHARP_HOLD_PCT", d.max_sharp_hold_pct)),
             sharp_consensus_max_gap=float(e("SHARP_CONSENSUS_MAX_GAP", d.sharp_consensus_max_gap)),
             min_confidence=e("MIN_CONFIDENCE", d.min_confidence).strip().lower(),
+            sport_min_ev={**d.sport_min_ev, **{k.strip(): float(v) for k, v in
+                          (x.split("=") for x in _csv(e("SPORT_MIN_EV", "")))}},
+            move_window_minutes=int(e("MOVE_WINDOW_MINUTES", d.move_window_minutes)),
             confidence_stakes=e("CONFIDENCE_STAKES", d.confidence_stakes),
             unit_size=float(e("UNIT_SIZE", d.unit_size)),
             bet_at_sharp=e("BET_AT_SHARP", "false").lower() in ("1", "true", "yes"),
@@ -1396,10 +1404,18 @@ CONFIDENCE_BADGE = {"high": "🟢 High", "medium": "🟡 Medium", "low": "🟠 L
 
 
 def rate_confidence(hold: float | None, gap: float | None, hours_to_start: float, ev_pct: float,
-                    prop: bool) -> tuple[str, list[str]]:
+                    prop: bool, move: float | None = None) -> tuple[str, list[str]]:
     """How much to trust a +EV price. Points for: a tight sharp market, the other books agreeing
-    with the sharp, a game close enough that the sharp line has matured, and a believable edge."""
+    with the sharp, a game close enough that the sharp line has matured, a believable edge, and
+    the sharp line moving toward this side (sharp money agrees; moving away costs a point)."""
     pts, notes = 0, []
+    if move is not None and abs(move) >= 1.5:
+        if move > 0:
+            pts += 1
+            notes.append(f"sharp line moving this way (+{move:.1f} pts)")
+        else:
+            pts -= 1
+            notes.append(f"sharp line moving against it ({move:.1f} pts)")
     tight, ok = (6.5, 9.0) if prop else (3.5, 6.0)
     if hold is None:
         pts += 1
@@ -1430,7 +1446,28 @@ def rate_confidence(hold: float | None, gap: float | None, hours_to_start: float
     return ("high" if pts >= 5 else "medium" if pts >= 3 else "low"), notes
 
 
-def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> list[EVBet]:
+class SharpHistory:
+    """Recent sharp fair prices per bet, to see which way the sharp line is moving."""
+
+    def __init__(self, window_minutes: int = 60):
+        self.window = timedelta(minutes=window_minutes)
+        self.points: dict[tuple, list[tuple[datetime, float]]] = {}
+
+    def record(self, key: tuple, now: datetime, prob: float) -> float | None:
+        """Store this sighting; return the move (in win-% points) since the oldest one in the window."""
+        pts = [x for x in self.points.get(key, []) if now - x[0] <= self.window]
+        move = (prob - pts[0][1]) * 100 if pts else None
+        if not pts or pts[-1][1] != prob:
+            pts.append((now, prob))
+        self.points[key] = pts
+        return move
+
+    def prune(self, now: datetime) -> None:
+        self.points = {k: v for k, v in self.points.items() if v and now - v[-1][0] <= self.window * 3}
+
+
+def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
+             history: SharpHistory | None = None) -> list[EVBet]:
     if not cfg.ev_enabled:
         return []
     now = now or datetime.now(timezone.utc)
@@ -1448,6 +1485,11 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
         n_total = {k: len(sharp) for k in fair}
         # The rest of the market, as a sanity check on the sharp's price.
         market = consensus_fair(ev, replace(cfg, consensus_min_books=3), now, is_live, set(sharp))
+        if history:
+            for k, probs in fair.items():
+                if not sharp_name.get(k, "").startswith("consensus"):
+                    for name, prob in probs.items():
+                        history.record((ev["id"], k[0], k[1], name), now, prob)
         holds = {}
         for k, srcs in raw_src.items():
             first = next(iter(srcs.values()))
@@ -1477,7 +1519,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
                     boards.setdefault((k, oc["name"]), []).append((bm.get("title", key), price, ev_pct, link))
                     if price > cfg.ev_max_odds:
                         continue
-                    if cfg.min_ev_pct <= ev_pct <= cfg.max_ev_pct:
+                    if max(cfg.min_ev_pct, cfg.sport_min_ev.get(ev.get("sport_key", ""), 0)) <= ev_pct <= cfg.max_ev_pct:
                         link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
                         offers.setdefault((k, oc["name"]), []).append(
                             (price, bm.get("title", key), link, oc.get("point")))
@@ -1510,7 +1552,8 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
             if gap is not None and gap > cfg.sharp_consensus_max_gap:
                 continue  # sharp and market far apart: one side is stale, can't trust either
             hours = (_parse_time(ev["commence_time"]) - now).total_seconds() / 3600
-            bet.confidence, bet.confidence_notes = rate_confidence(hold, gap, hours, bet.ev_pct, is_prop(k[1]))
+            move = history.record((ev["id"], k[0], k[1], name), now, bet.fair_prob) if history and from_sharp else None
+            bet.confidence, bet.confidence_notes = rate_confidence(hold, gap, hours, bet.ev_pct, is_prop(k[1]), move)
             if CONFIDENCE_ORDER[bet.confidence] < CONFIDENCE_ORDER.get(cfg.min_confidence, 0):
                 continue
             # Less certainty -> smaller bet (the edge itself isn't changed).
@@ -2657,6 +2700,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     prop_outs = OutlierAlerter(cfg, dry_run=args.dry_run, noun="prop outliers")
     prop_evs.on_log = prop_outs.on_log = tracker.add
     prop_cfg = cfg.for_props()
+    sharp_history = SharpHistory(cfg.move_window_minutes)
     parlay_alerter = ParlayAlerter(cfg, dry_run=args.dry_run)
 
     def update_parlays() -> int:
@@ -2778,7 +2822,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             sent = alerter.handle(arbs, checked_sports=due)
             outs = find_outliers(events, cfg)
             out_sent = out_alerter.handle(outs, checked_sports=due)
-            evs = without_outliers(find_evs(events, cfg), outs)  # the outlier alert covers those
+            evs = without_outliers(find_evs(events, cfg, history=sharp_history), outs)  # outliers cover those
+            sharp_history.prune(now)
             ev_sent = ev_alerter.handle(evs, checked_sports=due)
             tracker.observe(events, now)
             tracker.finalize()
@@ -2817,7 +2862,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             p_outs = find_outliers(prop_events, cfg)
             n_arb = prop_arbs.handle(find_arbs(prop_events, cfg), checked_events=checked)
             n_out = prop_outs.handle(p_outs, checked_events=checked)
-            n_ev = prop_evs.handle(without_outliers(find_evs(prop_events, prop_cfg), p_outs),
+            n_ev = prop_evs.handle(without_outliers(find_evs(prop_events, prop_cfg, history=sharp_history), p_outs),
                                    checked_events=checked)
             tracker.observe(prop_events, now)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
