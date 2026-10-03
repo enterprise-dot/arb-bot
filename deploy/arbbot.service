@@ -1,0 +1,16 @@
+[Unit]
+Description=Sports arbitrage alert bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=arbbot
+WorkingDirectory=/opt/arb-bot
+ExecStart=/usr/bin/python3 -u /opt/arb-bot/arbbot.py
+Restart=always
+RestartSec=60
+# Exit code 2 = bad config (e.g. wrong API key): don't restart-loop, wait for a fix.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

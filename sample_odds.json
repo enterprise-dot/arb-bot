@@ -1,0 +1,58 @@
+[
+  {
+    "id": "demo-nba-1",
+    "sport_key": "basketball_nba",
+    "sport_title": "NBA",
+    "commence_time": "2026-10-03T00:00:00Z",
+    "home_team": "Boston Celtics",
+    "away_team": "New York Knicks",
+    "bookmakers": [
+      {
+        "key": "draftkings", "title": "DraftKings", "last_update": "",
+        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
+          {"name": "Boston Celtics", "price": 1.55},
+          {"name": "New York Knicks", "price": 2.45}
+        ]}]
+      },
+      {
+        "key": "fanduel", "title": "FanDuel", "last_update": "",
+        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
+          {"name": "Boston Celtics", "price": 1.80},
+          {"name": "New York Knicks", "price": 2.05}
+        ]}]
+      },
+      {
+        "key": "betmgm", "title": "BetMGM", "last_update": "",
+        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
+          {"name": "Boston Celtics", "price": 1.60},
+          {"name": "New York Knicks", "price": 2.30}
+        ]}]
+      }
+    ]
+  },
+  {
+    "id": "demo-epl-1",
+    "sport_key": "soccer_epl",
+    "sport_title": "EPL",
+    "commence_time": "2099-01-01T15:00:00Z",
+    "home_team": "Arsenal",
+    "away_team": "Chelsea",
+    "bookmakers": [
+      {
+        "key": "draftkings", "title": "DraftKings", "last_update": "",
+        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
+          {"name": "Arsenal", "price": 2.10},
+          {"name": "Chelsea", "price": 3.60},
+          {"name": "Draw", "price": 3.40}
+        ]}]
+      },
+      {
+        "key": "caesars", "title": "Caesars", "last_update": "",
+        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
+          {"name": "Arsenal", "price": 2.20},
+          {"name": "Chelsea", "price": 3.30}
+        ]}]
+      }
+    ]
+  }
+]
