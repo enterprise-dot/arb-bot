@@ -704,6 +704,27 @@ class CLV(unittest.TestCase):
                 "first_seen": "2026-10-03T12:00:00+00:00", "commence_time": "2026-10-03T11:00:00Z"})
         self.assertEqual(tr.tracked, {})
 
+    def test_breakdown_and_summary(self):
+        from arbbot import clv_breakdown, clv_report, summary_payload
+        from datetime import datetime as dt
+        start_dt = dt.now(timezone.utc) + timedelta(hours=1)
+        start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        a = EVAlerter(self.cfg, dry_run=True)
+        tr = ClosingTracker(self.cfg)
+        a.on_log = tr.add
+        [b] = find_evs([self.game(1.91, 1.91, start)], self.cfg, start_dt - timedelta(hours=1))
+        a.handle([b], now=1000)
+        tr.observe([self.game(1.80, 2.05, start)], start_dt - timedelta(minutes=3))
+        tr.finalize(start_dt + timedelta(minutes=1))
+        g = clv_breakdown(self.cfg)
+        self.assertEqual(g["Market"][0][0], "Moneylines")
+        self.assertEqual(g["Book"][0][:2], ("B", 1))
+        self.assertIn("Moneylines", clv_report(self.cfg))
+        card = summary_payload(self.cfg, [("💰 **Arbs**", "2 arbs found")], 5000)["embeds"][0]
+        self.assertIn("Bet quality (CLV)", card["description"])
+        self.assertIn("✅ Beating the closing line", card["description"])
+        self.assertIn("💳 **Credits**", card["description"])
+
     def test_last_check_before_kickoff(self):
         cfg = Config(sports=["basketball_nba"], closing_minutes=5)
         s = sched_with({"basketball_nba": [("g1", NOW + timedelta(minutes=4))]}, cfg)

@@ -1152,6 +1152,16 @@ class Status:
         except Exception as e:
             print(f"  ! Status message failed: {e}", file=sys.stderr)
 
+    def send_card(self, payload: dict) -> None:
+        emb = payload["embeds"][0]
+        print(f"[status] {emb['title']}\n{emb.get('description', '')}", flush=True)
+        if self.dry_run:
+            return
+        try:
+            _webhook(self.url, payload)
+        except Exception as e:
+            print(f"  ! Status message failed: {e}", file=sys.stderr)
+
     def check_credits(self, remaining: float | None) -> None:
         if remaining is None or not self.cfg.low_credits:
             return
@@ -2111,6 +2121,49 @@ def clv_rows(cfg: Config, days: int | None = None) -> list[dict]:
     return out
 
 
+def _market_group(row: dict) -> str:
+    if row.get("player"):
+        return "Player props"
+    return {"h2h": "Moneylines", "spreads": "Spreads", "totals": "Totals"}.get(row["market"], row["market"])
+
+
+CLV_GROUPS = {
+    "Bet type": lambda r: {"ev": "+EV", "outlier": "Outliers"}.get(r["kind"], r["kind"]),
+    "Market": _market_group,
+    "Book": lambda r: r.get("book") or "?",
+    "Sport": lambda r: r.get("sport") or "?",
+    "Confidence": lambda r: (r.get("confidence") or "not rated").capitalize(),
+}
+
+
+def clv_breakdown(cfg: Config, days: int | None = None, min_bets: int = 1) -> dict[str, list[tuple]]:
+    """CLV by bet type, market, book, sport and confidence: {group: [(name, n, avg_clv, beat_pct)]}."""
+    rows = clv_rows(cfg, days)
+    out: dict[str, list[tuple]] = {}
+    for group, key in CLV_GROUPS.items():
+        buckets: dict[str, list[dict]] = {}
+        for r in rows:
+            buckets.setdefault(key(r), []).append(r)
+        out[group] = sorted(
+            ((name, len(rs), sum(x["clv_pct"] for x in rs) / len(rs),
+              sum(x["beat_close"] for x in rs) / len(rs) * 100)
+             for name, rs in buckets.items() if len(rs) >= min_bets),
+            key=lambda t: t[1], reverse=True)
+    return out
+
+
+def clv_report(cfg: Config, days: int | None = None) -> str:
+    """Plain-text CLV tables for --results."""
+    lines = []
+    for group, rows in clv_breakdown(cfg, days).items():
+        if not rows:
+            continue
+        lines.append(f"  {group}:")
+        for name, n, avg, beat in rows:
+            lines.append(f"    {name:<16} {n:>4} bets   CLV {avg:+5.1f}%   beat close {beat:3.0f}%")
+    return "\n".join(lines) or "  (no closing lines yet)"
+
+
 def clv_record(cfg: Config, days: int | None = None) -> str:
     rows = clv_rows(cfg, days)
     if not rows:
@@ -2457,6 +2510,31 @@ The chance is over. Ignore it.
 5. Books sometimes cancel bets on obvious mistakes and refund the money. With an arb, the other bet still stands, so you're left with one normal bet."""
 
 
+def summary_payload(cfg: Config, sections: list[tuple[str, str]], credits_left: float | None) -> dict:
+    """The daily summary card: what was found, whether the bets are good (CLV), credits."""
+    lines = [f"{title}\n{body}" for title, body in sections if body]
+    week, ever = clv_rows(cfg, 7), clv_rows(cfg)
+    if ever:
+        verdict = ("✅ Beating the closing line: the edge looks real."
+                   if sum(r["clv_pct"] for r in ever) > 0 and sum(r["beat_close"] for r in ever) * 2 > len(ever)
+                   else "⚠️ Not beating the closing line yet. Give it more bets before trusting it.")
+        groups = clv_breakdown(cfg, min_bets=5)
+        best = max((t for rows in groups.values() for t in rows), key=lambda t: t[2], default=None)
+        worst = min((t for rows in groups.values() for t in rows), key=lambda t: t[2], default=None)
+        detail = ""
+        if best and worst and best != worst:
+            detail = (f"\nBest: {best[0]} ({best[2]:+.1f}%, {best[1]} bets) · "
+                      f"Worst: {worst[0]} ({worst[2]:+.1f}%, {worst[1]} bets)")
+        lines.append(f"📐 **Bet quality (CLV)**\nLast 7 days: {clv_record(cfg, 7) if week else 'no closes yet'}\n"
+                     f"All time: {clv_record(cfg)}\n{verdict}{detail}")
+    left = f"{credits_left:,.0f}" if credits_left is not None else "?"
+    days = max(1.0, (next_reset(cfg, datetime.now(timezone.utc)) - datetime.now(timezone.utc)).total_seconds() / 86400)
+    lines.append(f"💳 **Credits**\n{left} left · about {float(credits_left or 0) / days:,.0f}/day until "
+                 f"{next_reset(cfg, datetime.now(timezone.utc)):%b %d}")
+    return _card("📊 Daily summary (last 24h)", "\n\n".join(lines), 0x5865F2,
+                 footer="Full breakdown on the server: arbbot.py --results")
+
+
 def guide_payload() -> dict:
     return _card("📖 How to use these alerts", GUIDE, 0x5865F2,
                  footer="Pin this message: hover over it → ⋯ → Pin Message")
@@ -2565,6 +2643,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         print(f"+EV record, all time: {ev_record(cfg)}")
         print(f"CLV (price you got vs the closing fair line), last 7 days: {clv_record(cfg, 7)}")
         print(f"CLV, all time: {clv_record(cfg)}")
+        print("CLV by group, all time (positive and beating the close more than half the time = real edge):")
+        print(clv_report(cfg))
         return
 
     mode = "dry run (console only)" if alerter.dry_run else "sending to Discord"
@@ -2587,30 +2667,24 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         if (cfg.summary_hour >= 0 and not args.once and local.hour >= cfg.summary_hour
                 and local.date() != summary_day):
             summary_day = local.date()
-            msg = f"📊 Last 24h: {alerter.summary()}."
-            if cfg.outliers_enabled:
-                msg += f"\n🚨 {out_alerter.summary()}."
-                out_alerter.reset_stats()
-            if cfg.parlays_enabled:
-                msg += f"\n📦 {parlay_alerter.summary()}."
-                parlay_alerter.reset_stats()
-            if cfg.props_enabled:
-                msg += f"\n🎯 Props: {prop_evs.summary()}; {prop_arbs.summary()}; {prop_outs.summary()}."
-                for a in (prop_arbs, prop_evs, prop_outs):
-                    a.reset_stats()
             if cfg.ev_enabled:
                 try:
                     settle_pending(cfg, api)
                 except Exception as e:  # noqa: BLE001 - a summary shouldn't crash the bot
                     print(f"! Grading +EV bets failed: {e}", file=sys.stderr)
-                msg += (f"\n📈 {ev_alerter.summary()}.\n"
-                        f"+EV results if you bet every alert: last 7 days {ev_record(cfg, 7)}; "
-                        f"all time {ev_record(cfg)}.\n"
-                        f"📐 CLV: last 7 days {clv_record(cfg, 7)}; all time {clv_record(cfg)}.")
-            left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
-            status.send(f"{msg}\nCredits left: {left}.")
-            alerter.reset_stats()
-            ev_alerter.reset_stats()
+            sections = [("💰 **Arbs**", f"{alerter.summary()}; props: {prop_arbs.summary()}")]
+            if cfg.ev_enabled:
+                sections.append(("📈 **+EV**", f"{ev_alerter.summary()}\nIf you bet every alert: "
+                                 f"last 7 days {ev_record(cfg, 7)}; all time {ev_record(cfg)}"))
+            if cfg.props_enabled:
+                sections.append(("🎯 **Props**", f"{prop_evs.summary()}; {prop_outs.summary()}"))
+            if cfg.outliers_enabled:
+                sections.append(("🚨 **Outliers**", out_alerter.summary()))
+            if cfg.parlays_enabled:
+                sections.append(("📦 **Parlays**", parlay_alerter.summary()))
+            status.send_card(summary_payload(cfg, sections, api.remaining))
+            for a in (alerter, ev_alerter, out_alerter, parlay_alerter, prop_arbs, prop_evs, prop_outs):
+                a.reset_stats()
 
         wait = seconds_until_active(cfg, now)
         if wait:
