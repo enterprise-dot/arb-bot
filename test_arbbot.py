@@ -935,6 +935,36 @@ class Parlays(unittest.TestCase):
         self.assertEqual(a2.webhook_for(p), "par")
 
 
+class LocksMode(unittest.TestCase):
+    def test_raises_floors_but_keeps_stricter_settings(self):
+        c = Config(min_profit_pct=1.5, min_ev_pct=4, min_confidence="low", prop_min_ev_pct=10).with_mode()
+        self.assertEqual(c.min_profit_pct, 2.0)
+        self.assertEqual(c.min_live_profit_pct, 3.0)
+        self.assertEqual(c.min_ev_pct, 5.0)
+        self.assertEqual(c.prop_min_ev_pct, 10)            # yours was already stricter
+        self.assertEqual(c.min_confidence, "high")
+        self.assertEqual((c.max_ev_per_hour, c.parlay_max_legs), (6, 2))
+        same = Config(alert_mode="balanced", min_profit_pct=1.5).with_mode()
+        self.assertEqual(same.min_profit_pct, 1.5)
+
+    def test_small_arbs_dropped(self):
+        ev = event({
+            "A": [("h2h", [("Home", 2.02, None), ("Away", 1.90, None)])],
+            "B": [("h2h", [("Home", 1.90, None), ("Away", 2.02, None)])],
+        })   # ~1% arb: not a lock
+        self.assertEqual(len(find_arbs([ev], Config(min_profit_pct=0.5, round_stakes=0), NOW)), 1)
+        self.assertEqual(find_arbs([ev], Config(min_profit_pct=0.5).with_mode(), NOW), [])
+
+    def test_hourly_cap_keeps_the_best(self):
+        a = EVAlerter(Config(), dry_run=True)
+        a.max_per_hour = 2
+        bets = [replace(ev_leg(f"g{i}", {"DK": 2.30}), event_id=f"g{i}") for i in range(4)]
+        self.assertEqual(a.handle(bets, now=1000), 2)
+        self.assertEqual(len(a.open), 2)
+        self.assertEqual(a.handle(bets, now=1100), 0)        # still capped this hour
+        self.assertEqual(a.handle(bets, now=1000 + 3700), 2)  # next hour: the next best go out
+
+
 class Channels(unittest.TestCase):
     def test_set_env_value_replaces_placeholder(self):
         import tempfile

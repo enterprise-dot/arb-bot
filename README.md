@@ -87,6 +87,13 @@ the other side elsewhere locks in a profit, the alert shows that hedge with stak
 Books can cancel bets on obvious pricing errors ("palpable errors"), and the bigger the gap,
 the more likely that is. Bet fast, and expect the occasional void.
 
+## Locks mode (default)
+
+The bot only sends alerts worth acting on: arbs that lock in **2%+** ($2 per $100, 3%+ when
+live), +EV bets of **5%+ at high confidence**, props at **8%+**, outliers at **15%+**, and 2-leg
+parlays at **15%+**, with at most 6 +EV, 6 prop and 2 parlay alerts an hour (the best ones go
+first). Set `ALERT_MODE=balanced` to use your own thresholds instead.
+
 ## How it keeps bets good
 
 - **Confidence on every +EV bet** (🟢 High / 🟡 Medium / 🟠 Low), from how tight Pinnacle's own

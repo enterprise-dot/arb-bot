@@ -58,6 +58,16 @@ DEFAULT_GAME_MINUTES = [
 ]
 FALLBACK_GAME_MINUTES = 180
 
+CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+# ALERT_MODE=locks floors: only alerts worth acting on.
+LOCKS = {
+    "arb_pct": 2.0, "live_arb_pct": 3.0, "arb_dollars": 5.0,   # $2+ per $100 staked, guaranteed
+    "ev_pct": 5.0, "prop_ev_pct": 8.0, "min_confidence": "high",
+    "outlier_pct": 15.0, "parlay_ev_pct": 15.0, "parlay_legs": 2,
+    "ev_per_hour": 6, "prop_per_hour": 6, "parlay_per_hour": 2,
+}
+
 # Bigger minimum edge where the sharp line is less reliable (lots of small games).
 DEFAULT_SPORT_MIN_EV = {"americanfootball_ncaaf": 6.0, "basketball_ncaab": 6.0}
 
@@ -165,6 +175,12 @@ class Config:
     min_profit_pct: float = 0.5
     min_profit_dollars: float = 0.0  # skip arbs that lock in less than this (at BANKROLL)
     max_profit_pct: float = 15.0  # above this it's almost always a stale/bad line
+    # "locks": only strong alerts (bigger arbs, high-confidence +EV, a few per hour).
+    # "balanced": the individual thresholds below as set. "all": everything that clears them.
+    alert_mode: str = "locks"
+    max_ev_per_hour: int = 0      # cap on new +EV alerts per hour, best first (0 = no cap)
+    max_prop_per_hour: int = 0
+    max_parlay_per_hour: int = 0
     max_age_seconds: int = 120    # live games: ignore prices not updated this recently
     pregame_max_age_seconds: int = 900  # pre-game lines can sit unchanged for a while
     realert_jump_pct: float = 2.5  # send a fresh alert if the edge grows by this many points
@@ -252,7 +268,7 @@ class Config:
     def from_env(cls) -> "Config":
         e = os.environ.get
         d = cls()
-        return cls(
+        cfg = cls(
             api_key=e("ODDS_API_KEY", ""),
             webhook_url=e("DISCORD_WEBHOOK_URL", ""),
             sports=_csv(e("SPORTS", "")) or d.sports,
@@ -278,6 +294,10 @@ class Config:
             game_minutes={k.strip(): int(v) for k, v in
                           (p.split("=") for p in _csv(e("GAME_MINUTES", "")))},
             min_profit_pct=float(e("MIN_PROFIT_PCT", d.min_profit_pct)),
+            alert_mode=e("ALERT_MODE", d.alert_mode).strip().lower(),
+            max_ev_per_hour=int(e("MAX_EV_PER_HOUR", d.max_ev_per_hour)),
+            max_prop_per_hour=int(e("MAX_PROP_PER_HOUR", d.max_prop_per_hour)),
+            max_parlay_per_hour=int(e("MAX_PARLAY_PER_HOUR", d.max_parlay_per_hour)),
             min_profit_dollars=float(e("MIN_PROFIT_DOLLARS", d.min_profit_dollars)),
             max_profit_pct=float(e("MAX_PROFIT_PCT", d.max_profit_pct)),
             max_age_seconds=int(e("MAX_AGE_SECONDS", d.max_age_seconds)),
@@ -358,6 +378,31 @@ class Config:
             live_only=e("LIVE_ONLY", "false").lower() in ("1", "true", "yes"),
             active_hours=e("ACTIVE_HOURS", "").strip(),
             timezone=e("TIMEZONE", d.timezone),
+        )
+        return cfg.with_mode()
+
+    def with_mode(self) -> "Config":
+        """Apply ALERT_MODE. "locks" raises every bar to at least the levels below (your own
+        stricter settings still win) and caps how many +EV-style alerts go out per hour."""
+        if self.alert_mode != "locks":
+            return self
+        L = LOCKS
+        conf = max(self.min_confidence, L["min_confidence"], key=lambda c: CONFIDENCE_ORDER.get(c, 0))
+        cap = lambda mine, lock: min(x for x in (mine, lock) if x) if (mine or lock) else 0
+        return replace(
+            self,
+            min_profit_pct=max(self.min_profit_pct, L["arb_pct"]),
+            min_live_profit_pct=max(self.min_live_profit_pct, L["live_arb_pct"]),
+            min_profit_dollars=max(self.min_profit_dollars, L["arb_dollars"]),
+            min_ev_pct=max(self.min_ev_pct, L["ev_pct"]),
+            prop_min_ev_pct=max(self.prop_min_ev_pct, L["prop_ev_pct"]),
+            outlier_min_pct=max(self.outlier_min_pct, L["outlier_pct"]),
+            parlay_min_ev_pct=max(self.parlay_min_ev_pct, L["parlay_ev_pct"]),
+            parlay_max_legs=min(self.parlay_max_legs, L["parlay_legs"]),
+            min_confidence=conf,
+            max_ev_per_hour=cap(self.max_ev_per_hour, L["ev_per_hour"]),
+            max_prop_per_hour=cap(self.max_prop_per_hour, L["prop_per_hour"]),
+            max_parlay_per_hour=cap(self.max_parlay_per_hour, L["parlay_per_hour"]),
         )
 
     def bad_webhooks(self) -> list[str]:
@@ -960,6 +1005,8 @@ class Alerter:
         self.open: dict[str, OpenArb] = {}
         self.restored: dict[str, dict] = {}
         self.started = time.time()
+        self.max_per_hour = 0          # 0 = no cap
+        self.posted_at: list[float] = []
         self.reset_stats()
         self._load_state()
 
@@ -1083,6 +1130,11 @@ class Alerter:
         for arb in arbs:
             seen.add(arb.key)
             cur = self.open.get(arb.key) or self._restore(arb, now)
+            if cur is None and self.max_per_hour:
+                self.posted_at = [t for t in self.posted_at if now - t < 3600]
+                if len(self.posted_at) >= self.max_per_hour:
+                    continue  # hourly cap reached; items arrive best-first, so the best already went out
+                self.posted_at.append(now)
             if cur is None:
                 print(self.text(arb), flush=True)
                 op = OpenArb(arb, now, now, self.value(arb), alerted_pct=self.value(arb),
@@ -1400,7 +1452,6 @@ def consensus_fair(ev: dict, cfg: Config, now: datetime, is_live: bool, skip: se
     return out
 
 
-CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 CONFIDENCE_BADGE = {"high": "🟢 High", "medium": "🟡 Medium", "low": "🟠 Low"}
 
 
@@ -2585,6 +2636,7 @@ def feed_freshness(events: list[dict], now: datetime | None = None) -> str:
 
 
 GUIDE = """**When an alert pops up, do what its 👉 line says. That's it.**
+The bot only sends strong ones (locks mode), so every alert is worth a look.
 
 💰 **ARB** (green, or red if the game is live)
 Bet **every** side shown, each at the book listed, using the exact amounts. You profit no matter who wins.
@@ -2663,11 +2715,23 @@ def short(sport: str) -> str:
     return sport.split("_", 1)[-1].upper()
 
 
+def mode_line(cfg: Config) -> str:
+    if cfg.alert_mode == "locks":
+        caps = ", ".join(f"{n} {what}/hour" for n, what in ((cfg.max_ev_per_hour, "+EV"),
+                         (cfg.max_prop_per_hour, "props"), (cfg.max_parlay_per_hour, "parlays")) if n)
+        return (f"Alert mode: LOCKS: arbs {cfg.min_profit_pct:g}%+ (live {cfg.min_live_profit_pct:g}%+), "
+                f"+EV {cfg.min_ev_pct:g}%+ {cfg.min_confidence}-confidence only, props {cfg.prop_min_ev_pct:g}%+, "
+                f"outliers {cfg.outlier_min_pct:g}%+, parlays {cfg.parlay_min_ev_pct:g}%+"
+                + (f"; at most {caps}" if caps else ""))
+    return f"Alert mode: {cfg.alert_mode.upper()} (thresholds as set in .env)"
+
+
 def print_plan(cfg: Config, sched: Scheduler) -> None:
     now = datetime.now(timezone.utc)
     sched.refresh_events(force=True)
     sched.update_budget(now)
     tz = ZoneInfo(cfg.timezone)
+    print("\n" + mode_line(cfg))
     print(f"\nCredits per check: {sched.cost} ({cfg.markets} × "
           f"{'bookmakers' if cfg.bookmakers else cfg.regions})")
     print(f"Credits left: {sched.api.remaining if sched.api.remaining is not None else '?'} "
@@ -2722,6 +2786,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     prop_cfg = cfg.for_props()
     sharp_history = SharpHistory(cfg.move_window_minutes)
     parlay_alerter = ParlayAlerter(cfg, dry_run=args.dry_run)
+    ev_alerter.max_per_hour = cfg.max_ev_per_hour
+    prop_evs.max_per_hour = cfg.max_prop_per_hour
+    parlay_alerter.max_per_hour = cfg.max_parlay_per_hour
 
     def update_parlays() -> int:
         open_bets = [op.arb for a in (ev_alerter, prop_evs) for op in a.open.values()]
@@ -2763,6 +2830,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     mode = "dry run (console only)" if alerter.dry_run else "sending to Discord"
     print(f"Arb bot started: {', '.join(short(s) for s in cfg.sports)} | {cfg.markets} | "
           f"{sched.cost} credits/check | {mode}")
+    print(mode_line(cfg))
     if cfg.active_hours:
         print(f"Active hours: {cfg.active_hours} ({cfg.timezone})")
     if not args.once:
