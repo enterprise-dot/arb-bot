@@ -14,6 +14,14 @@ Watches odds from many sportsbooks and pings Discord about two kinds of bets:
   Total $100 → returns ≥ $103.50 (+$3.50)
 ```
 
+**Every alert starts with a 👉 DO THIS line**: which book to open, how much to bet on what, and
+the price where you should skip it because it has moved too far. Post a how-to guide to your
+channel once and pin it, for anyone else using the alerts:
+
+```bash
+python arbbot.py --post-guide
+```
+
 **What a Discord alert does:**
 - **Pings you** the moment a gap appears. Each bet has a **tap-to-bet link** when the book provides one.
 - **Updates itself** if the prices shift while the gap is still open.

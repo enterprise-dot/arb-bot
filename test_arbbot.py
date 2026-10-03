@@ -109,6 +109,18 @@ class FindArbs(unittest.TestCase):
         [arb] = find_arbs([ev], Config(min_profit_pct=0, live_only=True), NOW)
         self.assertTrue(arb.is_live)
 
+    def test_arb_skip_lines(self):
+        [arb] = find_arbs(demo_events(), Config())
+        worst = arb.worst_ok_price(0)          # Celtics leg, Knicks unchanged at 2.45
+        self.assertAlmostEqual(1 / worst + 1 / 2.45, 1 / 1.005)
+        self.assertLess(worst, arb.legs[0].price)
+
+    def test_guide(self):
+        from arbbot import guide_payload
+        g = guide_payload()["embeds"][0]
+        for word in ("ARB", "+EV", "OUTLIER", "GONE", "skip"):
+            self.assertIn(word, g["description"])
+
     def test_live_arb_controls(self):
         ev = event({
             "A": [("h2h", [("Home", 2.02, None), ("Away", 1.90, None)])],
@@ -135,9 +147,10 @@ class FindArbs(unittest.TestCase):
         self.assertAlmostEqual(arb.profit_pct, 3.50, places=2)  # $57.50 / $42.50 -> $103.50
         self.assertEqual([l.stake for l in arb.legs], [57.5, 42.5])
         desc = discord_payload(arb)["embeds"][0]["description"]
-        self.assertIn("**1. Boston Celtics -125**", desc)
-        self.assertIn("Bet **$57.50** at FanDuel", desc)
-        self.assertIn("get back at least $103.50", desc)
+        self.assertTrue(desc.startswith("👉 **DO THIS NOW: place BOTH bets."))
+        self.assertIn("1️⃣ Open **FanDuel** → bet **$57.50** on **Boston Celtics -125**", desc)
+        self.assertIn("skip if the price is worse than -142", desc)
+        self.assertIn("get back at least **$103.50**", desc)
 
 
 class Stakes(unittest.TestCase):
@@ -401,7 +414,11 @@ class PlusEV(unittest.TestCase):
     def test_payload(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
-        self.assertEqual("📈 +5.0% EV · Home ML +110 at B", ev_payload(b)["embeds"][0]["title"])
+        self.assertEqual("📈 +EV 5.0% · Home ML +110 at B", ev_payload(b)["embeds"][0]["title"])
+        desc = ev_payload(b)["embeds"][0]["description"]
+        self.assertTrue(desc.startswith("👉 **DO THIS: bet this ONE side.**"))
+        self.assertIn("Open **B** → bet **$11** on **Home ML +110**", desc)
+        self.assertIn("skip if the price is worse than **+103**", desc)   # 1.5% edge vs fair +100
         self.assertTrue(ev_payload(b, gone_after=30)["embeds"][0]["title"].startswith("❌ GONE"))
 
 
@@ -503,7 +520,9 @@ class Outliers(unittest.TestCase):
         self.assertAlmostEqual(outs[0].hedge_pct, (1 / (1 / 1.85 + 1 / 4.00) - 1) * 100)
         title = outlier_payload(outs[0])["embeds"][0]["title"]
         self.assertTrue(title.startswith("🚨 OUTLIER"))
-        self.assertIn("lock in +", outlier_payload(outs[0])["embeds"][0]["description"])
+        d = outlier_payload(outs[0])["embeds"][0]["description"]
+        self.assertTrue(d.startswith("👉 **DO THIS NOW, before Stale fixes its price.**"))
+        self.assertIn("Want a sure profit instead?", d)
 
     def test_needs_enough_books_and_edge(self):
         ev = outlier_event(1.30, 3.60)                     # only slightly off: not an outlier

@@ -301,6 +301,11 @@ class Arb:
         for leg, st in zip(self.legs, stakes):
             leg.stake = st
 
+    def worst_ok_price(self, i: int, keep_pct: float = 0.5) -> float | None:
+        """Lowest price leg i can drop to (others unchanged) and still lock in keep_pct profit."""
+        room = 1 / (1 + keep_pct / 100) - sum(1 / l.price for j, l in enumerate(self.legs) if j != i)
+        return 1 / room if room > 0 else None
+
     @property
     def total_stake(self) -> float:
         return round(sum(l.stake for l in self.legs), 2)
@@ -486,6 +491,9 @@ def _line_label(arb: Arb) -> str:
 ODDS_FORMAT = "american"  # set from ODDS_FORMAT in .env at startup
 
 
+OK_EDGE_PCT = 1.5  # a single-side bet is still worth taking down to this much edge
+
+
 def american(dec: float) -> str:
     """2.52 -> +152, 1.65 -> -154."""
     if dec >= 2:
@@ -525,6 +533,7 @@ def format_text(arb: Arb) -> str:
 SPORT_ICONS = [("americanfootball", "🏈"), ("basketball", "🏀"), ("icehockey", "🏒"), ("baseball", "⚾"),
                ("soccer", "⚽"), ("mma", "🥊"), ("boxing", "🥊"), ("tennis", "🎾"), ("golf", "⛳")]
 GREY = 0x95A5A6
+DIVIDER = "\n\n───────────────\n"
 
 
 def sport_icon(sport_key: str) -> str:
@@ -565,24 +574,30 @@ def _gone_card(title: str, line: str) -> dict:
 
 def discord_payload(arb: Arb, mention: str = "", gone_after: float | None = None,
                     first_seen: float | None = None) -> dict:
-    """Arb card: what to bet where, then the guaranteed result."""
+    """Arb card: numbered instructions first, then the details."""
     market = f"{MARKET_NAMES.get(arb.market, arb.market)}{_line_label(arb)}"
     if gone_after is not None:
         return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~{arb.profit_pct:.2f}%~~ {arb.matchup}",
-                          f"{sport_icon(arb.sport_key)} {arb.sport} · {market} · prices moved, don't bet this one.")
-    legs = "\n\n".join(
-        f"**{i}. {l.outcome} {odds(l.price)}**\n↳ Bet **{money(l.stake)}** at {_link(l.book, l.link)}"
-        for i, l in enumerate(arb.legs, 1))
+                          f"Ignore this one. The prices moved. ({sport_icon(arb.sport_key)} {arb.sport} · {market})")
+    steps = []
+    for i, l in enumerate(arb.legs):
+        worst = arb.worst_ok_price(i)
+        skip = f"\n     ↳ skip if the price is worse than {odds(worst)}" if worst else ""
+        num = ["1️⃣", "2️⃣", "3️⃣"][i] if i < 3 else "•"
+        steps.append(f"{num} Open **{_link(l.book, l.link)}** → bet "
+                     f"**{money(l.stake)}** on **{l.outcome} {odds(l.price)}**{skip}")
     rounding = (f"\n*{arb.exact_pct:.2f}% with exact stakes; rounded to look like normal bets*"
                 if arb.exact_pct - arb.profit_pct >= 0.05 else "")
-    desc = (f"{sport_icon(arb.sport_key)} **{arb.sport}** · {arb.matchup}\n"
-            f"{market} · {_when(arb.is_live, arb.commence_time, first_seen)}\n\n"
-            f"{legs}\n\n"
-            f"💵 **Stake {money(arb.total_stake)} → get back at least {money(arb.guaranteed_return)}**"
-            f"{rounding}")
-    return _card(f"💰 {arb.profit_pct:.2f}% ARB · +{money(arb.guaranteed_profit)} guaranteed", desc,
+    desc = (f"👉 **DO THIS NOW: place BOTH bets. You profit no matter who wins.**\n\n"
+            + "\n\n".join(steps)
+            + f"\n\n💵 You bet **{money(arb.total_stake)}** and get back at least "
+              f"**{money(arb.guaranteed_return)}** (+{money(arb.guaranteed_profit)}).{rounding}"
+            + "\nDo them back to back. If one price moved past its skip line, don't place the other."
+            + f"\n\n───────────────\n{sport_icon(arb.sport_key)} **{arb.sport}** · {arb.matchup}\n"
+              f"{market} · {_when(arb.is_live, arb.commence_time, first_seen)}")
+    return _card(f"💰 ARB · +{money(arb.guaranteed_profit)} guaranteed ({arb.profit_pct:.2f}%)", desc,
                  0xE74C3C if arb.is_live else 0x2ECC71, url=arb.legs[0].link,
-                 footer="Check both prices first. Place the harder bet first.", mention=mention)
+                 footer="ARB = bet every side at different books, profit locked in.", mention=mention)
 
 
 def _webhook(url: str, payload: dict, method: str = "POST", message_id: str | None = None) -> dict | None:
@@ -862,6 +877,10 @@ class EVBet:
     first_fair_prob: float = 0.0     # fair probability when first alerted (to show movement)
     first_sharp_quotes: list[tuple[str, list[float]]] = field(default_factory=list)
 
+    def worst_ok_price(self, min_edge_pct: float = OK_EDGE_PCT) -> float:
+        """Lowest price that still leaves min_edge_pct of edge against the fair price."""
+        return (1 + min_edge_pct / 100) / self.fair_prob
+
     @property
     def stake_label(self) -> str:
         units = f" ({self.stake / self.unit_size:.2g}u)" if self.unit_size > 0 else ""
@@ -1084,26 +1103,30 @@ def _board_lines(b: EVBet, rows: int = 12) -> str:
 
 
 def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
-               first_seen: float | None = None) -> dict:
-    """+EV card: the bet and stake first, then why (fair value, sharp prices), then every book."""
+                first_seen: float | None = None) -> dict:
+    """+EV card: the instruction first, then why (fair value, sharp prices), then every book."""
     icon = sport_icon(b.sport_key)
     if gone_after is not None:
         return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~+{b.ev_pct:.1f}%~~ {b.pick} {odds(b.price)}",
-                          f"{icon} {b.matchup} · {b.book} moved, the edge is gone.")
+                          f"Ignore this one. {b.book} moved and the value is gone. ({icon} {b.matchup})")
     parts = [
-        f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}",
-        f"**Bet {b.stake_label}** on **{b.pick} {odds(b.price)}** at {_link(b.book, b.link)}",
-        f"**Fair value** {_fair_line(b)} · {b.fair_prob:.1%} to win"
-        + (f"\n**{b.sharp_quotes[0][0]}** {' / '.join(odds(x) for x in b.sharp_quotes[0][1])}"
-           if b.sharp_quotes else "")
-        + (f" *(was {' / '.join(odds(x) for x in b.first_sharp_quotes[0][1])})*"
-           if b.first_sharp_quotes and b.first_sharp_quotes != b.sharp_quotes else ""),
+        f"👉 **DO THIS: bet this ONE side.** Good value, but it won't win every time.\n\n"
+        f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**\n"
+        f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**",
     ]
+    if len([r for r in b.board if r[2] > 0]) > 1:
+        parts.append("Can't use that book? Any 🟢 book below works too, at its price.")
+    details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}\n\n"
+               f"**Fair value** {_fair_line(b)} · {b.fair_prob:.1%} to win"
+               + (f"\n**{b.sharp_quotes[0][0]}** {' / '.join(odds(x) for x in b.sharp_quotes[0][1])}"
+                  if b.sharp_quotes else "")
+               + (f" *(was {' / '.join(odds(x) for x in b.first_sharp_quotes[0][1])})*"
+                  if b.first_sharp_quotes and b.first_sharp_quotes != b.sharp_quotes else ""))
+    desc = "\n\n".join(parts) + DIVIDER + details
     if b.board:
-        parts.append("**Every book**\n" + _board_lines(b))
-    footer = f"Fair value from {b.sharp_book} · sources {b.sources_used}/{b.sources_total} · " \
-             "+EV wins over many bets, not every bet"
-    return _card(f"📈 +{b.ev_pct:.1f}% EV · {b.pick} {odds(b.price)} at {b.book}", "\n\n".join(parts),
+        desc += "\n\n**Every book**\n" + _board_lines(b)
+    footer = f"+EV = better price than the true odds ({b.sharp_book}). Wins over many bets, not every bet."
+    return _card(f"📈 +EV {b.ev_pct:.1f}% · {b.pick} {odds(b.price)} at {b.book}", desc,
                  0x3498DB, url=b.link, footer=footer, mention=mention)
 
 
@@ -1245,28 +1268,32 @@ def without_outliers(evs: list[EVBet], outs: list[EVBet]) -> list[EVBet]:
 
 def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
                     first_seen: float | None = None) -> dict:
-    """Outlier card: same layout as +EV, plus the lock-in hedge when there is one."""
+    """Outlier card: bet-now instruction, optional lock-in, then why and every book."""
     icon = sport_icon(b.sport_key)
     if gone_after is not None:
         return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~🚨 +{b.ev_pct:.0f}%~~ {b.pick} {odds(b.price)}",
-                          f"{icon} {b.matchup} · {b.book} caught up with the market.")
+                          f"Ignore this one. {b.book} fixed its price. ({icon} {b.matchup})")
     parts = [
-        f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}",
-        f"**{b.book} has {b.pick} at {odds(b.price)}**\nThe other {b.sources_used} books say "
-        f"**{odds(b.fair_odds)}** ({b.fair_prob:.1%} to win)",
-        f"**Bet {b.stake_label}** at {_link(b.book, b.link)}",
+        f"👉 **DO THIS NOW, before {b.book} fixes its price.**\n\n"
+        f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**\n"
+        f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**",
     ]
     if b.hedge:
         legs = [(b.pick, b.book, b.price, b.link)] + [(o, bk, pr, ln) for o, bk, pr, ln in b.hedge]
         margin = sum(1 / pr for _, _, pr, _ in legs)
-        lines = [f"• {o} {odds(pr)} at {_link(bk, ln)} → **{money(round(100 / pr / margin, 2))}**"
+        lines = [f"• Open **{_link(bk, ln)}** → bet **{money(round(100 / pr / margin, 2))}** on {o} {odds(pr)}"
                  for o, bk, pr, ln in legs]
-        parts.append(f"🔒 **Or lock in +{b.hedge_pct:.1f}% guaranteed** (per $100)\n" + "\n".join(lines))
+        parts.append(f"🔒 **Want a sure profit instead?** Place all of these for **+{b.hedge_pct:.1f}% "
+                     f"guaranteed** (per $100 total):\n" + "\n".join(lines))
+    details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}\n\n"
+               f"**Why:** {b.book} has {b.pick} at **{odds(b.price)}**, but the other {b.sources_used} books "
+               f"say **{odds(b.fair_odds)}** ({b.fair_prob:.1%} to win).")
+    desc = "\n\n".join(parts) + DIVIDER + details
     if b.board:
-        parts.append("**Every book**\n" + _board_lines(b))
-    return _card(f"🚨 OUTLIER +{b.ev_pct:.0f}% · {b.pick} {odds(b.price)} at {b.book}", "\n\n".join(parts),
+        desc += "\n\n**Every book**\n" + _board_lines(b)
+    return _card(f"🚨 OUTLIER +{b.ev_pct:.0f}% · {b.pick} {odds(b.price)} at {b.book}", desc,
                  0xE67E22, url=b.link,
-                 footer="One book is way off the market. Bet fast; books can void obvious pricing errors.",
+                 footer="OUTLIER = one book is way off. Bet fast; books can void obvious pricing errors.",
                  mention=mention)
 
 
@@ -1717,6 +1744,36 @@ def feed_freshness(events: list[dict], now: datetime | None = None) -> str:
     return "; ".join(parts) or "no prices"
 
 
+GUIDE = """**When an alert pops up, do what its 👉 line says. That's it.**
+
+💰 **ARB** (green, or red if the game is live)
+Bet **every** side shown, each at the book listed, using the exact amounts. You profit no matter who wins.
+• Place the bets back to back.
+• If a price has moved past its "skip" line, don't place the other bet.
+
+📈 **+EV** (blue)
+Bet **one** side at the book shown, for the amount shown. It's a better price than it should be, but it won't win every time. It pays off over many bets.
+
+🚨 **OUTLIER** (orange, pings everyone)
+One book's price is way off from all the others. Bet it fast, before they fix it.
+Optional: also place the 🔒 bets it lists to lock in a guaranteed profit.
+
+❌ **GONE** (grey)
+The chance is over. Ignore it.
+
+**Every time**
+1. Tap the book name to open it. Check the price matches the alert, or is better.
+2. Worse than the "skip" price? Don't bet.
+3. Bet the exact amount shown. Don't go bigger.
+4. 🟢 in "Every book" means that book's price is also good to bet.
+5. Books sometimes cancel bets on obvious mistakes and refund the money. With an arb, the other bet still stands, so you're left with one normal bet."""
+
+
+def guide_payload() -> dict:
+    return _card("📖 How to use these alerts", GUIDE, 0x5865F2,
+                 footer="Pin this message: hover over it → ⋯ → Pin Message")
+
+
 def demo_events() -> list[dict]:
     """Sample data with one planted arb, re-stamped as fresh so it passes the age filter."""
     data = json.loads((HERE / "sample_odds.json").read_text())
@@ -1920,6 +1977,8 @@ def main() -> None:
     p.add_argument("--demo", action="store_true", help="use bundled sample data (no API key needed)")
     p.add_argument("--dry-run", action="store_true", help="print alerts instead of sending to Discord")
     p.add_argument("--test-discord", action="store_true", help="send one sample alert to Discord and exit")
+    p.add_argument("--post-guide", action="store_true",
+                   help="post a how-to-use guide to your Discord channel (then pin it)")
     p.add_argument("--results", action="store_true",
                    help="grade finished +EV alerts and print the win/loss record (2 credits per sport)")
     args = p.parse_args()
@@ -1927,6 +1986,13 @@ def main() -> None:
     cfg = Config.from_env()
     global ODDS_FORMAT
     ODDS_FORMAT = cfg.odds_format
+
+    if args.post_guide:
+        if not cfg.webhook_url:
+            sys.exit("Set DISCORD_WEBHOOK_URL in .env first.")
+        _webhook(cfg.webhook_url, guide_payload())
+        print("Posted the guide. In Discord: hover over it → ⋯ → Pin Message.")
+        return
 
     if args.test_discord:
         if not cfg.webhook_url:
