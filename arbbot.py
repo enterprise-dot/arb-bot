@@ -1824,7 +1824,17 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
                         if margin < 1:
                             bet.hedge, bet.hedge_pct = hedge, (1 / margin - 1) * 100
                     out.append(bet)
-    return sorted(out, key=lambda b: b.ev_pct, reverse=True)
+    # Several books can be off-market on the same bet. Alerts are keyed by the bet, so keep only
+    # the best price per bet (otherwise a worse book would overwrite the best one's alert) and
+    # list the rest under "also".
+    best: dict[tuple, EVBet] = {}
+    for b in sorted(out, key=lambda b: b.ev_pct, reverse=True):
+        k = (b.event_id, b.market, b.line, b.outcome)
+        if k in best:
+            best[k].also.append((b.book, b.price))
+        else:
+            best[k] = b
+    return list(best.values())
 
 
 def note_related(bets: list[EVBet], *alerters: "Alerter") -> None:

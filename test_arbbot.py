@@ -672,6 +672,21 @@ class Outliers(unittest.TestCase):
         self.assertEqual(find_outliers([outlier_event(1.85, 1.95)], Config(outlier_live=False), NOW), [])
         self.assertEqual(find_outliers([outlier_event(1.85, 1.95)], Config(outliers_enabled=False), NOW), [])
 
+    def test_two_books_off_market_on_one_bet_keeps_the_best(self):
+        ev = outlier_event(1.85, 1.95)
+        second = {"key": "stale2", "title": "Stale2", "last_update": FRESH, "markets": [
+            {"key": "h2h", "last_update": FRESH, "outcomes": [
+                {"name": "Home", "price": 1.60, "point": None}, {"name": "Away", "price": 2.30, "point": None}]}]}
+        ev["bookmakers"].append(second)
+        outs = find_outliers([ev], Config(), NOW)
+        home = [o for o in outs if o.outcome == "Home"]
+        self.assertEqual(len(home), 1)                       # one alert per bet...
+        self.assertEqual(home[0].book, "Stale")               # ...at the best price (1.85 beats 1.60)
+        self.assertEqual(home[0].also, [("Stale2", 1.60)])
+        a = OutlierAlerter(Config(), dry_run=True)
+        a.handle(outs, now=1000)
+        self.assertEqual(a.open[home[0].key].arb.book, "Stale")   # not overwritten by the worse book
+
     def test_sharp_book_itself_never_flagged(self):
         ev = outlier_event(1.25, 4.00)
         ev["bookmakers"][0]["markets"][0]["outcomes"][0]["price"] = 1.90   # Pinnacle is the odd one
