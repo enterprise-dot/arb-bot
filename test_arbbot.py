@@ -773,6 +773,16 @@ class Parlays(unittest.TestCase):
 
 
 class Channels(unittest.TestCase):
+    def test_set_env_value_replaces_placeholder(self):
+        import tempfile
+        from arbbot import set_env_value
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / ".env"
+            f.write_text("ODDS_API_KEY=abc\nDISCORD_EV_WEBHOOK_URL=PASTE_URL_HERE\nBANKROLL=300\n")
+            set_env_value(f, "DISCORD_EV_WEBHOOK_URL", "https://discord.com/api/webhooks/1/x")
+            self.assertEqual(f.read_text().splitlines(), [
+                "ODDS_API_KEY=abc", "BANKROLL=300", "DISCORD_EV_WEBHOOK_URL=https://discord.com/api/webhooks/1/x"])
+
     def test_placeholder_webhook_falls_back_to_main(self):
         cfg = Config(webhook_url="https://main", ev_webhook_url="PASTE_URL_HERE")
         self.assertEqual(cfg.bad_webhooks(), ["DISCORD_EV_WEBHOOK_URL"])

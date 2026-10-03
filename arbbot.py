@@ -70,6 +70,42 @@ DEFAULT_PROP_MARKETS = {
 
 # --------------------------------------------------------------------------- config
 
+WEBHOOK_SETTINGS = {
+    "main": ("DISCORD_WEBHOOK_URL", "arbs (and anything without its own channel)"),
+    "ev": ("DISCORD_EV_WEBHOOK_URL", "+EV bets, props, outliers and parlays"),
+    "outlier": ("DISCORD_OUTLIER_WEBHOOK_URL", "outliers"),
+    "parlay": ("DISCORD_PARLAY_WEBHOOK_URL", "parlays"),
+    "live": ("DISCORD_LIVE_WEBHOOK_URL", "live arbs"),
+    "status": ("DISCORD_STATUS_WEBHOOK_URL", "bot health messages"),
+}
+
+
+def set_env_value(path: Path, key: str, value: str) -> None:
+    """Replace KEY=... in .env (or add it), keeping every other line as it is."""
+    lines = path.read_text().splitlines() if path.exists() else []
+    lines = [l for l in lines if not l.strip().startswith(key + "=")]
+    lines.append(f"{key}={value}")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def set_webhook(channel: str) -> None:
+    """Ask for a webhook URL, check it, save it to .env and send a test message."""
+    key, what = WEBHOOK_SETTINGS[channel]
+    print(f"Paste the Discord webhook URL for {what}, then press Enter:")
+    url = input("> ").strip().strip("'\"")
+    if not url.startswith(("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")):
+        sys.exit("That doesn't look like a Discord webhook URL (it should start with "
+                 "https://discord.com/api/webhooks/). Nothing was changed.")
+    try:
+        _webhook(url, {"username": "Arb Bot", "content": f"✅ Connected. This channel now gets {what}."})
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"Discord rejected that URL ({e}). Copy it again from the channel's webhook settings. "
+                 "Nothing was changed.")
+    set_env_value(HERE / ".env", key, url)
+    print(f"Saved {key}. A ✅ test message was sent to that channel.")
+    print("Now restart the bot so it uses it:  systemctl restart arbbot")
+
+
 def load_dotenv(path: Path) -> None:
     """Minimal .env loader: KEY=VALUE lines, no override of real env vars."""
     if not path.exists():
@@ -2400,11 +2436,17 @@ def main() -> None:
     p.add_argument("--demo", action="store_true", help="use bundled sample data (no API key needed)")
     p.add_argument("--dry-run", action="store_true", help="print alerts instead of sending to Discord")
     p.add_argument("--test-discord", action="store_true", help="send one sample alert to Discord and exit")
+    p.add_argument("--set-webhook", choices=sorted(WEBHOOK_SETTINGS), metavar="CHANNEL",
+                   help="paste a Discord webhook URL for a channel: " + ", ".join(sorted(WEBHOOK_SETTINGS)))
     p.add_argument("--post-guide", action="store_true",
                    help="post a how-to-use guide to your Discord channel (then pin it)")
     p.add_argument("--results", action="store_true",
                    help="grade finished +EV alerts and print the win/loss record (2 credits per sport)")
     args = p.parse_args()
+
+    if args.set_webhook:
+        set_webhook(args.set_webhook)
+        return
 
     cfg = Config.from_env()
     global ODDS_FORMAT
