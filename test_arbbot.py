@@ -656,8 +656,8 @@ class EVLifecycle(unittest.TestCase):
                 Scores.calls += 1
                 return [{"id": "e1", "completed": True,
                          "scores": [{"name": "Home", "score": "110"}, {"name": "Away", "score": "100"}]}]
-        self.assertEqual(settle_pending(self.cfg, Scores()), 1)   # ...but graded once
-        self.assertEqual(settle_pending(self.cfg, Scores()), 0)   # nothing left; no extra API call
+        self.assertEqual(len(settle_pending(self.cfg, Scores())), 1)   # ...but graded once
+        self.assertEqual(settle_pending(self.cfg, Scores()), [])       # nothing left; no extra API call
         self.assertEqual(Scores.calls, 1)
         rec = ev_record(self.cfg)
         self.assertTrue(rec.startswith("1 bets, 1-0-0, +$"), rec)
@@ -1598,6 +1598,172 @@ class Settings(unittest.TestCase):
             load_dotenv(f)
             self.assertEqual(os.environ.pop("ARBTEST_BOOKS"), "draftkings")
             os.environ.pop("ARBTEST_OTHER", None)
+
+
+class BetResults(unittest.TestCase):
+    """Grading every kind of alert, the day view, and the results channel."""
+    START = "2026-10-03T18:00:00Z"                              # 2pm in New York
+    LATER = datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc)    # every game is over
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.cfg = Config(min_ev_pct=3, round_stakes=0, webhook_url="https://main", state_dir=str(d / "state"),
+                          results_webhook_url="https://results", log_file=str(d / "arbs.csv"),
+                          ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
+                          parlay_log_file=str(d / "par.csv"), ev_results_file=str(d / "res.csv"),
+                          closing_file=str(d / "close.csv"), pregame_max_age_seconds=10**9)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def scores(self, finals):
+        """finals: {event_id: (home, away)} -> a fake API that counts its calls."""
+        class Api:
+            calls = []
+            def scores(self, sport, days_from=3):
+                Api.calls.append(sport)
+                return [{"id": gid, "completed": True,
+                         "scores": [{"name": "Home", "score": str(h)}, {"name": "Away", "score": str(a)}]}
+                        for gid, (h, a) in finals.items()]
+        return Api()
+
+    def log_ev(self, gid, home_price=2.20, market="h2h"):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", home_price, None)]},
+                      start=self.START)
+        ev["id"], ev["sport_key"] = gid, "icehockey_nhl"
+        [b] = find_evs([ev], self.cfg, NOW)
+        EVAlerter(self.cfg, dry_run=True).handle([b], now=1000)
+        return b
+
+    def log_parlay(self, gids):
+        legs = [ev_leg(g, {"DK": 2.20}) for g in gids]
+        [p] = find_parlays(legs, Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=len(gids)))
+        p.stake = 10
+        ParlayAlerter(self.cfg, dry_run=True).handle([p], now=1000)
+        return p
+
+    def test_single_bets_graded(self):
+        b = self.log_ev("g1")
+        api = self.scores({"g1": (4, 2)})
+        [row] = settle_pending(self.cfg, api, self.LATER)
+        self.assertEqual((row["result"], row["profit"]), ("win", round(b.stake * 1.2, 2)))
+        self.assertEqual(api.calls, ["icehockey_nhl"])
+        self.assertEqual(settle_pending(self.cfg, api, self.LATER), [])     # graded once, no more calls
+        self.assertEqual(api.calls, ["icehockey_nhl"])
+
+    def test_not_graded_before_the_game_can_be_over(self):
+        self.log_ev("g1")
+        api = self.scores({})
+        self.assertEqual(settle_pending(self.cfg, api, datetime(2026, 10, 3, 19, 0, tzinfo=timezone.utc)), [])
+        self.assertEqual(api.calls, [])                                     # no credits spent
+
+    def test_parlays_graded_leg_by_leg(self):
+        p = self.log_parlay(["g1", "g2"])
+        [row] = settle_pending(self.cfg, self.scores({"g1": (3, 1), "g2": (5, 2)}), self.LATER)
+        self.assertEqual(row["kind"], "parlay")
+        self.assertEqual((row["result"], row["profit"]), ("win", round(10 * (p.price - 1), 2)))
+
+    def test_parlay_push_drops_the_leg_and_a_loss_ends_it_early(self):
+        self.log_parlay(["g1", "g2"])
+        [row] = settle_pending(self.cfg, self.scores({"g1": (3, 1), "g2": (2, 2)}), self.LATER)
+        self.assertEqual((row["result"], row["profit"]), ("win", 12.0))      # only the 2.20 leg counts
+        self.tearDown(); self.setUp()
+        self.log_parlay(["g1", "g2"])
+        [row] = settle_pending(self.cfg, self.scores({"g1": (1, 3)}), self.LATER)   # g2 not final yet
+        self.assertEqual((row["result"], row["profit"]), ("loss", -10.0))
+
+    def test_props_listed_but_never_graded(self):
+        ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)}, start=self.START)
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        [b] = find_evs([ev], self.cfg.for_props(), NOW)
+        EVAlerter(self.cfg, dry_run=True).handle([b], now=1000)
+        api = self.scores({"p1": (100, 90)})
+        self.assertEqual(settle_pending(self.cfg, api, self.LATER), [])
+        self.assertEqual(api.calls, [])                                     # nothing to spend credits on
+        from arbbot import day_bets, result_line
+        from datetime import date
+        [r] = day_bets(self.cfg, date(2026, 10, 3))
+        self.assertIn("🎯", result_line(r, self.cfg, self.LATER))
+        self.assertIn("LeBron James Over 25.5 Points", result_line(r, self.cfg, self.LATER))
+
+    def test_day_view_and_card(self):
+        from arbbot import day_bets, results_payload, print_day
+        from datetime import date
+        self.log_ev("g1")
+        self.log_ev("g2", home_price=2.30)
+        settle_pending(self.cfg, self.scores({"g1": (4, 2), "g2": (1, 2)}), self.LATER)
+        rows = day_bets(self.cfg, date(2026, 10, 3))
+        self.assertEqual([r["result"] for r in rows], ["win", "loss"])
+        self.assertEqual(day_bets(self.cfg, date(2026, 10, 2)), [])
+        card = results_payload(self.cfg, "📅 Results", rows, rows, date(2026, 10, 3), self.LATER)["embeds"][0]
+        self.assertTrue(card["title"].startswith("📅 Results · 1-1"))
+        self.assertIn("✅ **Home ML", card["description"])
+        self.assertIn("❌ **Home ML", card["description"])
+        self.assertIn("Final: Away 2, Home 4", card["description"])
+        self.assertIn("**All:** 1-1", card["description"])
+        import io, contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            print_day(self.cfg, date(2026, 10, 3), self.LATER)
+        self.assertIn("Saturday Oct 3", out.getvalue())
+        self.assertNotIn("**", out.getvalue())
+
+    def test_results_channel_posts_each_result_once(self):
+        from arbbot import Results
+        self.log_ev("g1")
+        res = Results(self.cfg, dry_run=False)
+        sent = []
+        res.send = lambda payload: sent.append(payload["embeds"][0])
+        api = self.scores({"g1": (4, 2)})
+        self.assertEqual(res.run(api, self.LATER), 1)
+        self.assertTrue(sent[0]["title"].startswith("📋 1 result in · 1-0"))
+        self.assertEqual(res.run(api, self.LATER), 0)                       # not posted twice
+        # A bet graded from the command line still gets posted by the bot.
+        self.log_ev("g2")
+        settle_pending(self.cfg, self.scores({"g2": (0, 1)}), self.LATER)
+        self.assertEqual(res.run(api, self.LATER), 1)
+        self.assertIn("❌", sent[-1]["description"])
+        # After a restart nothing is re-posted.
+        again = Results(self.cfg, dry_run=False)
+        again.send = lambda payload: sent.append(payload["embeds"][0])
+        self.assertEqual(again.run(api, self.LATER), 0)
+
+    def test_first_run_does_not_flood_old_results(self):
+        from arbbot import Results
+        self.log_ev("g1")
+        settle_pending(self.cfg, self.scores({"g1": (4, 2)}), self.LATER)  # graded before this update
+        res = Results(self.cfg, dry_run=False)
+        res.send = lambda payload: self.fail("should not post old results")
+        self.assertEqual(res.run(self.scores({}), self.LATER), 0)
+
+    def test_daily_recap(self):
+        from arbbot import Results
+        from datetime import date
+        self.log_ev("g1")
+        res = Results(self.cfg, dry_run=False)
+        sent = []
+        res.send = lambda payload: sent.append(payload["embeds"][0])
+        res.daily(self.scores({"g1": (4, 2)}), date(2026, 10, 3), self.LATER)
+        self.assertTrue(sent[0]["title"].startswith("📅 Results for Sat Oct 3 · 1-0"))
+        self.assertEqual(res.run(self.scores({}), self.LATER), 0)           # not posted again one by one
+
+    def test_record_keeps_parlays_separate(self):
+        self.log_ev("g1")
+        self.log_parlay(["g2", "g3"])
+        settle_pending(self.cfg, self.scores({"g1": (4, 2), "g2": (1, 3), "g3": (1, 3)}), self.LATER)
+        self.assertTrue(ev_record(self.cfg).startswith("1 bets, 1-0-0"))
+        self.assertTrue(ev_record(self.cfg, kinds=("parlay",)).startswith("1 bets, 0-1-0"))
+
+    def test_pick_labels(self):
+        from arbbot import row_pick
+        base = {"kind": "ev", "player": "", "point": ""}
+        self.assertEqual(row_pick({**base, "market": "h2h", "outcome": "Bills"}), "Bills ML")
+        self.assertEqual(row_pick({**base, "market": "spreads", "outcome": "Bills", "point": "-3.5"}), "Bills -3.5")
+        self.assertEqual(row_pick({**base, "market": "totals", "outcome": "Over", "point": "47.5"}), "Over 47.5")
+        self.assertEqual(row_pick({**base, "market": "player_points", "outcome": "Over", "point": "25.5",
+                                   "player": "LeBron James"}), "LeBron James Over 25.5 Points")
 
 
 if __name__ == "__main__":

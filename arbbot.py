@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -95,6 +95,7 @@ WEBHOOK_SETTINGS = {
     "parlay": ("DISCORD_PARLAY_WEBHOOK_URL", "parlays"),
     "live": ("DISCORD_LIVE_WEBHOOK_URL", "live arbs"),
     "status": ("DISCORD_STATUS_WEBHOOK_URL", "bot health messages"),
+    "results": ("DISCORD_RESULTS_WEBHOOK_URL", "bet results (what hit and what missed)"),
 }
 
 
@@ -207,6 +208,8 @@ class Config:
     include_links: bool = True    # ask for bet-slip deep links where books support them
     discord_mention: str = ""     # e.g. @everyone or <@USER_ID> to force a phone ping
     status_webhook_url: str = ""  # health messages; defaults to the alerts webhook
+    results_webhook_url: str = ""  # graded bets (what hit); defaults to the health channel
+    results_minutes: int = 30     # look for finished games to grade this often (0 = daily only)
     low_credits: int = 5000       # warn on Discord below this many credits
     log_file: str = "arbs.csv"    # every arb with how long it lasted ("" = off)
     state_dir: str = "state"      # open alerts survive restarts (no duplicate posts) ("" = off)
@@ -350,6 +353,8 @@ class Config:
             include_links=e("INCLUDE_LINKS", "true").lower() in ("1", "true", "yes"),
             discord_mention=e("DISCORD_MENTION", ""),
             status_webhook_url=e("DISCORD_STATUS_WEBHOOK_URL", ""),
+            results_webhook_url=e("DISCORD_RESULTS_WEBHOOK_URL", ""),
+            results_minutes=num("RESULTS_MINUTES", d.results_minutes, int),
             low_credits=num("LOW_CREDITS", d.low_credits, int),
             log_file=e("LOG_FILE", d.log_file),
             state_dir=e("STATE_DIR", d.state_dir),
@@ -445,7 +450,8 @@ class Config:
                           ("outlier_webhook_url", "DISCORD_OUTLIER_WEBHOOK_URL"),
                           ("parlay_webhook_url", "DISCORD_PARLAY_WEBHOOK_URL"),
                           ("live_webhook_url", "DISCORD_LIVE_WEBHOOK_URL"),
-                          ("status_webhook_url", "DISCORD_STATUS_WEBHOOK_URL")):
+                          ("status_webhook_url", "DISCORD_STATUS_WEBHOOK_URL"),
+                          ("results_webhook_url", "DISCORD_RESULTS_WEBHOOK_URL")):
             value = getattr(self, attr)
             if value and not value.startswith(("https://", "http://")):
                 bad.append(env)
@@ -2121,7 +2127,9 @@ def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None
                  mention=mention)
 
 
-PARLAY_FIELDS = ["first_seen", "book", "legs", "price", "fair_prob", "best_ev_pct", "stake", "games"]
+PARLAY_FIELDS = ["first_seen", "book", "legs", "price", "fair_prob", "best_ev_pct", "stake", "games", "legs_json"]
+LEG_FIELDS = ["event_id", "sport_key", "matchup", "home_team", "away_team", "commence_time", "market",
+              "outcome", "point", "n_outcomes", "player"]
 
 
 class ParlayAlerter(Alerter):
@@ -2155,7 +2163,10 @@ class ParlayAlerter(Alerter):
         return {"book": p.book, "legs": " + ".join(f"{b.pick} {odds(pr)}" for b, pr, _ in p.legs),
                 "price": round(p.price, 3), "fair_prob": round(p.fair_prob, 4),
                 "best_ev_pct": round(op.best_pct, 2), "stake": p.stake,
-                "games": " | ".join(b.matchup for b, _, _ in p.legs)}
+                "games": " | ".join(b.matchup for b, _, _ in p.legs),
+                # Each leg in full, so the parlay can be graded once its games finish.
+                "legs_json": json.dumps([{**{f: _blank(getattr(b, f)) for f in LEG_FIELDS}, "price": pr}
+                                         for b, pr, _ in p.legs])}
 
 
 # --------------------------------------------------------------------------- +EV results
@@ -2204,50 +2215,153 @@ def _bet_id(row: dict) -> str:
     return f"{row['event_id']}|{row['market']}|{player}{row['outcome']}|{row['point']}"
 
 
-def settle_pending(cfg: Config, api: "OddsAPI") -> int:
-    """Grade logged +EV alerts whose games have finished. Uses the scores endpoint
-    (2 credits per sport, only for sports with ungraded bets from the last 3 days)."""
-    done = {_bet_id(r) for r in _read_csv(cfg.ev_results_file)}
-    pending: dict[str, dict] = {}
-    cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+def _blank(v):
+    return "" if v is None else v
+
+
+def _parlay_row(r: dict) -> dict | None:
+    """A logged parlay as a result-file row (None for parlays logged before legs were saved)."""
+    try:
+        legs = json.loads(r.get("legs_json") or "[]")
+    except ValueError:
+        return None
+    if not legs:
+        return None
+    ids = "+".join(sorted(_bet_id(l) for l in legs))
+    return {
+        "first_seen": r["first_seen"], "event_id": f"parlay:{r['book']}:{ids}", "sport": "Parlay",
+        "sport_key": "parlay", "matchup": r.get("games", ""), "home_team": "", "away_team": "",
+        "commence_time": max(l["commence_time"] for l in legs), "live": False, "market": "parlay",
+        "outcome": r.get("legs", ""), "point": "", "n_outcomes": "", "book": r["book"], "price": r["price"],
+        "fair_odds": round(1 / float(r["fair_prob"]), 3) if float(r.get("fair_prob") or 0) else "",
+        "best_ev_pct": r["best_ev_pct"], "stake": r["stake"], "player": "", "confidence": "",
+        "kind": "parlay", "_legs": legs,
+    }
+
+
+def logged_bets(cfg: Config, since: datetime | None = None) -> dict[str, dict]:
+    """Every alerted bet (first alert only), by bet id: +EV, outliers, props and parlays."""
+    out: dict[str, dict] = {}
     closing = {r["bet_id"]: float(r["closing_fair_prob"]) for r in _read_csv(cfg.closing_file)}
-    for kind, name in (("ev", cfg.ev_log_file), ("outlier", cfg.outlier_log_file)):
+    for kind, name in (("ev", cfg.ev_log_file), ("outlier", cfg.outlier_log_file),
+                       ("parlay", cfg.parlay_log_file)):
         for r in _read_csv(name) if name else []:
+            if kind == "parlay":
+                r = _parlay_row(r)
+                if r is None:
+                    continue
             bid = _bet_id(r)
-            if bid in done or bid in pending or r.get("player"):
-                continue  # repeats count once; props need player stats, so CLV judges those
-            start = _parse_time(r["commence_time"])
-            if cutoff < start < datetime.now(timezone.utc) - timedelta(hours=2):
-                cp = closing.get(bid)
-                pending[bid] = {**r, "kind": kind,
-                                "closing_fair_odds": round(1 / cp, 3) if cp else "",
-                                "clv_pct": round(clv_pct(float(r["price"]), cp), 2) if cp else ""}
-    if not pending:
-        return 0
-    graded = 0
-    for sport in sorted({r["sport_key"] for r in pending.values()}):
+            if bid in out or (since and _parse_time(r["commence_time"]) < since):
+                continue  # repeats count once
+            cp = closing.get(bid)
+            out[bid] = {**r, "kind": kind,
+                        "closing_fair_odds": round(1 / cp, 3) if cp else "",
+                        "clv_pct": round(clv_pct(float(r["price"]), cp), 2) if cp else ""}
+    return out
+
+
+def _legs(r: dict) -> list[dict]:
+    return r["_legs"] if r.get("kind") == "parlay" else [r]
+
+
+def gradable(r: dict) -> bool:
+    """Final scores can grade it: player props need box scores, which the odds feed doesn't have."""
+    return not any(l.get("player") for l in _legs(r))
+
+
+def settle_parlay(r: dict, finals: dict[str, dict[str, float]]) -> tuple[str, float] | None:
+    """Grade a parlay from the legs' final scores. One losing leg loses it (even before the other
+    games end); a pushed leg drops out, like at the books. None = not decided yet."""
+    results = []
+    for leg in r["_legs"]:
+        pts = finals.get(leg["event_id"])
+        if not pts or leg["home_team"] not in pts or leg["away_team"] not in pts:
+            results.append(None)
+            continue
+        results.append(settle({**leg, "stake": 1, "price": leg["price"]},
+                              pts[leg["home_team"]], pts[leg["away_team"]])[0])
+    stake = float(r["stake"])
+    if "loss" in results:
+        return "loss", -stake
+    if None in results or "unknown" in results:
+        return None
+    price = math.prod(float(l["price"]) for l, res in zip(r["_legs"], results) if res == "win")
+    if "win" not in results:
+        return "push", 0.0
+    return "win", round(stake * (price - 1), 2)
+
+
+def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
+                   recent_hours: float | None = None) -> list[dict]:
+    """Grade alerted bets whose games have finished; returns the newly graded rows.
+
+    Uses the scores endpoint: 2 credits per sport, only for sports with an ungraded bet whose
+    game should be over (and, with recent_hours, ended within that many hours: postponed or
+    very old games are left to the daily pass)."""
+    now = now or datetime.now(timezone.utc)
+    done = {_bet_id(r) for r in _read_csv(cfg.ev_results_file)}
+    pending = {bid: r for bid, r in logged_bets(cfg, since=now - timedelta(days=3)).items()
+               if bid not in done and gradable(r)}
+    sports = set()
+    for r in pending.values():
+        for leg in _legs(r):
+            end = _parse_time(leg["commence_time"]) + timedelta(minutes=cfg.minutes_for(leg["sport_key"]))
+            if end <= now and (recent_hours is None or now - end <= timedelta(hours=recent_hours)):
+                sports.add(leg["sport_key"])
+    if not sports:
+        return []
+    finals: dict[str, dict[str, float]] = {}
+    for sport in sorted(sports):
         try:
-            scores = {s["id"]: s for s in api.scores(sport) if s.get("completed") and s.get("scores")}
+            for g in api.scores(sport):
+                if g.get("completed") and g.get("scores"):
+                    finals[g["id"]] = {x["name"]: float(x["score"]) for x in g["scores"]}
         except Exception as e:  # noqa: BLE001
             print(f"! Couldn't load {sport} scores: {e}", file=sys.stderr)
-            continue
-        for r in pending.values():
-            s = scores.get(r["event_id"]) if r["sport_key"] == sport else None
-            if not s:
+    graded = []
+    for r in pending.values():
+        if r["kind"] == "parlay":
+            res = settle_parlay(r, finals)
+            if res is None:
                 continue
-            pts = {x["name"]: float(x["score"]) for x in s["scores"]}
-            if r["home_team"] not in pts or r["away_team"] not in pts:
+            scores = {}
+        else:
+            pts = finals.get(r["event_id"])
+            if not pts or r["home_team"] not in pts or r["away_team"] not in pts:
                 continue
-            res, profit = settle(r, pts[r["home_team"]], pts[r["away_team"]])
-            append_csv(cfg.ev_results_file, RESULT_FIELDS, {
-                **r, "home_score": pts[r["home_team"]], "away_score": pts[r["away_team"]],
-                "result": res, "profit": profit})
-            graded += 1
+            res = settle(r, pts[r["home_team"]], pts[r["away_team"]])
+            if res[0] == "unknown":
+                continue
+            scores = {"home_score": pts[r["home_team"]], "away_score": pts[r["away_team"]]}
+        row = {**{k: v for k, v in r.items() if k != "_legs"}, **scores, "result": res[0], "profit": res[1]}
+        append_csv(cfg.ev_results_file, RESULT_FIELDS, row)
+        graded.append(row)
     return graded
 
 
-def ev_record(cfg: Config, days: int | None = None) -> str:
-    rows = _read_csv(cfg.ev_results_file)
+def _record(rows: list[dict]) -> tuple[int, int, int, float, float]:
+    """(wins, losses, pushes, profit, staked) for graded rows."""
+    rows = [r for r in rows if r.get("result") in ("win", "loss", "push")]
+    w = sum(r["result"] == "win" for r in rows)
+    l = sum(r["result"] == "loss" for r in rows)
+    staked = sum(float(r["stake"]) for r in rows if r["result"] != "push")
+    return w, l, len(rows) - w - l, sum(float(r["profit"]) for r in rows), staked
+
+
+def signed_money(x: float) -> str:
+    return ("+" if x >= 0 else "−") + money(abs(x))
+
+
+def record_line(rows: list[dict]) -> str:
+    w, l, pu, profit, staked = _record(rows)
+    if not w + l + pu:
+        return "no graded bets yet"
+    roi = f" (ROI {profit / staked * 100:+.1f}%)" if staked else ""
+    return f"{w}-{l}" + (f"-{pu}" if pu else "") + f" · {signed_money(profit)} on {money(staked)} staked{roi}"
+
+
+def ev_record(cfg: Config, days: int | None = None, kinds: tuple[str, ...] = ("ev", "outlier", "")) -> str:
+    rows = [r for r in _read_csv(cfg.ev_results_file) if r.get("kind", "") in kinds]
     if days is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         rows = [r for r in rows if _parse_time(r["commence_time"]) >= cutoff]
@@ -2263,6 +2377,232 @@ def ev_record(cfg: Config, days: int | None = None) -> str:
     roi = profit / staked * 100 if staked else 0
     return (f"{len(rows)} bets, {w}-{l}-{pu}, {'+' if profit >= 0 else '-'}${abs(profit):,.2f} "
             f"on ${staked:,.0f} staked (ROI {roi:+.1f}%, avg edge {avg_ev:.1f}%)")
+
+
+# --------------------------------------------------------------------------- results by day
+
+RESULT_ICON = {"win": "✅", "loss": "❌", "push": "➖"}
+KIND_LABEL = {"ev": "📈 +EV", "outlier": "🚨 Outliers", "parlay": "📦 Parlays", "prop": "🎯 Props"}
+
+
+def row_pick(r: dict) -> str:
+    """The bet as the alert named it ("Bills ML", "Over 47.5", "LeBron James Over 25.5 Points")."""
+    if r.get("kind") == "parlay":
+        return f"{len(r['_legs'])}-leg parlay"
+    point = r.get("point")
+    if r.get("player"):
+        stat = MARKET_NAMES.get(r["market"], r["market"])
+        return f"{r['player']} {r['outcome']}" + (f" {float(point):g}" if point not in ("", None) else "") + f" {stat}"
+    if r["market"] == "h2h":
+        return r["outcome"] if r["outcome"] == "Draw" else f"{r['outcome']} ML"
+    if point in ("", None):
+        return r["outcome"]
+    return f"{r['outcome']} {float(point):+g}" if r["market"] == "spreads" else f"{r['outcome']} {float(point):g}"
+
+
+def local_day(cfg: Config, ts: str):
+    return _parse_time(ts).astimezone(ZoneInfo(cfg.timezone)).date()
+
+
+def day_bets(cfg: Config, day) -> list[dict]:
+    """Every alert whose game is on `day` (local time; a parlay counts on its last game's day),
+    first alert per bet, with its result if it's been graded. Earliest game first."""
+    graded = {_bet_id(r): r for r in _read_csv(cfg.ev_results_file)}
+    since = datetime.combine(day, dtime.min, ZoneInfo(cfg.timezone)) - timedelta(days=2)
+    out = []
+    for bid, r in logged_bets(cfg, since=since).items():
+        if local_day(cfg, r["commence_time"]) != day:
+            continue
+        g = graded.get(bid, {})
+        out.append({**r, "result": g.get("result", ""), "profit": g.get("profit", ""),
+                    "home_score": g.get("home_score", ""), "away_score": g.get("away_score", ""),
+                    "clv_pct": g.get("clv_pct") or r.get("clv_pct", "")})
+    return sorted(out, key=lambda r: r["commence_time"])
+
+
+def _kind(r: dict) -> str:
+    return "prop" if r.get("player") else r.get("kind") or "ev"
+
+
+def result_line(r: dict, cfg: Config, now: datetime | None = None, discord: bool = True) -> str:
+    """One bet: what it was, at what book and stake, and how it went (or when it plays)."""
+    now = now or datetime.now(timezone.utc)
+    b = (lambda x: f"**{x}**") if discord else (lambda x: x)
+    pick = f"{row_pick(r)} {odds(float(r['price']))}"
+    head = f"{b(pick)} at {r['book']} · {money(float(r['stake']))}"
+    start = _parse_time(r["commence_time"])
+    if r.get("result") in RESULT_ICON:
+        icon, tail = RESULT_ICON[r["result"]], f"→ {b(signed_money(float(r['profit'])))}"
+    elif not gradable(r):
+        icon, tail = "🎯", "· check the box score yourself" if start <= now else "· not started yet"
+    elif start > now:
+        ts = int(start.timestamp())
+        icon, tail = "⏰", (f"· starts <t:{ts}:t>" if discord
+                           else f"· starts {start.astimezone(ZoneInfo(cfg.timezone)):%-I:%M %p}")
+    else:
+        icon, tail = "⏳", "· waiting for the final"
+    if r.get("kind") == "parlay":
+        where, icon2 = r.get("outcome", ""), "📦"
+    else:
+        where, icon2 = r.get("matchup", ""), sport_icon(r.get("sport_key", ""))
+        if r.get("home_score") not in ("", None):
+            where = (f"Final: {r['away_team']} {float(r['away_score']):g}, "
+                     f"{r['home_team']} {float(r['home_score']):g}")
+    if r.get("clv_pct") not in ("", None):
+        where += f" · CLV {float(r['clv_pct']):+.1f}%"
+    return f"{icon} {head} {tail}\n     {icon2} {where}"
+
+
+def day_summary(rows: list[dict]) -> str:
+    """Record for the day, per kind, plus what's still to come."""
+    lines = [f"**All:** {record_line(rows)}"]
+    for kind, label in KIND_LABEL.items():
+        group = [r for r in rows if _kind(r) == kind and r.get("result")]
+        if group:
+            lines.append(f"{label}: {record_line(group)}")
+    waiting = sum(1 for r in rows if not r.get("result") and gradable(r))
+    manual = sum(1 for r in rows if not r.get("result") and not gradable(r))
+    if waiting or manual:
+        lines.append(" · ".join(x for x in (f"⏳ {waiting} still to finish" if waiting else "",
+                                             f"🎯 {manual} prop{'s' if manual != 1 else ''} to check yourself"
+                                             if manual else "") if x))
+    return "\n".join(lines)
+
+
+def arbs_on(cfg: Config, day) -> str:
+    """Arbs alerted that day, and the profit they locked in at BANKROLL (if you placed them all)."""
+    rows = [r for r in _read_csv(cfg.log_file) if r.get("first_seen")
+            and local_day(cfg, r["first_seen"]) == day]
+    if not rows:
+        return ""
+    locked = sum(float(r.get("best_profit_pct") or 0) for r in rows) * cfg.bankroll / 100
+    return (f"💰 **Arbs:** {len(rows)} alerted · about {signed_money(locked)} locked in if you placed "
+            f"them all at {money(cfg.bankroll)} (an arb wins either way)")
+
+
+def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: list[dict],
+                    day, now: datetime | None = None) -> dict:
+    """A results card: the given bets one by one, then the day's record."""
+    now = now or datetime.now(timezone.utc)
+    shown = rows[:20]
+    body = "\n".join(result_line(r, cfg, now) for r in shown)
+    if len(rows) > len(shown):
+        body += f"\n…and {len(rows) - len(shown)} more (all of them: arbbot.py --results {day})"
+    w, l, pu, profit, _ = _record(rows)
+    graded = w + l + pu
+    title = f"{title_prefix}" + (f" · {w}-{l}" + (f"-{pu}" if pu else "") + f" · {signed_money(profit)}"
+                                 if graded else "")
+    arbs = arbs_on(cfg, day)
+    desc = (body + DIVIDER + f"**{day:%a %b %-d}** (every alert at the stake it showed)\n"
+            + day_summary(day_rows) + (f"\n{arbs}" if arbs else ""))
+    color = 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else GREY)
+    return _card(title, desc, color,
+                 footer="Results assume every alert was bet at the stake shown. Props need a box score, "
+                        "so check those in your book's app.")
+
+
+class Results:
+    """Grades alerted bets as games finish and posts what hit to the results channel."""
+
+    def __init__(self, cfg: Config, dry_run: bool):
+        self.cfg = cfg
+        self.url = cfg.results_webhook_url or cfg.status_webhook_url or cfg.webhook_url
+        self.dry_run = dry_run or not self.url
+        self.last = 0.0
+        self.path = data_path(cfg.state_dir) / "results_posted.json" if cfg.state_dir and not self.dry_run else None
+        self.posted: dict[str, str] = {}   # bet id -> game start (to prune)
+        try:
+            self.posted = json.loads(self.path.read_text()) if self.path else {}
+        except (OSError, ValueError):
+            # First run: everything already graded counts as posted, so there's no flood.
+            self.posted = {_bet_id(r): r["commence_time"] for r in _read_csv(cfg.ev_results_file)}
+            self._save()
+
+    def _save(self, now: datetime | None = None) -> None:
+        if not self.path:
+            return
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=5)
+        self.posted = {k: v for k, v in self.posted.items() if _parse_time(v) > cutoff}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.posted))
+            tmp.replace(self.path)
+        except OSError as e:
+            print(f"  ! Couldn't save results state: {e}", file=sys.stderr)
+
+    def due(self) -> bool:
+        return bool(self.cfg.results_minutes) and time.time() - self.last >= self.cfg.results_minutes * 60
+
+    def run(self, api: "OddsAPI", now: datetime | None = None, recent_hours: float | None = 12) -> int:
+        """Grade what's finished, then post every graded bet not posted yet (including ones
+        graded from the command line). Returns how many were posted."""
+        now = now or datetime.now(timezone.utc)
+        self.last = time.time()
+        try:
+            settle_pending(self.cfg, api, now, recent_hours)
+        except Exception as e:  # noqa: BLE001 - grading must never stop the bot
+            print(f"! Grading bets failed: {e}", file=sys.stderr)
+        cutoff = now - timedelta(days=3)
+        new = [r for r in _read_csv(self.cfg.ev_results_file)
+               if _bet_id(r) not in self.posted and _parse_time(r["commence_time"]) > cutoff]
+        if not new:
+            return 0
+        bets = logged_bets(self.cfg, since=cutoff)
+        new = [{**bets.get(_bet_id(r), {}), **r} for r in new]   # parlays need their legs back
+        new = [r for r in new if r.get("kind") != "parlay" or r.get("_legs")]
+        by_day: dict = {}
+        for r in new:
+            by_day.setdefault(local_day(self.cfg, r["commence_time"]), []).append(r)
+        for day, rows in sorted(by_day.items()):
+            n = len(rows)
+            self.send(results_payload(self.cfg, f"📋 {n} result{'s' if n != 1 else ''} in", rows,
+                                      day_bets(self.cfg, day), day, now))
+        for r in new:
+            self.posted[_bet_id(r)] = r["commence_time"]
+        self._save(now)
+        return len(new)
+
+    def send(self, payload: dict) -> None:
+        emb = payload["embeds"][0]
+        print(f"[results] {emb['title']}\n{emb['description']}", flush=True)
+        if self.dry_run:
+            return
+        try:
+            _webhook(self.url, payload)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! Results message failed: {e}", file=sys.stderr)
+
+    def daily(self, api: "OddsAPI", day, now: datetime | None = None) -> None:
+        """Daily pass: grade everything still open (not just recent games), post the full card
+        for `day`, and count that day's bets as posted so they don't also come one by one."""
+        try:
+            settle_pending(self.cfg, api, now)
+        except Exception as e:  # noqa: BLE001
+            print(f"! Grading bets failed: {e}", file=sys.stderr)
+        self.recap(day, now)
+        for r in _read_csv(self.cfg.ev_results_file):
+            if local_day(self.cfg, r["commence_time"]) == day:
+                self.posted[_bet_id(r)] = r["commence_time"]
+        self._save(now)
+
+    def recap(self, day, now: datetime | None = None) -> None:
+        """The whole day's bets and record (posted with the daily summary, for yesterday)."""
+        rows = day_bets(self.cfg, day)
+        if rows or arbs_on(self.cfg, day):
+            self.send(results_payload(self.cfg, f"📅 Results for {day:%a %b %-d}", rows, rows, day, now))
+
+
+def print_day(cfg: Config, day, now: datetime | None = None) -> None:
+    rows = day_bets(cfg, day)
+    print(f"\n{day:%A %b %-d}: every alert, at the stake it showed")
+    if not rows:
+        print("  No +EV, outlier, prop or parlay alerts for games that day.")
+    for r in rows:
+        print("  " + result_line(r, cfg, now, discord=False).replace("\n", "\n  "))
+    print("\n" + day_summary(rows).replace("**", ""))
+    if arbs := arbs_on(cfg, day):
+        print(arbs.replace("**", ""))
 
 
 # --------------------------------------------------------------------------- closing line value (CLV)
@@ -2806,6 +3146,9 @@ One ticket with 2-3 +EV bets from different games, all at the same book. Every l
 ❌ **GONE** (grey)
 The chance is over. Ignore it.
 
+📋 **RESULTS** (in the results channel)
+As games finish, the bot posts what hit: ✅ won, ❌ lost, ➖ push, with the profit at the stake shown, and the day's record so far. 🎯 props need a box score, so check those in your book's app.
+
 **Every time**
 1. Tap the book name to open it. Check the price matches the alert, or is better.
 2. Worse than the "skip" price? Don't bet.
@@ -2932,6 +3275,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     ev_alerter = EVAlerter(cfg, dry_run=args.dry_run)
     out_alerter = OutlierAlerter(cfg, dry_run=args.dry_run)
     tracker = ClosingTracker(cfg)
+    results = Results(cfg, dry_run=args.dry_run)
     ev_alerter.on_log = out_alerter.on_log = tracker.add
     # Props are fetched per game on their own schedule, so they get their own alert trackers
     # (a main-line check must never "close" a prop alert it didn't look at).
@@ -2973,9 +3317,24 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         print_plan(cfg, sched)
         return
 
-    if args.results:
-        n = settle_pending(cfg, api)
+    if args.results or args.post_results:
+        tz = ZoneInfo(cfg.timezone)
+        which = args.post_results or args.results
+        today = datetime.now(tz).date()
+        try:
+            day = {"today": today, "yesterday": today - timedelta(days=1)}.get(which) or date.fromisoformat(which)
+        except ValueError:
+            sys.exit(f"Use today, yesterday or a date like {today:%Y-%m-%d} (got {which!r}).")
+        n = len(settle_pending(cfg, api))
         print(f"Graded {n} new bet(s).")
+        if args.post_results:
+            res = Results(cfg, dry_run=args.dry_run)
+            res.dry_run = res.dry_run or not res.url
+            res.recap(day)
+            print("Posted to Discord." if not res.dry_run else "(dry run: not sent)")
+            return
+        print_day(cfg, day)
+        print()
         print(f"+EV record, last 7 days (every alert, at the alerted price): {ev_record(cfg, 7)}")
         print(f"+EV record, all time: {ev_record(cfg)}")
         print(f"CLV (price you got vs the closing fair line), last 7 days: {clv_record(cfg, 7)}")
@@ -3005,11 +3364,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         if (cfg.summary_hour >= 0 and not args.once and local.hour >= cfg.summary_hour
                 and local.date() != summary_day):
             summary_day = local.date()
-            if cfg.ev_enabled:
-                try:
-                    settle_pending(cfg, api)
-                except Exception as e:  # noqa: BLE001 - a summary shouldn't crash the bot
-                    print(f"! Grading +EV bets failed: {e}", file=sys.stderr)
+            results.daily(api, local.date() - timedelta(days=1), now)
             sections = [("💰 **Arbs**", f"{alerter.summary()}; props: {prop_arbs.summary()}")]
             if cfg.ev_enabled:
                 sections.append(("📈 **+EV**", f"{ev_alerter.summary()}\nIf you bet every alert: "
@@ -3136,6 +3491,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             if n_par:
                 print(f"  📦 {n_par} new parlay(s)", flush=True)
 
+        if not args.once and results.due():
+            n_res = results.run(api, now)
+            if n_res:
+                print(f"  📋 {n_res} bet result(s) posted", flush=True)
+
         if args.once:
             if not due and not prop_games:
                 print("Nothing live or starting soon to check right now.")
@@ -3158,8 +3518,11 @@ def main() -> None:
                    help="paste a Discord webhook URL for a channel: " + ", ".join(sorted(WEBHOOK_SETTINGS)))
     p.add_argument("--post-guide", action="store_true",
                    help="post a how-to-use guide to your Discord channel (then pin it)")
-    p.add_argument("--results", action="store_true",
-                   help="grade finished +EV alerts and print the win/loss record (2 credits per sport)")
+    p.add_argument("--post-results", nargs="?", const="today", metavar="DAY",
+                   help="post a day's results card to the results channel (today, yesterday or YYYY-MM-DD)")
+    p.add_argument("--results", nargs="?", const="today", metavar="DAY",
+                   help="grade finished alerts and list a day's bets with what hit (today, yesterday or "
+                        "YYYY-MM-DD), plus the records (2 credits per sport with finished games)")
     args = p.parse_args()
 
     if args.set_webhook:
@@ -3191,7 +3554,7 @@ def main() -> None:
         print(f"Bad setting in .env: {ex}. Fix it with: nano /opt/arb-bot/.env", file=sys.stderr)
         url = os.environ.get("DISCORD_STATUS_WEBHOOK_URL") or os.environ.get("DISCORD_WEBHOOK_URL", "")
         interactive = (args.dry_run, args.demo, args.once, args.plan, args.results, args.test_discord,
-                       args.post_guide)
+                       args.post_guide, args.post_results)
         if url.startswith("https://") and not any(interactive):   # the service: say why it stopped
             try:
                 _webhook(url, {"username": "Arb Bot", "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
@@ -3239,7 +3602,8 @@ def main() -> None:
         sys.exit(2)
 
     bad = cfg.bad_webhooks()
-    status = Status(cfg, dry_run=args.dry_run or args.demo or args.plan or args.once or args.results)
+    status = Status(cfg, dry_run=args.dry_run or args.demo or args.plan or args.once or bool(args.results)
+                    or bool(args.post_results))
     if bad:
         status.send(f"⚠️ {', '.join(bad)} in .env isn't a Discord webhook URL, so those alerts are going "
                     f"to this channel for now. Fix it with: nano /opt/arb-bot/.env")

@@ -143,13 +143,21 @@ skipped. If only one of them priced it, the stake is halved (`SINGLE_SOURCE_STAK
 **Bigger edge, new alert.** Discord doesn't ping you when a message is edited. So if a bet's edge
 grows by 2.5 points or more while it's open (`REALERT_JUMP_PCT`), you get a fresh alert.
 
-**Is it working?** Every +EV alert is logged to `ev_bets.csv`. Once games finish, the bot grades
-them with final scores and keeps a record in `ev_results.csv`. Grading costs 2 credits per sport
-per day. The daily Discord summary shows the record, or check any time:
+**Is it working? (what hit)** Every +EV, outlier, prop and parlay alert is logged. As games
+finish, the bot grades them with the final scores (`ev_results.csv`) and posts each result to a
+**results channel**: ✅ won / ❌ lost / ➖ push with the profit at the stake shown, plus the day's
+record so far. Every morning it posts the whole previous day. Parlays are graded leg by leg (a
+pushed leg drops out, like at the books). Player props need a box score, which the odds feed
+doesn't have, so they're listed as 🎯 for you to check. Grading costs 2 credits per sport with a
+finished bet, at most every `RESULTS_MINUTES` (30).
+
+Make a `#results` channel and connect it: `python arbbot.py --set-webhook results`. Without it,
+results go to the bot health channel. On the command line:
 
 ```bash
-python arbbot.py --results
-# Example output: +EV record, all time: 212 bets, 108-98-6, +$187.40 on $2,450 staked (ROI +7.6%, avg edge 4.3%)
+python arbbot.py --results              # today's bets one by one, then 7-day and all-time records
+python arbbot.py --results yesterday    # or a date: --results 2026-10-03
+python arbbot.py --post-results         # post today's card to the results channel now
 ```
 
 **Closing line value (CLV)** is the faster test. For every logged +EV and outlier bet, the bot
