@@ -1,3 +1,5 @@
 .env
 arbs.csv
 __pycache__/
+ev_bets.csv
+ev_results.csv

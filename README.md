@@ -1,7 +1,10 @@
 # Arb Bot
 
-Watches odds from many sportsbooks and pings Discord when the books disagree enough
-that betting every outcome guarantees a profit. Each alert includes exact stakes.
+Watches odds from many sportsbooks and pings Discord about two kinds of bets:
+
+- **💰 Arbitrage:** the books disagree enough that betting every side guarantees a profit.
+- **📈 +EV:** one book's price beats the "true" odds from Pinnacle, the sharpest book.
+  You don't win every bet, but you come out ahead over many of them.
 
 ```
 💰 3.76% ARB | NBA | New York Knicks @ Boston Celtics (🔴 LIVE)
@@ -20,6 +23,44 @@ that betting every outcome guarantees a profit. Each alert includes exact stakes
 **What else you get:**
 - **`arbs.csv`:** every gap and how long it stayed open. After a week, this tells you whether you can realistically catch them.
 - **Bot health in Discord:** 🟢 online, 🔴 crashed, ⚠️ credits running low, and a 📊 daily summary.
+
+## +EV bets
+
+```
+📈 +5.4% EV | NHL | Bruins @ Rangers (starts 7:00 PM)
+  Bruins ML @ 2.45 on DraftKings  → stake $10
+  Fair odds 2.32 (Pinnacle no-vig)
+```
+
+**How it works:** Pinnacle takes big bettors and keeps a thin margin, so its lines are the
+market's best guess at the real odds. The bot removes Pinnacle's margin (the "vig") to get each
+side's fair probability. It alerts when a book you can bet at pays more than that, by at least
+`MIN_EV_PCT` (3%).
+
+**What it costs:** nothing extra. Pinnacle is one of the 10 books in `BOOKMAKERS`, and 10 books
+cost the same as one region.
+
+**Stakes** use the Kelly formula: bet more when the edge is bigger. It uses a quarter of full
+Kelly to soften the swings, and never more than 3% of `EV_BANKROLL` on one bet.
+
+**Is it working?** Every +EV alert is logged to `ev_bets.csv`. Once games finish, the bot grades
+them with final scores and keeps a record in `ev_results.csv`. Grading costs 2 credits per sport
+per day. The daily Discord summary shows the record, or check any time:
+
+```bash
+python arbbot.py --results
+# Example output: +EV record, all time: 212 bets, 108-98-6, +$187.40 on $2,450 staked (ROI +7.6%, avg edge 4.3%)
+```
+
+This assumes you bet every alert at the alerted price. Give it a few hundred bets before judging;
+50 bets is mostly luck.
+
+**Good to know:**
+- **Pre-game only by default.** Live +EV is mostly the feeds updating at different times,
+  not a real edge. Pre-game checks run every 15 minutes in the 2 hours before kickoff
+  (`PREGAME_MINUTES`, `PREGAME_HOURS`).
+- **Long shots are skipped** (`EV_MAX_ODDS=5.0`), because their fair odds are the least reliable.
+- **Books limit +EV bettors faster than arbers.** Mixing in some normal bets helps.
 
 ## Setup
 
@@ -44,9 +85,9 @@ Needs Python 3.10+. No packages to install.
 | **Out-of-season sports cost nothing.** | List every sport you care about. They only cost credits once games are on. |
 | **Stops checking a game once books pull it** (the game ended). | It doesn't keep paying for a game that's over. |
 | **Budget autopilot.** Every few minutes it compares the next 24h of games with the credits you have left and the days until reset. | Checks every 60s when you can afford it. On a packed day it slows down *just enough* to make the credits last. It never runs dry mid-month. |
-| **Pre-game checks are slower** (every 15 min, only in the 2h before kickoff). | Pre-game gaps last longer, so they don't need minute-by-minute checks. |
+| **Pre-game checks are slower** (every 15 min, only in the 2h before kickoff). | Pre-game gaps last longer, so they don't need minute-by-minute checks. These checks also feed the +EV alerts. |
 | **Checks all due sports at once, in parallel.** | An alert goes out within seconds of the check. |
-| **Bookmaker trick** (optional) | Up to 10 named books cost the same as one region. You can mix books from different regions at no extra cost. |
+| **Bookmaker trick** (on by default) | Up to 10 named books cost the same as one region, so adding Pinnacle (EU) to your US books costs nothing. |
 
 Each check of a sport costs **(# bet types) × (# regions)** credits, which is **3** with the defaults.
 

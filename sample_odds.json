@@ -8,25 +8,88 @@
     "away_team": "New York Knicks",
     "bookmakers": [
       {
-        "key": "draftkings", "title": "DraftKings", "last_update": "",
-        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
-          {"name": "Boston Celtics", "price": 1.55},
-          {"name": "New York Knicks", "price": 2.45}
-        ]}]
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "Boston Celtics",
+                "price": 1.55
+              },
+              {
+                "name": "New York Knicks",
+                "price": 2.45
+              }
+            ]
+          }
+        ]
       },
       {
-        "key": "fanduel", "title": "FanDuel", "last_update": "",
-        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
-          {"name": "Boston Celtics", "price": 1.80},
-          {"name": "New York Knicks", "price": 2.05}
-        ]}]
+        "key": "fanduel",
+        "title": "FanDuel",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "Boston Celtics",
+                "price": 1.8
+              },
+              {
+                "name": "New York Knicks",
+                "price": 2.05
+              }
+            ]
+          }
+        ]
       },
       {
-        "key": "betmgm", "title": "BetMGM", "last_update": "",
-        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
-          {"name": "Boston Celtics", "price": 1.60},
-          {"name": "New York Knicks", "price": 2.30}
-        ]}]
+        "key": "betmgm",
+        "title": "BetMGM",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "Boston Celtics",
+                "price": 1.6
+              },
+              {
+                "name": "New York Knicks",
+                "price": 2.3
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "Boston Celtics",
+                "price": 1.7
+              },
+              {
+                "name": "New York Knicks",
+                "price": 2.25
+              }
+            ]
+          }
+        ]
       }
     ]
   },
@@ -39,19 +102,75 @@
     "away_team": "Chelsea",
     "bookmakers": [
       {
-        "key": "draftkings", "title": "DraftKings", "last_update": "",
-        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
-          {"name": "Arsenal", "price": 2.10},
-          {"name": "Chelsea", "price": 3.60},
-          {"name": "Draw", "price": 3.40}
-        ]}]
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "Arsenal",
+                "price": 2.4
+              },
+              {
+                "name": "Chelsea",
+                "price": 3.3
+              },
+              {
+                "name": "Draw",
+                "price": 3.2
+              }
+            ]
+          }
+        ]
       },
       {
-        "key": "caesars", "title": "Caesars", "last_update": "",
-        "markets": [{"key": "h2h", "last_update": "", "outcomes": [
-          {"name": "Arsenal", "price": 2.20},
-          {"name": "Chelsea", "price": 3.30}
-        ]}]
+        "key": "williamhill_us",
+        "title": "Caesars",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "Arsenal",
+                "price": 2.2
+              },
+              {
+                "name": "Chelsea",
+                "price": 3.3
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "",
+            "outcomes": [
+              {
+                "name": "Arsenal",
+                "price": 2.15
+              },
+              {
+                "name": "Chelsea",
+                "price": 3.5
+              },
+              {
+                "name": "Draw",
+                "price": 3.45
+              }
+            ]
+          }
+        ]
       }
     ]
   }

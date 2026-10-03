@@ -84,7 +84,9 @@ class Config:
         "americanfootball_nfl", "basketball_nba", "icehockey_nhl", "baseball_mlb"])
     regions: str = "us"
     markets: str = "h2h,spreads,totals"
-    bookmakers: str = ""          # optional comma list; overrides regions if set
+    # Up to 10 books cost the same as one region. Pinnacle is read only, as the sharp
+    # reference for +EV; you never bet there.
+    bookmakers: str = "pinnacle,draftkings,fanduel,betmgm,williamhill_us,espnbet,betrivers,fanatics,hardrockbet,ballybet"
     poll_seconds: int = 60        # fastest check rate for sports with live games
     pregame_minutes: int = 15     # check rate before kickoff (0 = live games only)
     pregame_hours: float = 2.0    # how far before kickoff pre-game checks start
@@ -103,6 +105,21 @@ class Config:
     low_credits: int = 5000       # warn on Discord below this many credits
     log_file: str = "arbs.csv"    # every arb with how long it lasted ("" = off)
     summary_hour: int = 9         # local hour for the daily Discord summary (-1 = off)
+    # +EV
+    ev_enabled: bool = True
+    bet_at_sharp: bool = False      # true only if you can actually bet at the sharp book
+    sharp_books: str = "pinnacle"   # fair-odds reference, in priority order
+    ev_books: str = ""              # only alert for these books ("" = every non-sharp book)
+    min_ev_pct: float = 3.0
+    max_ev_pct: float = 25.0        # above this it's almost always a stale line
+    ev_max_odds: float = 5.0        # skip long shots; their fair odds are least reliable
+    ev_live: bool = False           # live +EV is mostly feed-timing noise; pre-game only
+    ev_bankroll: float = 1000.0
+    kelly_fraction: float = 0.25
+    ev_max_stake_pct: float = 3.0   # never stake more than this % of EV_BANKROLL on one bet
+    ev_mention: str = ""
+    ev_log_file: str = "ev_bets.csv"
+    ev_results_file: str = "ev_results.csv"
     live_only: bool = False       # only alert on games in progress
     active_hours: str = ""        # e.g. "08:00-22:00"; empty = always on
     timezone: str = "America/New_York"
@@ -117,7 +134,7 @@ class Config:
             sports=_csv(e("SPORTS", "")) or d.sports,
             regions=e("REGIONS", d.regions),
             markets=e("MARKETS", d.markets),
-            bookmakers=e("BOOKMAKERS", ""),
+            bookmakers=e("BOOKMAKERS", d.bookmakers),
             poll_seconds=int(e("POLL_SECONDS", d.poll_seconds)),
             pregame_minutes=int(e("PREGAME_MINUTES", d.pregame_minutes)),
             pregame_hours=float(e("PREGAME_HOURS", d.pregame_hours)),
@@ -137,6 +154,20 @@ class Config:
             low_credits=int(e("LOW_CREDITS", d.low_credits)),
             log_file=e("LOG_FILE", d.log_file),
             summary_hour=int(e("SUMMARY_HOUR", d.summary_hour)),
+            ev_enabled=e("EV_ENABLED", "true").lower() in ("1", "true", "yes"),
+            sharp_books=e("SHARP_BOOKS", d.sharp_books),
+            bet_at_sharp=e("BET_AT_SHARP", "false").lower() in ("1", "true", "yes"),
+            ev_books=e("EV_BOOKS", ""),
+            min_ev_pct=float(e("MIN_EV_PCT", d.min_ev_pct)),
+            max_ev_pct=float(e("MAX_EV_PCT", d.max_ev_pct)),
+            ev_max_odds=float(e("EV_MAX_ODDS", d.ev_max_odds)),
+            ev_live=e("EV_LIVE", "false").lower() in ("1", "true", "yes"),
+            ev_bankroll=float(e("EV_BANKROLL", d.ev_bankroll)),
+            kelly_fraction=float(e("KELLY_FRACTION", d.kelly_fraction)),
+            ev_max_stake_pct=float(e("EV_MAX_STAKE_PCT", d.ev_max_stake_pct)),
+            ev_mention=e("EV_MENTION", ""),
+            ev_log_file=e("EV_LOG_FILE", d.ev_log_file),
+            ev_results_file=e("EV_RESULTS_FILE", d.ev_results_file),
             live_only=e("LIVE_ONLY", "false").lower() in ("1", "true", "yes"),
             active_hours=e("ACTIVE_HOURS", "").strip(),
             timezone=e("TIMEZONE", d.timezone),
@@ -267,6 +298,10 @@ class OddsAPI:
             print("! The events endpoint used credits. Raise EVENTS_REFRESH_MINUTES.", file=sys.stderr)
         return data
 
+    def scores(self, sport: str, days_from: int = 3) -> list[dict]:
+        """Final scores for recent games. Costs 2 credits."""
+        return self._get(f"/sports/{sport}/scores", {"daysFrom": days_from, "dateFormat": "iso"})
+
     def odds(self, sport: str, until: datetime) -> list[dict]:
         """Odds for every game starting before `until` (and all live ones). Costs credits."""
         params = {
@@ -303,6 +338,7 @@ def _line_for(market: str, outcome: dict, home_team: str) -> float | None:
 def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> list[Arb]:
     now = now or datetime.now(timezone.utc)
     arbs: list[Arb] = []
+    sharp_only = set() if cfg.bet_at_sharp else set(_csv(cfg.sharp_books))
 
     for ev in events:
         start = _parse_time(ev["commence_time"])
@@ -316,6 +352,8 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
         n_outcomes: dict[tuple, int] = {}
 
         for bm in ev.get("bookmakers", []):
+            if bm["key"] in sharp_only:
+                continue  # reference-only book (e.g. Pinnacle): not bettable from the US
             for mkt in bm.get("markets", []):
                 updated = mkt.get("last_update") or bm.get("last_update")
                 if updated and (now - _parse_time(updated)).total_seconds() > cfg.max_age_seconds:
@@ -465,11 +503,29 @@ def send_discord(webhook_url: str, arb: Arb, mention: str = "") -> str | None:
 
 @dataclass
 class OpenArb:
-    arb: Arb
+    arb: "Arb | EVBet"
     first_seen: float
     last_seen: float
     best_pct: float
     message_id: str | None = None
+
+
+def data_path(name: str) -> Path:
+    path = Path(name)
+    return path if path.is_absolute() else HERE / path
+
+
+def append_csv(name: str, fields: list[str], row: dict) -> None:
+    path = data_path(name)
+    new_file = not path.exists()
+    try:
+        with path.open("a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+    except OSError as e:
+        print(f"  ! Couldn't write {path}: {e}", file=sys.stderr)
 
 
 LOG_FIELDS = ["first_seen", "gone_at", "seconds_open", "sport", "matchup", "market", "line",
@@ -484,11 +540,44 @@ class Alerter:
     Arb disappears -> the message is edited to "GONE after Ns" and logged to CSV.
     """
 
+    noun = "arbs"
+    log_fields = LOG_FIELDS
+    log_on_open = False  # arbs are logged when they close, so the row has how long it lasted
+
     def __init__(self, cfg: Config, dry_run: bool):
         self.cfg = cfg
         self.dry_run = dry_run or not cfg.webhook_url
         self.open: dict[str, OpenArb] = {}
-        self.stats = {"found": 0, "closed": 0, "open_seconds": 0.0, "best_pct": 0.0, "best": ""}
+        self.reset_stats()
+
+    # ---- hooks (overridden for +EV)
+    def text(self, item) -> str:
+        return format_text(item)
+
+    def payload(self, item, mention: str = "", gone_after: float | None = None,
+                first_seen: float | None = None) -> dict:
+        return discord_payload(item, mention, gone_after, first_seen)
+
+    def value(self, item) -> float:
+        return item.profit_pct
+
+    def label(self, item) -> str:
+        return f"{item.matchup} {item.market}"
+
+    def mention(self) -> str:
+        return self.cfg.discord_mention
+
+    def log_path(self) -> str:
+        return self.cfg.log_file
+
+    def row(self, op: OpenArb) -> dict:
+        a = op.arb
+        return {
+            "sport": a.sport, "matchup": a.matchup, "market": a.market,
+            "line": "" if a.line is None else a.line, "live": a.is_live,
+            "best_profit_pct": round(op.best_pct, 2),
+            "legs": "; ".join(f"{l.outcome} @{l.price} {l.book}" for l in a.legs),
+        }
 
     def _discord(self, payload: dict, message_id: str | None = None) -> str | None:
         if self.dry_run:
@@ -514,21 +603,23 @@ class Alerter:
             seen.add(arb.key)
             cur = self.open.get(arb.key)
             if cur is None:
-                print(format_text(arb), flush=True)
-                op = OpenArb(arb, now, now, arb.profit_pct)
-                op.message_id = self._discord(discord_payload(arb, self.cfg.discord_mention, first_seen=now))
+                print(self.text(arb), flush=True)
+                op = OpenArb(arb, now, now, self.value(arb))
+                op.message_id = self._discord(self.payload(arb, self.mention(), first_seen=now))
                 self.open[arb.key] = op
+                if self.log_on_open:
+                    self._log(op, now, None)
                 self.stats["found"] += 1
-                if arb.profit_pct > self.stats["best_pct"]:
-                    self.stats["best_pct"], self.stats["best"] = arb.profit_pct, arb.matchup
+                if self.value(arb) > self.stats["best_pct"]:
+                    self.stats["best_pct"], self.stats["best"] = self.value(arb), arb.matchup
                 new += 1
             else:
                 changed = cur.arb.fingerprint != arb.fingerprint
                 cur.arb, cur.last_seen = arb, now
-                cur.best_pct = max(cur.best_pct, arb.profit_pct)
+                cur.best_pct = max(cur.best_pct, self.value(arb))
                 if changed:
-                    print(f"  ↻ updated: {arb.matchup} {arb.market} now {arb.profit_pct:.2f}%", flush=True)
-                    self._discord(discord_payload(arb, first_seen=cur.first_seen), cur.message_id)
+                    print(f"  ↻ updated: {self.label(arb)} now {self.value(arb):.2f}%", flush=True)
+                    self._discord(self.payload(arb, first_seen=cur.first_seen), cur.message_id)
 
         checked = set(checked_sports) if checked_sports is not None else None
         for key in list(self.open):
@@ -541,44 +632,30 @@ class Alerter:
     def _close(self, key: str, now: float) -> None:
         op = self.open.pop(key)
         lasted = now - op.first_seen  # first seen -> first check where it was gone
-        print(f"  ❌ gone after {_fmt_secs(lasted)}: {op.arb.matchup} {op.arb.market}", flush=True)
+        print(f"  ❌ gone after {_fmt_secs(lasted)}: {self.label(op.arb)}", flush=True)
         if op.message_id:
-            self._discord(discord_payload(op.arb, gone_after=lasted), op.message_id)
+            self._discord(self.payload(op.arb, gone_after=lasted), op.message_id)
         self.stats["closed"] += 1
         self.stats["open_seconds"] += lasted
-        self._log(op, now, lasted)
+        if not self.log_on_open:
+            self._log(op, now, lasted)
 
-    def _log(self, op: OpenArb, now: float, lasted: float) -> None:
-        if not self.cfg.log_file:
+    def _log(self, op: OpenArb, now: float, lasted: float | None) -> None:
+        if not self.log_path():
             return
-        path = Path(self.cfg.log_file)
-        if not path.is_absolute():
-            path = HERE / path
-        a = op.arb
         row = {
             "first_seen": datetime.fromtimestamp(op.first_seen, timezone.utc).isoformat(timespec="seconds"),
-            "gone_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
-            "seconds_open": round(lasted),
-            "sport": a.sport, "matchup": a.matchup, "market": a.market,
-            "line": "" if a.line is None else a.line, "live": a.is_live,
-            "best_profit_pct": round(op.best_pct, 2),
-            "legs": "; ".join(f"{l.outcome} @{l.price} {l.book}" for l in a.legs),
+            "gone_at": "" if lasted is None else datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
+            "seconds_open": "" if lasted is None else round(lasted),
+            **self.row(op),
         }
-        new_file = not path.exists()
-        try:
-            with path.open("a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
-                if new_file:
-                    w.writeheader()
-                w.writerow(row)
-        except OSError as e:
-            print(f"  ! Couldn't write {path}: {e}", file=sys.stderr)
+        append_csv(self.log_path(), self.log_fields, row)
 
     def summary(self) -> str:
         s = self.stats
         avg = s["open_seconds"] / s["closed"] if s["closed"] else 0
         best = f", best {s['best_pct']:.2f}% ({s['best']})" if s["found"] else ""
-        return f"{s['found']} arbs found{best}, open {_fmt_secs(avg)} on average"
+        return f"{s['found']} {self.noun} found{best}, open {_fmt_secs(avg)} on average"
 
     def reset_stats(self) -> None:
         self.stats = {"found": 0, "closed": 0, "open_seconds": 0.0, "best_pct": 0.0, "best": ""}
@@ -612,6 +689,339 @@ class Status:
                       f"make them last until the plan resets.")
         elif remaining >= self.cfg.low_credits:
             self.low_warned = False
+
+
+# --------------------------------------------------------------------------- +EV bets
+
+@dataclass
+class EVBet:
+    """One side priced better than the sharp book's no-vig ("fair") odds."""
+    event_id: str
+    sport: str
+    sport_key: str
+    matchup: str
+    home_team: str
+    away_team: str
+    commence_time: str
+    is_live: bool
+    market: str
+    line: float | None        # grouping key (home team's point for spreads)
+    outcome: str
+    point: float | None       # this outcome's own point (-3.5, 220.5, ...)
+    book: str
+    price: float
+    fair_prob: float
+    sharp_book: str
+    n_outcomes: int
+    link: str = ""
+    also: list[tuple[str, float]] = field(default_factory=list)  # other +EV books
+    stake: float = 0.0
+
+    @property
+    def ev_pct(self) -> float:
+        return (self.fair_prob * self.price - 1) * 100
+
+    @property
+    def fair_odds(self) -> float:
+        return 1 / self.fair_prob
+
+    @property
+    def key(self) -> str:
+        return f"ev|{self.event_id}|{self.market}|{self.line}|{self.outcome}"
+
+    @property
+    def fingerprint(self) -> str:
+        return f"{self.key}|{self.book}@{self.price}"
+
+    @property
+    def pick(self) -> str:
+        if self.market == "h2h":
+            return self.outcome if self.outcome == "Draw" else f"{self.outcome} ML"
+        if self.point is None:
+            return self.outcome
+        return f"{self.outcome} {self.point:+g}" if self.market == "spreads" else f"{self.outcome} {self.point:g}"
+
+
+def devig(prices: list[float]) -> list[float]:
+    """No-vig probabilities from a full set of decimal odds (proportional method)."""
+    inv = [1 / p for p in prices]
+    total = sum(inv)
+    return [x / total for x in inv]
+
+
+def kelly_stake(fair_prob: float, price: float, cfg: Config) -> float:
+    edge = (fair_prob * price - 1) / (price - 1)
+    stake = cfg.ev_bankroll * cfg.kelly_fraction * max(0.0, edge)
+    stake = min(stake, cfg.ev_bankroll * cfg.ev_max_stake_pct / 100)
+    if cfg.round_stakes > 0 and stake >= cfg.round_stakes:
+        return float(round(stake / cfg.round_stakes) * cfg.round_stakes)
+    return float(round(stake)) if stake >= 1 else round(stake, 2)
+
+
+def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> list[EVBet]:
+    if not cfg.ev_enabled:
+        return []
+    now = now or datetime.now(timezone.utc)
+    sharp = _csv(cfg.sharp_books)
+    allowed = set(_csv(cfg.ev_books))
+    out: list[EVBet] = []
+
+    def fresh(mkt: dict, bm: dict) -> bool:
+        updated = mkt.get("last_update") or bm.get("last_update")
+        return not updated or (now - _parse_time(updated)).total_seconds() <= cfg.max_age_seconds
+
+    for ev in events:
+        is_live = _parse_time(ev["commence_time"]) <= now
+        if (cfg.live_only and not is_live) or (is_live and not cfg.ev_live):
+            continue
+        books = {bm["key"]: bm for bm in ev.get("bookmakers", [])}
+
+        # Fair probabilities from the first sharp book (in SHARP_BOOKS order) that prices the line.
+        fair: dict[tuple, dict[str, float]] = {}
+        sharp_name: dict[tuple, str] = {}
+        for sk in sharp:
+            bm = books.get(sk)
+            if not bm:
+                continue
+            for mkt in bm.get("markets", []):
+                if not fresh(mkt, bm):
+                    continue
+                groups: dict[tuple, dict[str, float]] = {}
+                for oc in mkt.get("outcomes", []):
+                    price = float(oc.get("price") or 0)
+                    if price > 1.0:
+                        k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
+                        groups.setdefault(k, {})[oc["name"]] = price
+                for k, outs in groups.items():
+                    if k in fair or len(outs) < 2:
+                        continue
+                    names = list(outs)
+                    fair[k] = dict(zip(names, devig([outs[n] for n in names])))
+                    sharp_name[k] = bm.get("title", sk)
+
+        # Every soft-book price that beats fair by enough.
+        offers: dict[tuple, list[tuple[float, str, str, float | None]]] = {}
+        for key, bm in books.items():
+            if key in sharp or (allowed and key not in allowed):
+                continue
+            for mkt in bm.get("markets", []):
+                if not fresh(mkt, bm):
+                    continue
+                for oc in mkt.get("outcomes", []):
+                    k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
+                    p = fair.get(k, {}).get(oc["name"])
+                    price = float(oc.get("price") or 0)
+                    if p is None or price <= 1.0 or price > cfg.ev_max_odds:
+                        continue
+                    ev_pct = (p * price - 1) * 100
+                    if cfg.min_ev_pct <= ev_pct <= cfg.max_ev_pct:
+                        link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
+                        offers.setdefault((k, oc["name"]), []).append(
+                            (price, bm.get("title", key), link, oc.get("point")))
+
+        for (k, name), lst in offers.items():
+            lst.sort(key=lambda o: o[0], reverse=True)
+            price, book, link, point = lst[0]
+            bet = EVBet(
+                event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
+                sport_key=ev.get("sport_key", ""), matchup=f"{ev['away_team']} @ {ev['home_team']}",
+                home_team=ev["home_team"], away_team=ev["away_team"],
+                commence_time=ev["commence_time"], is_live=is_live,
+                market=k[0], line=k[1], outcome=name, point=point,
+                book=book, price=price, link=link,
+                fair_prob=fair[k][name], sharp_book=sharp_name[k], n_outcomes=len(fair[k]),
+                also=[(b, pr) for pr, b, _, _ in lst[1:]],
+            )
+            bet.stake = kelly_stake(bet.fair_prob, bet.price, cfg)
+            out.append(bet)
+
+    return sorted(out, key=lambda b: b.ev_pct, reverse=True)
+
+
+def format_ev_text(b: EVBet) -> str:
+    status = "🔴 LIVE" if b.is_live else f"starts {b.commence_time}"
+    also = f"\n  Also +EV at: {', '.join(f'{bk} {pr:.2f}' for bk, pr in b.also)}" if b.also else ""
+    return (
+        f"📈 +{b.ev_pct:.1f}% EV | {b.sport} | {b.matchup} ({status})\n"
+        f"  {b.pick} @ {b.price:.2f} on {b.book}  → stake ${b.stake:g}"
+        + (f"\n    {b.link}" if b.link else "")
+        + f"\n  Fair odds {b.fair_odds:.2f} ({b.sharp_book} no-vig){also}"
+    )
+
+
+def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
+               first_seen: float | None = None) -> dict:
+    gone = gone_after is not None
+    title = f"📈 +{b.ev_pct:.1f}% EV: {b.pick} @ {b.price:.2f} ({b.book})"
+    if gone:
+        title = f"❌ GONE after {_fmt_secs(gone_after)} · ~~+{b.ev_pct:.1f}%~~ {b.pick} ({b.book})"
+    when = ("🔴 **LIVE**" if b.is_live
+            else f"starts <t:{int(_parse_time(b.commence_time).timestamp())}:R>")
+    seen = f" · first seen <t:{int(first_seen)}:R>" if first_seen and not gone else ""
+    fields = [
+        {"name": "Bet", "value": f"**{b.pick} @ {b.price:.2f}**\n{b.book}"
+                                 + (f"\n[Open bet slip]({b.link})" if b.link and not gone else ""), "inline": True},
+        {"name": "Fair odds", "value": f"{b.fair_odds:.2f}\n{b.sharp_book} no-vig", "inline": True},
+        {"name": "Stake", "value": f"**${b.stake:g}**\nKelly-sized", "inline": True},
+    ]
+    if b.also:
+        fields.append({"name": "Also +EV at",
+                       "value": ", ".join(f"{bk} {pr:.2f}" for bk, pr in b.also)[:1000], "inline": False})
+    payload = {
+        "username": "Arb Bot",
+        "embeds": [{
+            "title": title[:256],
+            "description": f"**{b.sport}** · {b.matchup} · {when}{seen}",
+            "color": 0x95A5A6 if gone else 0x3498DB,
+            "fields": fields,
+            "footer": {"text": "Price moved; edge gone." if gone
+                       else "+EV wins over many bets, not every bet. Stick to the stake size."},
+        }],
+        "allowed_mentions": {"parse": ["everyone", "roles", "users"]},
+    }
+    if mention and not gone:
+        payload["content"] = mention
+    return payload
+
+
+EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
+                 "home_team", "away_team", "commence_time", "live", "market", "outcome", "point",
+                 "n_outcomes", "book", "price", "fair_odds", "best_ev_pct", "stake"]
+
+
+class EVAlerter(Alerter):
+    noun = "+EV bets"
+    log_fields = EV_LOG_FIELDS
+    log_on_open = True  # logged at first sight, so a restart never loses a bet from the results
+
+    def text(self, item) -> str:
+        return format_ev_text(item)
+
+    def payload(self, item, mention="", gone_after=None, first_seen=None) -> dict:
+        return ev_payload(item, mention, gone_after, first_seen)
+
+    def value(self, item) -> float:
+        return item.ev_pct
+
+    def label(self, item) -> str:
+        return f"{item.pick} ({item.book})"
+
+    def mention(self) -> str:
+        return self.cfg.ev_mention
+
+    def log_path(self) -> str:
+        return self.cfg.ev_log_file
+
+    def row(self, op: OpenArb) -> dict:
+        b = op.arb
+        return {
+            "event_id": b.event_id, "sport": b.sport, "sport_key": b.sport_key, "matchup": b.matchup,
+            "home_team": b.home_team, "away_team": b.away_team, "commence_time": b.commence_time,
+            "live": b.is_live, "market": b.market, "outcome": b.outcome,
+            "point": "" if b.point is None else b.point, "n_outcomes": b.n_outcomes,
+            "book": b.book, "price": b.price, "fair_odds": round(b.fair_odds, 3),
+            "best_ev_pct": round(b.ev_pct, 2), "stake": b.stake,
+        }
+
+
+# --------------------------------------------------------------------------- +EV results
+
+RESULT_FIELDS = EV_LOG_FIELDS + ["home_score", "away_score", "result", "profit"]
+
+
+def settle(bet: dict, home_score: float, away_score: float) -> tuple[str, float]:
+    """Grade one logged +EV bet against the final score. Returns (win/loss/push, profit)."""
+    home, away = bet["home_team"], bet["away_team"]
+    pick, market = bet["outcome"], bet["market"]
+    point = float(bet["point"]) if bet.get("point") not in ("", None) else 0.0
+    if market == "h2h":
+        if pick == "Draw":
+            res = "win" if home_score == away_score else "loss"
+        elif home_score == away_score:
+            res = "loss" if int(bet.get("n_outcomes") or 2) == 3 else "push"
+        else:
+            res = "win" if pick == (home if home_score > away_score else away) else "loss"
+    elif market == "spreads":
+        mine, theirs = (home_score, away_score) if pick == home else (away_score, home_score)
+        diff = mine + point - theirs
+        res = "win" if diff > 0 else ("push" if diff == 0 else "loss")
+    elif market == "totals":
+        total = home_score + away_score
+        diff = total - point if pick == "Over" else point - total
+        res = "win" if diff > 0 else ("push" if diff == 0 else "loss")
+    else:
+        return "unknown", 0.0
+    stake, price = float(bet["stake"]), float(bet["price"])
+    profit = stake * (price - 1) if res == "win" else (-stake if res == "loss" else 0.0)
+    return res, round(profit, 2)
+
+
+def _read_csv(name: str) -> list[dict]:
+    path = data_path(name)
+    if not path.exists():
+        return []
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _bet_id(row: dict) -> str:
+    return f"{row['event_id']}|{row['market']}|{row['outcome']}|{row['point']}"
+
+
+def settle_pending(cfg: Config, api: "OddsAPI") -> int:
+    """Grade logged +EV alerts whose games have finished. Uses the scores endpoint
+    (2 credits per sport, only for sports with ungraded bets from the last 3 days)."""
+    done = {_bet_id(r) for r in _read_csv(cfg.ev_results_file)}
+    pending: dict[str, dict] = {}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+    for r in _read_csv(cfg.ev_log_file):
+        bid = _bet_id(r)
+        if bid in done or bid in pending:
+            continue  # first alert for a bet counts; repeats of the same bet don't
+        start = _parse_time(r["commence_time"])
+        if cutoff < start < datetime.now(timezone.utc) - timedelta(hours=2):
+            pending[bid] = r
+    if not pending:
+        return 0
+    graded = 0
+    for sport in sorted({r["sport_key"] for r in pending.values()}):
+        try:
+            scores = {s["id"]: s for s in api.scores(sport) if s.get("completed") and s.get("scores")}
+        except Exception as e:  # noqa: BLE001
+            print(f"! Couldn't load {sport} scores: {e}", file=sys.stderr)
+            continue
+        for r in pending.values():
+            s = scores.get(r["event_id"]) if r["sport_key"] == sport else None
+            if not s:
+                continue
+            pts = {x["name"]: float(x["score"]) for x in s["scores"]}
+            if r["home_team"] not in pts or r["away_team"] not in pts:
+                continue
+            res, profit = settle(r, pts[r["home_team"]], pts[r["away_team"]])
+            append_csv(cfg.ev_results_file, RESULT_FIELDS, {
+                **r, "home_score": pts[r["home_team"]], "away_score": pts[r["away_team"]],
+                "result": res, "profit": profit})
+            graded += 1
+    return graded
+
+
+def ev_record(cfg: Config, days: int | None = None) -> str:
+    rows = _read_csv(cfg.ev_results_file)
+    if days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        rows = [r for r in rows if _parse_time(r["commence_time"]) >= cutoff]
+    rows = [r for r in rows if r["result"] in ("win", "loss", "push")]
+    if not rows:
+        return "no graded bets yet"
+    w = sum(r["result"] == "win" for r in rows)
+    l = sum(r["result"] == "loss" for r in rows)
+    pu = len(rows) - w - l
+    staked = sum(float(r["stake"]) for r in rows if r["result"] != "push")
+    profit = sum(float(r["profit"]) for r in rows)
+    avg_ev = sum(float(r["best_ev_pct"]) for r in rows) / len(rows)
+    roi = profit / staked * 100 if staked else 0
+    return (f"{len(rows)} bets, {w}-{l}-{pu}, {'+' if profit >= 0 else '-'}${abs(profit):,.2f} "
+            f"on ${staked:,.0f} staked (ROI {roi:+.1f}%, avg edge {avg_ev:.1f}%)")
 
 
 # --------------------------------------------------------------------------- schedule
@@ -838,11 +1248,14 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
 
 def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     alerter = Alerter(cfg, dry_run=args.dry_run)
+    ev_alerter = EVAlerter(cfg, dry_run=args.dry_run)
 
     if args.demo:
-        arbs = find_arbs(demo_events(), cfg)
+        events = demo_events()
+        arbs, evs = find_arbs(events, cfg), find_evs(events, cfg)
         alerter.handle(arbs)
-        print(f"[demo] {len(arbs)} arb(s) in sample data")
+        ev_alerter.handle(evs)
+        print(f"[demo] {len(arbs)} arb(s), {len(evs)} +EV bet(s) in sample data")
         return
 
     api = OddsAPI(cfg)
@@ -850,6 +1263,13 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
 
     if args.plan:
         print_plan(cfg, sched)
+        return
+
+    if args.results:
+        n = settle_pending(cfg, api)
+        print(f"Graded {n} new bet(s).")
+        print(f"+EV record, last 7 days (every alert, at the alerted price): {ev_record(cfg, 7)}")
+        print(f"+EV record, all time: {ev_record(cfg)}")
         return
 
     mode = "dry run (console only)" if alerter.dry_run else "sending to Discord"
@@ -864,15 +1284,27 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     tz = ZoneInfo(cfg.timezone)
     summary_day = datetime.now(tz).date()
     idle_logged = False
+    sharp_seen = False
+    sharp_checks = 0
     while True:
         now = datetime.now(timezone.utc)
         local = now.astimezone(tz)
         if (cfg.summary_hour >= 0 and not args.once and local.hour >= cfg.summary_hour
                 and local.date() != summary_day):
             summary_day = local.date()
+            msg = f"📊 Last 24h: {alerter.summary()}."
+            if cfg.ev_enabled:
+                try:
+                    settle_pending(cfg, api)
+                except Exception as e:  # noqa: BLE001 - a summary shouldn't crash the bot
+                    print(f"! Grading +EV bets failed: {e}", file=sys.stderr)
+                msg += (f"\n📈 {ev_alerter.summary()}.\n"
+                        f"+EV results if you bet every alert: last 7 days {ev_record(cfg, 7)}; "
+                        f"all time {ev_record(cfg)}.")
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
-            status.send(f"📊 Last 24h: {alerter.summary()}. Credits left: {left}.")
+            status.send(f"{msg}\nCredits left: {left}.")
             alerter.reset_stats()
+            ev_alerter.reset_stats()
 
         wait = seconds_until_active(cfg, now)
         if wait:
@@ -906,11 +1338,28 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             events = sched.fetch(due, now)
             arbs = find_arbs(events, cfg)
             sent = alerter.handle(arbs, checked_sports=due)
+            evs = find_evs(events, cfg)
+            ev_sent = ev_alerter.handle(evs, checked_sports=due)
             status.check_credits(api.remaining)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
+            ev_note = f" | {len(evs)} +EV, {ev_sent} new" if cfg.ev_enabled else ""
             print(f"[{datetime.now():%H:%M:%S}] checked {', '.join(short(s) for s in due)} "
-                  f"({len(events)} games, {time.time() - t0:.1f}s) | {len(arbs)} arbs, {sent} new | "
-                  f"credits left {left}", flush=True)
+                  f"({len(events)} games, {time.time() - t0:.1f}s) | {len(arbs)} arbs, {sent} new"
+                  f"{ev_note} | credits left {left}", flush=True)
+
+            seen_books = {bm["key"] for ev in events for bm in ev.get("bookmakers", [])}
+            if args.once:
+                wanted = set(_csv(cfg.bookmakers))
+                print(f"Books in the feed: {', '.join(sorted(seen_books)) or 'none'}")
+                if wanted - seen_books:
+                    print(f"Not in the feed right now (check the key spelling): "
+                          f"{', '.join(sorted(wanted - seen_books))}")
+            if cfg.ev_enabled and not sharp_seen and events:
+                sharp_seen = bool(seen_books & set(_csv(cfg.sharp_books)))
+                sharp_checks += 1
+                if not sharp_seen and sharp_checks == 5:
+                    status.send(f"⚠️ No {cfg.sharp_books} odds in the feed, so +EV alerts can't work. "
+                                f"Add {_csv(cfg.sharp_books)[0]} to BOOKMAKERS in .env.")
         elif not idle_logged:
             idle_logged = True
             print(f"[{datetime.now():%H:%M:%S}] No games live or starting soon. Waiting (no credits used).",
@@ -932,6 +1381,8 @@ def main() -> None:
     p.add_argument("--demo", action="store_true", help="use bundled sample data (no API key needed)")
     p.add_argument("--dry-run", action="store_true", help="print alerts instead of sending to Discord")
     p.add_argument("--test-discord", action="store_true", help="send one sample alert to Discord and exit")
+    p.add_argument("--results", action="store_true",
+                   help="grade finished +EV alerts and print the win/loss record (2 credits per sport)")
     args = p.parse_args()
 
     cfg = Config.from_env()
@@ -952,7 +1403,7 @@ def main() -> None:
         print("Set ODDS_API_KEY in .env (key at https://the-odds-api.com), or run with --demo.", file=sys.stderr)
         sys.exit(2)
 
-    status = Status(cfg, dry_run=args.dry_run or args.demo or args.plan or args.once)
+    status = Status(cfg, dry_run=args.dry_run or args.demo or args.plan or args.once or args.results)
     while True:
         try:
             run(cfg, args, status)

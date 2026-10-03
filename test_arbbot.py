@@ -2,8 +2,9 @@ import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from arbbot import (LIVE, PREGAME, Alerter, Config, Scheduler, demo_events, discord_payload,
-                    find_arbs, next_reset, seconds_until_active)
+from arbbot import (LIVE, PREGAME, Alerter, Config, EVAlerter, Scheduler, demo_events, devig,
+                    discord_payload, ev_payload, ev_record, find_arbs, find_evs, kelly_stake,
+                    next_reset, seconds_until_active, settle, settle_pending)
 
 NOW = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
 FRESH = NOW.isoformat().replace("+00:00", "Z")
@@ -101,6 +102,16 @@ class FindArbs(unittest.TestCase):
         [arb] = find_arbs([ev], Config(min_profit_pct=0, live_only=True), NOW)
         self.assertTrue(arb.is_live)
 
+    def test_sharp_book_never_an_arb_leg(self):
+        # Pinnacle's price would make an arb, but US bettors can't bet there.
+        ev = event({
+            "Pinnacle": [("h2h", [("Home", 2.20, None), ("Away", 1.75, None)])],
+            "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])],
+        })
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        self.assertEqual(find_arbs([ev], CFG, NOW), [])
+        self.assertEqual(len(find_arbs([ev], Config(min_profit_pct=0, bet_at_sharp=True), NOW)), 1)
+
     def test_demo_data_has_one_arb(self):
         [arb] = find_arbs(demo_events(), Config())
         self.assertEqual(arb.matchup, "New York Knicks @ Boston Celtics")
@@ -185,6 +196,140 @@ class AlerterLifecycle(unittest.TestCase):
         self.assertEqual(discord_payload(self.arbs[0], mention="@everyone")["content"], "@everyone")
 
 
+def ev_event(sharp, books, start="2026-10-03T18:00:00Z", market="h2h"):
+    """sharp: [(name, price, point)], books: {title: [(name, price, point)]}"""
+    ev = event({"Pinnacle": [(market, sharp)], **{t: [(market, o)] for t, o in books.items()}}, start=start)
+    ev["bookmakers"][0]["key"] = "pinnacle"
+    return ev
+
+
+EVCFG = Config(min_ev_pct=3, round_stakes=0, ev_bankroll=1000, kelly_fraction=0.25)
+
+
+class PlusEV(unittest.TestCase):
+    def test_devig(self):
+        p = devig([1.91, 1.91])
+        self.assertAlmostEqual(p[0], 0.5)
+        p = devig([1.70, 2.25])
+        self.assertAlmostEqual(sum(p), 1)
+        self.assertGreater(p[0], p[1])
+
+    def test_finds_price_above_fair(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"B": [("Home", 2.10, None), ("Away", 1.75, None)]})
+        [b] = find_evs([ev], EVCFG, NOW)
+        self.assertEqual((b.outcome, b.book, b.price), ("Home", "B", 2.10))
+        self.assertAlmostEqual(b.ev_pct, 5.0, places=1)    # 0.5 * 2.10 - 1
+        self.assertAlmostEqual(b.fair_odds, 2.0)
+
+    def test_best_book_wins_others_listed(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"B": [("Home", 2.10, None)], "C": [("Home", 2.15, None)], "D": [("Home", 2.0, None)]})
+        [b] = find_evs([ev], EVCFG, NOW)
+        self.assertEqual(b.book, "C")
+        self.assertEqual(b.also, [("B", 2.10)])  # D's 2.0 is no edge
+
+    def test_needs_sharp_reference(self):
+        ev = event({"B": [("h2h", [("Home", 2.5, None), ("Away", 1.5, None)])]})
+        self.assertEqual(find_evs([ev], EVCFG, NOW), [])
+
+    def test_lines_must_match(self):
+        ev = ev_event([("Home", 1.91, -3.5), ("Away", 1.91, 3.5)],
+                      {"B": [("Home", 2.30, -7.5), ("Away", 1.60, 7.5)]}, market="spreads")
+        self.assertEqual(find_evs([ev], EVCFG, NOW), [])
+
+    def test_filters(self):
+        ev = ev_event([("Home", 1.30, None), ("Away", 4.50, None)],
+                      {"B": [("Away", 6.0, None)]})   # long shot over EV_MAX_ODDS
+        self.assertEqual(find_evs([ev], EVCFG, NOW), [])
+        live = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                        {"B": [("Home", 2.10, None)]}, start="2026-10-03T11:00:00Z")
+        self.assertEqual(find_evs([live], EVCFG, NOW), [])           # pre-game only by default
+        self.assertEqual(len(find_evs([live], Config(min_ev_pct=3, ev_live=True), NOW)), 1)
+        self.assertEqual(find_evs([live], Config(ev_enabled=False, ev_live=True), NOW), [])
+
+    def test_kelly_stake(self):
+        # fair 50%, price 2.10: full Kelly = 0.05/1.10 = 4.55% -> quarter = 1.14% of $1000
+        self.assertEqual(kelly_stake(0.5, 2.10, EVCFG), 11.0)
+        self.assertEqual(kelly_stake(0.5, 2.10, Config(round_stakes=5, ev_bankroll=1000)), 10.0)
+        capped = Config(round_stakes=0, ev_bankroll=1000, kelly_fraction=1, ev_max_stake_pct=3)
+        self.assertEqual(kelly_stake(0.6, 2.10, capped), 30.0)
+
+    def test_payload(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
+        [b] = find_evs([ev], EVCFG, NOW)
+        self.assertIn("+5.0% EV: Home ML @ 2.10 (B)", ev_payload(b)["embeds"][0]["title"])
+        self.assertTrue(ev_payload(b, gone_after=30)["embeds"][0]["title"].startswith("❌ GONE"))
+
+
+def bet(market, outcome, point="", price=2.0, stake=10, n=2):
+    return {"home_team": "Home", "away_team": "Away", "market": market, "outcome": outcome,
+            "point": point, "price": price, "stake": stake, "n_outcomes": n}
+
+
+class Grading(unittest.TestCase):
+    def test_moneyline(self):
+        self.assertEqual(settle(bet("h2h", "Home"), 100, 90), ("win", 10.0))
+        self.assertEqual(settle(bet("h2h", "Away"), 100, 90), ("loss", -10.0))
+        self.assertEqual(settle(bet("h2h", "Home"), 20, 20), ("push", 0.0))
+        self.assertEqual(settle(bet("h2h", "Home", n=3), 1, 1), ("loss", -10.0))
+        self.assertEqual(settle(bet("h2h", "Draw", price=3.4, n=3), 1, 1), ("win", 24.0))
+
+    def test_spread(self):
+        self.assertEqual(settle(bet("spreads", "Home", -3.5), 100, 97)[0], "loss")
+        self.assertEqual(settle(bet("spreads", "Home", -3.5), 100, 96)[0], "win")
+        self.assertEqual(settle(bet("spreads", "Away", 3.0), 100, 97)[0], "push")
+        self.assertEqual(settle(bet("spreads", "Away", 3.5), 100, 97)[0], "win")
+
+    def test_total(self):
+        self.assertEqual(settle(bet("totals", "Over", 200.5), 100, 101)[0], "win")
+        self.assertEqual(settle(bet("totals", "Under", 200.5), 100, 101)[0], "loss")
+        self.assertEqual(settle(bet("totals", "Under", 201), 100, 101)[0], "push")
+
+
+class EVLifecycle(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.cfg = Config(min_ev_pct=3, ev_log_file=str(d / "ev.csv"), ev_results_file=str(d / "res.csv"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_log_grade_record(self):
+        from datetime import datetime as dt
+        start = (dt.now(timezone.utc) - timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]},
+                      start=start)
+        ev["sport_key"] = "basketball_nba"
+        [b] = find_evs([ev], Config(min_ev_pct=3, max_age_seconds=10**9),
+                       _parse(start) - timedelta(hours=1))
+        a = EVAlerter(self.cfg, dry_run=True)
+        a.handle([b], ["basketball_nba"], now=1000)   # logged right away
+        self.assertEqual(len(Path(self.cfg.ev_log_file).read_text().splitlines()), 2)
+        a.handle([b], ["basketball_nba"], now=1060)   # same bet again: no duplicate
+        a.handle([], ["basketball_nba"], now=1120)    # gone
+        a.handle([b], ["basketball_nba"], now=2000)   # reappears -> logged twice in ev.csv...
+        self.assertEqual(len(Path(self.cfg.ev_log_file).read_text().splitlines()), 3)
+
+        class Scores:
+            calls = 0
+            def scores(self, sport):
+                Scores.calls += 1
+                return [{"id": "e1", "completed": True,
+                         "scores": [{"name": "Home", "score": "110"}, {"name": "Away", "score": "100"}]}]
+        self.assertEqual(settle_pending(self.cfg, Scores()), 1)   # ...but graded once
+        self.assertEqual(settle_pending(self.cfg, Scores()), 0)   # nothing left; no extra API call
+        self.assertEqual(Scores.calls, 1)
+        rec = ev_record(self.cfg)
+        self.assertTrue(rec.startswith("1 bets, 1-0-0, +$"), rec)
+
+
+def _parse(ts):
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
 class ActiveHours(unittest.TestCase):
     def at(self, hhmm):  # a New York local time on a fixed day, as UTC
         from zoneinfo import ZoneInfo
@@ -222,8 +367,12 @@ def sched_with(games, cfg=None, remaining=None):
 
 class Credits(unittest.TestCase):
     def test_cost_markets_times_regions(self):
-        self.assertEqual(Config(markets="h2h,spreads,totals", regions="us").credits_per_call(), 3)
-        self.assertEqual(Config(markets="h2h", regions="us,us2").credits_per_call(), 2)
+        self.assertEqual(Config(markets="h2h,spreads,totals", regions="us", bookmakers="").credits_per_call(), 3)
+        self.assertEqual(Config(markets="h2h", regions="us,us2", bookmakers="").credits_per_call(), 2)
+
+    def test_default_ten_books_cost_one_region(self):
+        self.assertEqual(len(Config().bookmakers.split(",")), 10)
+        self.assertEqual(Config(markets="h2h,spreads,totals").credits_per_call(), 3)
 
     def test_up_to_ten_bookmakers_cost_one_region(self):
         ten = ",".join(f"b{i}" for i in range(10))
