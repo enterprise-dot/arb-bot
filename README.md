@@ -166,6 +166,20 @@ Needs Python 3.10+. No packages to install.
 
 Each check of a sport costs **(# bet types) × (# regions)** credits, which is **3** with the defaults.
 
+## Upcoming games, not just live ones
+
+| Game starts | Main lines | Player props |
+|---|---|---|
+| Live | every 60s | none |
+| Within 2h (props: 3h) | every 15 min | every 30 min |
+| Within 24h | every hour | every 4 hours |
+| Within 48h | every 3 hours | none |
+
+One main-line check covers every game in a sport, so watching tomorrow's games costs almost
+nothing. Early lines are often the softest, so +EV, outlier and parlay alerts for later games show
+up well before kickoff (cards show the day: "Starts Sun 1:00 PM"). When credits are tight, the
+upcoming-game checks slow down first; live and near-kickoff checks keep at least half the budget.
+
 ## What the $59 plan gets you
 
 With 4 sports and all 3 bet types, a typical day has around 12–16 hours of live games

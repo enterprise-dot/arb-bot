@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from arbbot import (LIVE, PREGAME, Alerter, Config, EVAlerter, OutlierAlerter, Scheduler,
+from arbbot import (LIVE, PREGAME, EARLY, FAR, Alerter, Config, EVAlerter, OutlierAlerter, Scheduler,
                     demo_events, devig, find_outliers, outlier_payload, without_outliers,
                     discord_payload, ev_payload, ev_record, find_arbs, find_evs, kelly_stake,
                     next_reset, seconds_until_active, settle, settle_pending,
@@ -98,9 +98,14 @@ class FindArbs(unittest.TestCase):
         self.assertEqual(len(find_arbs([ev], CFG, NOW)), 1)       # pre-game: 10 min is fine
         ev["commence_time"] = "2026-10-03T11:00:00Z"
         self.assertEqual(find_arbs([ev], CFG, NOW), [])           # live: too old
-        ev["commence_time"] = "2026-10-03T18:00:00Z"
+        ev["commence_time"] = "2026-10-03T13:00:00Z"              # kicks off in 1 hour
         ev["bookmakers"][1]["markets"][0]["last_update"] = (NOW - timedelta(minutes=20)).isoformat()
-        self.assertEqual(find_arbs([ev], CFG, NOW), [])           # pre-game: 20 min is too old
+        self.assertEqual(find_arbs([ev], CFG, NOW), [])           # near kickoff: 20 min is too old
+        ev["commence_time"] = "2026-10-04T12:00:00Z"              # tomorrow
+        ev["bookmakers"][1]["markets"][0]["last_update"] = (NOW - timedelta(hours=2)).isoformat()
+        self.assertEqual(len(find_arbs([ev], CFG, NOW)), 1)       # a day out: a 2h-old line is fine
+        ev["bookmakers"][1]["markets"][0]["last_update"] = (NOW - timedelta(hours=4)).isoformat()
+        self.assertEqual(find_arbs([ev], CFG, NOW), [])           # ...but not a 4h-old one
 
     def test_profit_filters_and_live_only(self):
         ev = event({
@@ -701,16 +706,21 @@ class Props(unittest.TestCase):
     def test_props_schedule_and_budget(self):
         cfg = Config(sports=["basketball_nba"], prop_minutes=30, prop_hours=3)
         s = sched_with({"basketball_nba": [("g1", NOW + timedelta(hours=2)), ("g2", NOW + timedelta(hours=5))]}, cfg)
-        self.assertEqual(s.props_due(NOW), [("basketball_nba", "g1")])   # only inside the window
-        s.last_props["g1"] = time.time()
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", "g1"), ("basketball_nba", "g2")])
+        s.last_props["g1"] = s.last_props["g2"] = time.time()
         self.assertEqual(s.props_due(NOW), [])
+        s.last_props["g2"] = time.time() - 31 * 60
+        self.assertEqual(s.props_due(NOW), [])          # g2 is 5h out: early tier, every 4h
+        s.last_props["g1"] = time.time() - 31 * 60
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", "g1")])   # g1 is 2h out: every 30m
         self.assertEqual(cfg.prop_credits_per_call("basketball_nba"), 4)  # 4 markets, 10 books = 1 region
         s.update_budget(NOW)
         with_props = s.forecast
         s.cfg = Config(sports=["basketball_nba"], props_enabled=False)
         s.update_budget(NOW)
-        # g1 (in 2h): 2h of window left; g2 (in 5h): full 3h. (2 + 3)h x 2 checks/h x 4 credits = 40
-        self.assertAlmostEqual(with_props - s.forecast, 40, delta=2)
+        # Near kickoff (every 30m): g1 2h + g2 3h = 5h x 2/h x 4 = 40.
+        # Early (every 4h, from 24h out): g1 0h left, g2 2h (5h-3h) = 2h x 0.25/h x 4 = 2.
+        self.assertAlmostEqual(with_props - s.forecast, 42, delta=2)
 
     def test_prop_alerts_close_only_when_their_game_is_rechecked(self):
         ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)})
@@ -882,11 +892,16 @@ class SchedulerState(unittest.TestCase):
         s = sched_with({"basketball_nba": [("g1", NOW - timedelta(minutes=30))],
                         "icehockey_nhl": [("g2", NOW + timedelta(hours=1))],
                         "baseball_mlb": [("g3", NOW + timedelta(hours=8))],
+                        "soccer_epl": [("g4", NOW + timedelta(hours=36))],
+                        "tennis_atp": [("g5", NOW + timedelta(hours=60))],
                         "americanfootball_nfl": []})
         self.assertEqual(s.state("basketball_nba", NOW), LIVE)
         self.assertEqual(s.state("icehockey_nhl", NOW), PREGAME)
-        self.assertIsNone(s.state("baseball_mlb", NOW))
+        self.assertEqual(s.state("baseball_mlb", NOW), EARLY)      # later today: hourly
+        self.assertEqual(s.state("soccer_epl", NOW), FAR)          # tomorrow-ish: every 3h
+        self.assertIsNone(s.state("tennis_atp", NOW))              # beyond the 48h lookahead
         self.assertIsNone(s.state("americanfootball_nfl", NOW))
+        self.assertEqual([s.interval(x) for x in (LIVE, PREGAME, EARLY, FAR)], [60, 900, 3600, 10800])
 
     def test_game_over_after_duration(self):
         s = sched_with({"basketball_nba": [("g1", NOW - timedelta(minutes=200))]})
@@ -901,7 +916,8 @@ class SchedulerState(unittest.TestCase):
         self.assertIsNone(s.state("basketball_nba", NOW))
 
     def test_pregame_off(self):
-        cfg = Config(sports=["icehockey_nhl"], pregame_minutes=0)
+        # PREGAME_MINUTES=0 and LOOKAHEAD_HOURS=0: live games only.
+        cfg = Config(sports=["icehockey_nhl"], pregame_minutes=0, lookahead_hours=0)
         s = sched_with({"icehockey_nhl": [("g2", NOW + timedelta(hours=1))]}, cfg)
         self.assertIsNone(s.state("icehockey_nhl", NOW))
 
@@ -935,10 +951,36 @@ class Budget(unittest.TestCase):
                        cfg, remaining=3000)
         s.update_budget(NOW)
         # 24h of back-to-back games = 4320 credits at full speed, far more than
-        # (3000 left - 2% cushion) / days until reset.
+        # (3000 left - 2% cushion) / days until reset. Early checks stretch to the cap first,
+        # then live checks slow just enough to fit.
         self.assertGreater(s.scale, 1)
-        self.assertAlmostEqual(s.forecast / s.scale, s.allowance, delta=1)
+        self.assertEqual(s.extra_scale, cfg.extra_max_stretch)
+        spend = s.core_demand / s.scale + s.extra_demand / s.extra_scale
+        self.assertAlmostEqual(spend, s.allowance, delta=1)
         self.assertGreater(s.interval(LIVE), 60)
+
+    def test_early_checks_stretch_before_live_ones(self):
+        # One live game plus lots of far-out games: the far-out checks slow down, live stays at 60s.
+        cfg = Config(sports=["basketball_nba", "icehockey_nhl"], props_enabled=False, early_minutes=1)
+        s = sched_with({"basketball_nba": [("g1", NOW)],
+                        "icehockey_nhl": [("h1", NOW + timedelta(hours=20))]}, cfg, remaining=75_000)
+        s.update_budget(NOW)
+        self.assertLess(s.core_demand, s.allowance)
+        self.assertGreater(s.forecast, s.allowance)
+        self.assertEqual(s.scale, 1.0)                 # live untouched...
+        self.assertGreater(s.extra_scale, 1.0)         # ...early checks absorb the shortfall
+        self.assertEqual(s.interval(LIVE), 60)
+
+    def test_live_never_paused_by_early_checks(self):
+        # Early checks alone exceed the budget: they stretch beyond the cap; live keeps running.
+        cfg = Config(sports=["basketball_nba", "icehockey_nhl"], props_enabled=False, early_minutes=1)
+        s = sched_with({"basketball_nba": [("g1", NOW)],
+                        "icehockey_nhl": [("h1", NOW + timedelta(hours=20))]}, cfg, remaining=31 * 600)
+        s.update_budget(NOW)
+        self.assertLess(s.scale, float("inf"))
+        self.assertGreater(s.extra_scale, cfg.extra_max_stretch)
+        spend = s.core_demand / s.scale + s.extra_demand / s.extra_scale
+        self.assertAlmostEqual(spend, s.allowance, delta=1)
 
     def test_out_of_credits_pauses(self):
         s = sched_with({"basketball_nba": [("g1", NOW)]}, remaining=0)

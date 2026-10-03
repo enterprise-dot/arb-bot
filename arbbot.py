@@ -139,6 +139,11 @@ class Config:
     poll_seconds: int = 60        # fastest check rate for sports with live games
     pregame_minutes: int = 15     # check rate before kickoff (0 = live games only)
     pregame_hours: float = 2.0    # how far before kickoff pre-game checks start
+    early_minutes: int = 60       # games later today/tomorrow (within 24h): main lines this often
+    lookahead_hours: float = 48   # look this far ahead at all (0 = only near kickoff)
+    far_minutes: int = 180        # games 24-48h out: main lines this often
+    far_max_age_seconds: int = 10800  # early lines can sit unchanged for hours without being stale
+    extra_max_stretch: float = 4.0    # on a tight budget, slow early checks up to this much first
     monthly_credits: int = 100_000
     billing_day: int = 1          # day of month your plan's credits reset
     events_refresh_minutes: int = 10
@@ -191,7 +196,9 @@ class Config:
         "americanfootball_nfl", "basketball_nba", "icehockey_nhl"])
     prop_markets: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_PROP_MARKETS))
     prop_minutes: int = 30          # how often to check a game's props
-    prop_hours: float = 3.0         # start checking this long before kickoff
+    prop_hours: float = 3.0         # check every PROP_MINUTES this close to kickoff
+    prop_early_hours: float = 24.0  # and every PROP_EARLY_MINUTES from this far out
+    prop_early_minutes: int = 240
     prop_min_ev_pct: float = 7.0    # prop prices are noisier, so ask for more edge
     prop_min_books: int = 4         # without a sharp price, use the median of at least this many books
     consensus_min_books: int = 0    # (internal) consensus fallback for +EV; set for props only
@@ -231,6 +238,11 @@ class Config:
             poll_seconds=int(e("POLL_SECONDS", d.poll_seconds)),
             pregame_minutes=int(e("PREGAME_MINUTES", d.pregame_minutes)),
             pregame_hours=float(e("PREGAME_HOURS", d.pregame_hours)),
+            early_minutes=int(e("EARLY_MINUTES", d.early_minutes)),
+            lookahead_hours=float(e("LOOKAHEAD_HOURS", d.lookahead_hours)),
+            far_minutes=int(e("FAR_MINUTES", d.far_minutes)),
+            far_max_age_seconds=int(e("FAR_MAX_AGE_SECONDS", d.far_max_age_seconds)),
+            extra_max_stretch=float(e("EXTRA_MAX_STRETCH", d.extra_max_stretch)),
             monthly_credits=int(e("MONTHLY_CREDITS", d.monthly_credits)),
             billing_day=int(e("BILLING_DAY", d.billing_day)),
             events_refresh_minutes=int(e("EVENTS_REFRESH_MINUTES", d.events_refresh_minutes)),
@@ -284,6 +296,8 @@ class Config:
                           (x.split("=", 1) for x in e("PROP_MARKETS", "").split(";") if "=" in x)}},
             prop_minutes=int(e("PROP_MINUTES", d.prop_minutes)),
             prop_hours=float(e("PROP_HOURS", d.prop_hours)),
+            prop_early_hours=float(e("PROP_EARLY_HOURS", d.prop_early_hours)),
+            prop_early_minutes=int(e("PROP_EARLY_MINUTES", d.prop_early_minutes)),
             prop_min_ev_pct=float(e("PROP_MIN_EV_PCT", d.prop_min_ev_pct)),
             prop_min_books=int(e("PROP_MIN_BOOKS", d.prop_min_books)),
             parlays_enabled=e("PARLAYS_ENABLED", "true").lower() in ("1", "true", "yes"),
@@ -505,12 +519,19 @@ class OddsAPI:
 
 # --------------------------------------------------------------------------- detection
 
-def is_fresh(mkt: dict, bm: dict, now: datetime, live: bool, cfg: Config) -> bool:
-    """Live prices must be recent; pre-game lines legitimately sit still for longer."""
+def is_fresh(mkt: dict, bm: dict, now: datetime, live: bool, cfg: Config,
+             start: datetime | None = None) -> bool:
+    """Live prices must be recent; pre-game lines legitimately sit still for longer, and lines
+    for games a day or two out can go hours without moving."""
     updated = mkt.get("last_update") or bm.get("last_update")
     if not updated:
         return True
-    limit = cfg.max_age_seconds if live else cfg.pregame_max_age_seconds
+    if live:
+        limit = cfg.max_age_seconds
+    elif start is not None and start - now > timedelta(hours=cfg.pregame_hours):
+        limit = cfg.far_max_age_seconds
+    else:
+        limit = cfg.pregame_max_age_seconds
     return (now - _parse_time(updated)).total_seconds() <= limit
 
 
@@ -551,7 +572,7 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
             if bm["key"] in sharp_only:
                 continue  # reference-only book (e.g. Pinnacle): not bettable from the US
             for mkt in bm.get("markets", []):
-                if not is_fresh(mkt, bm, now, is_live, cfg):
+                if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue  # stale price, likely already moved
                 per_line: dict[tuple, int] = {}
                 for oc in mkt.get("outcomes", []):
@@ -697,8 +718,10 @@ def _when(is_live: bool, commence_time: str, first_seen: float | None = None) ->
     if is_live:
         when = "🔴 **LIVE**"
     else:
-        ts = int(_parse_time(commence_time).timestamp())
-        when = f"⏰ Starts <t:{ts}:t> (<t:{ts}:R>)"
+        start = _parse_time(commence_time)
+        ts = int(start.timestamp())
+        style = "t" if start - datetime.now(timezone.utc) < timedelta(hours=12) else "F"  # add the day
+        when = f"⏰ Starts <t:{ts}:{style}> (<t:{ts}:R>)"
     return when + (f" · spotted <t:{int(first_seen)}:R>" if first_seen else "")
 
 
@@ -1136,7 +1159,7 @@ def sharp_fair(ev: dict, cfg: Config, now: datetime, is_live: bool):
             continue
         titles[sk] = bm.get("title", sk)
         for mkt in bm.get("markets", []):
-            if not is_fresh(mkt, bm, now, is_live, cfg):
+            if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                 continue
             groups: dict[tuple, dict[str, float]] = {}
             for oc in mkt.get("outcomes", []):
@@ -1178,7 +1201,7 @@ def consensus_fair(ev: dict, cfg: Config, now: datetime, is_live: bool, skip: se
         if bm["key"] in skip:
             continue
         for mkt in bm.get("markets", []):
-            if not is_fresh(mkt, bm, now, is_live, cfg):
+            if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                 continue
             for oc in mkt.get("outcomes", []):
                 price = float(oc.get("price") or 0)
@@ -1232,7 +1255,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
             if key in sharp or (allowed and key not in allowed):
                 continue
             for mkt in bm.get("markets", []):
-                if not is_fresh(mkt, bm, now, is_live, cfg):
+                if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue
                 for oc in mkt.get("outcomes", []):
                     k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
@@ -1414,7 +1437,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
         for bm in ev.get("bookmakers", []):
             titles[bm["key"]] = bm.get("title", bm["key"])
             for mkt in bm.get("markets", []):
-                if not is_fresh(mkt, bm, now, is_live, cfg):
+                if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue
                 for oc in mkt.get("outcomes", []):
                     price = float(oc.get("price") or 0)
@@ -1930,7 +1953,8 @@ def next_reset(cfg: Config, now: datetime) -> datetime:
     return cand
 
 
-LIVE, PREGAME = "live", "pregame"
+LIVE, PREGAME, EARLY, FAR = "live", "pregame", "early", "far"
+CORE = {LIVE, PREGAME}   # protected on a tight budget; EARLY/FAR stretch first
 STEP = 300  # seconds per slice when forecasting the next 24h
 
 
@@ -1948,7 +1972,8 @@ class Scheduler:
         self.ended: set[str] = set()
         self.need_close: set[str] = set()  # event ids wanting a last pre-kickoff check (CLV)
         self.last_props: dict[str, float] = {}  # event id -> last prop check
-        self.scale = 1.0
+        self.scale = 1.0         # slow-down for live and near-kickoff checks
+        self.extra_scale = 1.0   # slow-down for early/far-out checks (stretched first)
         self.forecast = 0.0      # credits the next 24h would cost at full speed
         self.allowance = 0.0     # credits we can afford per day
         self.budget_at = 0.0
@@ -1956,11 +1981,12 @@ class Scheduler:
     # ---- game state
 
     def state(self, sport: str, now: datetime) -> str | None:
-        dur = timedelta(minutes=self.cfg.minutes_for(sport))
-        soon = timedelta(hours=self.cfg.pregame_hours)
-        want_live = (self.cfg.arb_live or (self.cfg.ev_enabled and self.cfg.ev_live)
-                     or (self.cfg.outliers_enabled and self.cfg.outlier_live))
-        pregame = False
+        """The most urgent reason to check this sport: a live game, then the soonest kickoff."""
+        cfg = self.cfg
+        dur = timedelta(minutes=cfg.minutes_for(sport))
+        want_live = (cfg.arb_live or (cfg.ev_enabled and cfg.ev_live)
+                     or (cfg.outliers_enabled and cfg.outlier_live))
+        soonest = None
         for gid, start in self.games[sport]:
             if gid in self.ended:
                 continue
@@ -1968,13 +1994,25 @@ class Scheduler:
                 if want_live:
                     return LIVE
                 continue  # nothing live is wanted: don't pay to check games in progress
-            if self.cfg.pregame_minutes and now < start <= now + soon:
-                pregame = True
-        return PREGAME if pregame else None
+            if start > now and (soonest is None or start < soonest):
+                soonest = start
+        if soonest is None:
+            return None
+        ahead = soonest - now
+        if cfg.pregame_minutes and ahead <= timedelta(hours=cfg.pregame_hours):
+            return PREGAME
+        if cfg.lookahead_hours and cfg.early_minutes and ahead <= timedelta(hours=min(24, cfg.lookahead_hours)):
+            return EARLY
+        if cfg.lookahead_hours and cfg.far_minutes and ahead <= timedelta(hours=cfg.lookahead_hours):
+            return FAR
+        return None
+
+    def base_interval(self, st: str) -> float:
+        return {LIVE: self.cfg.poll_seconds, PREGAME: self.cfg.pregame_minutes * 60,
+                EARLY: self.cfg.early_minutes * 60, FAR: self.cfg.far_minutes * 60}[st]
 
     def interval(self, st: str) -> float:
-        base = self.cfg.poll_seconds if st == LIVE else self.cfg.pregame_minutes * 60
-        return base * self.scale
+        return self.base_interval(st) * (self.scale if st in CORE else self.extra_scale)
 
     def refresh_events(self, force: bool = False) -> None:
         now = time.time()
@@ -1982,7 +2020,7 @@ class Scheduler:
             if not force and now - self.events_at[sport] < self.cfg.events_refresh_minutes * 60:
                 continue
             try:
-                evs = self.api.events(sport)
+                evs = self.api.events(sport, horizon_hours=max(26, self.cfg.lookahead_hours + 2))
             except urllib.error.HTTPError as e:
                 if e.code == 401:
                     raise
@@ -2017,44 +2055,76 @@ class Scheduler:
         days_left = max(1.0, (next_reset(self.cfg, now) - now).total_seconds() / 86400)
         self.allowance = max(0.0, remaining - reserve) / days_left
 
-        demand = 0.0
+        core = extra = 0.0
         for step in range(0, 86400, STEP):
             t = now + timedelta(seconds=step)
             if seconds_until_active(self.cfg, t):
                 continue
             for sport in self.cfg.sports:
                 st = self.state(sport, t)
-                if st == LIVE:
-                    demand += STEP * self.cost / self.cfg.poll_seconds
-                elif st == PREGAME:
-                    demand += STEP * self.cost / (self.cfg.pregame_minutes * 60)
-            demand += STEP * self._prop_rate(t)
-        self.forecast = demand
-        if self.allowance <= 0:
-            self.scale = math.inf
+                if st:
+                    rate = STEP * self.cost / self.base_interval(st)
+                    if st in CORE:
+                        core += rate
+                    else:
+                        extra += rate
+            near, early = self._prop_rates(t)
+            core += STEP * near
+            extra += STEP * early
+        self.forecast = core + extra
+        self.core_demand, self.extra_demand = core, extra
+        a, cap = self.allowance, self.cfg.extra_max_stretch
+        if a <= 0:
+            self.scale = self.extra_scale = math.inf
+        elif core + extra <= a:
+            self.scale = self.extra_scale = 1.0
+        elif core + extra / cap <= a:
+            self.scale, self.extra_scale = 1.0, extra / (a - core)   # only early checks slow down
         else:
-            self.scale = max(1.0, demand / self.allowance)
+            # Early checks at their max stretch; live/near-kickoff get the rest, never less
+            # than half the budget (if needed, early checks stretch further to make room).
+            self.extra_scale = cap
+            room = a - extra / cap
+            if room < a / 2:
+                room = a / 2
+                self.extra_scale = extra / (a - room) if extra else cap
+            self.scale = max(1.0, core / room)
         self.budget_at = time.time()
 
-    def _prop_games(self, now: datetime) -> list[tuple[str, str]]:
-        """(sport, event id) for games inside the props window before kickoff."""
-        if not self.cfg.props_enabled:
+    def _prop_tiers(self, now: datetime) -> list[tuple[str, str, bool]]:
+        """(sport, event id, near_kickoff) for games inside a props window."""
+        cfg = self.cfg
+        if not cfg.props_enabled:
             return []
-        window = timedelta(hours=self.cfg.prop_hours)
-        return [(sport, gid) for sport in self.cfg.prop_sports if sport in self.games
-                and self.cfg.prop_markets.get(sport)
-                for gid, start in self.games[sport] if now < start <= now + window]
+        near = timedelta(hours=cfg.prop_hours)
+        early = timedelta(hours=max(cfg.prop_hours, cfg.prop_early_hours if cfg.prop_early_minutes else 0))
+        return [(sport, gid, start - now <= near) for sport in cfg.prop_sports if sport in self.games
+                and cfg.prop_markets.get(sport)
+                for gid, start in self.games[sport] if now < start <= now + early]
 
-    def _prop_rate(self, t: datetime) -> float:
-        """Credits per second spent on props at time t (at full speed)."""
-        return sum(self.cfg.prop_credits_per_call(sport) / (self.cfg.prop_minutes * 60)
-                   for sport, _ in self._prop_games(t))
+    def _prop_games(self, now: datetime) -> list[tuple[str, str]]:
+        return [(sport, gid) for sport, gid, _ in self._prop_tiers(now)]
+
+    def _prop_every(self, near: bool) -> float:
+        if near:
+            return self.cfg.prop_minutes * 60 * self.scale
+        return self.cfg.prop_early_minutes * 60 * self.extra_scale
+
+    def _prop_rates(self, t: datetime) -> tuple[float, float]:
+        """Credits per second on props at time t at full speed: (near kickoff, early)."""
+        near = early = 0.0
+        for sport, _, is_near in self._prop_tiers(t):
+            cost = self.cfg.prop_credits_per_call(sport)
+            if is_near:
+                near += cost / (self.cfg.prop_minutes * 60)
+            else:
+                early += cost / (self.cfg.prop_early_minutes * 60)
+        return near, early
 
     def props_due(self, now: datetime) -> list[tuple[str, str]]:
         ts = time.time()
-        every = self.cfg.prop_minutes * 60 * self.scale
-        return [(sport, gid) for sport, gid in self._prop_games(now)
-                if ts - self.last_props.get(gid, 0) >= every]
+        return [(sport, gid) for sport, gid, near in self._prop_tiers(now)
+                if ts - self.last_props.get(gid, 0) >= self._prop_every(near)]
 
     def fetch_props(self, games: list[tuple[str, str]]) -> list[dict]:
         def one(item):
@@ -2102,13 +2172,13 @@ class Scheduler:
         ts = time.time()
         waits = [self.last_odds[s] + self.interval(st) - ts
                  for s in self.cfg.sports if (st := self.state(s, now))]
-        if self.cfg.props_enabled:
-            every = self.cfg.prop_minutes * 60 * self.scale
-            waits += [self.last_props.get(gid, 0) + every - ts for _, gid in self._prop_games(now)]
+        waits += [self.last_props.get(gid, 0) + self._prop_every(near) - ts
+                  for _, gid, near in self._prop_tiers(now)]
         return min([15.0] + waits)
 
     def fetch(self, sports: list[str], now: datetime) -> list[dict]:
-        until = now + timedelta(hours=self.cfg.pregame_hours if self.cfg.pregame_minutes else 0, minutes=1)
+        ahead = max(self.cfg.pregame_hours if self.cfg.pregame_minutes else 0, self.cfg.lookahead_hours)
+        until = now + timedelta(hours=ahead, minutes=1)
 
         def one(sport: str) -> tuple[str, list[dict] | Exception]:
             try:
@@ -2214,8 +2284,9 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
           f"{'bookmakers' if cfg.bookmakers else cfg.regions})")
     print(f"Credits left: {sched.api.remaining if sched.api.remaining is not None else '?'} "
           f"| plan resets {next_reset(cfg, now):%b %d} (UTC)")
-    print("\nNext 24h, when each sport will be checked (L = live every "
-          f"{cfg.poll_seconds}s, p = pre-game every {cfg.pregame_minutes}m):")
+    print("\nNext 24h, when each sport will be checked:\n"
+          f"  L = live every {cfg.poll_seconds}s · p = near kickoff every {cfg.pregame_minutes}m · "
+          f"e = upcoming every {cfg.early_minutes}m · f = 1-2 days out every {cfg.far_minutes}m")
     hours = [now + timedelta(hours=h) for h in range(24)]
     print("            " + "".join(f"{h.astimezone(tz):%H}"[0] for h in hours))
     print("            " + "".join(f"{h.astimezone(tz):%H}"[1] for h in hours))
@@ -2223,18 +2294,22 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
         row = ""
         for h in hours:
             states = {sched.state(sport, h + timedelta(minutes=m)) for m in range(0, 60, 10)}
-            row += "L" if LIVE in states else ("p" if PREGAME in states else "·")
+            row += next((c for st, c in ((LIVE, "L"), (PREGAME, "p"), (EARLY, "e"), (FAR, "f"))
+                         if st in states), "·")
         n = len(sched.games[sport])
         print(f"  {short(sport):<9} {row}   {n} game{'s' if n != 1 else ''}")
     if cfg.props_enabled:
         prop_games = {gid for h in range(0, 24 * 60, 10) for _, gid in sched._prop_games(now + timedelta(minutes=h))}
-        print(f"\nProps: {len(prop_games)} games in the next 24h, checked every {cfg.prop_minutes}m "
-              f"in the {cfg.prop_hours:g}h before kickoff ({', '.join(short(s) for s in cfg.prop_sports)}).")
+        print(f"\nProps: {len(prop_games)} games in the next 24h ({', '.join(short(s) for s in cfg.prop_sports)}): "
+              f"every {cfg.prop_early_minutes // 60}h from {cfg.prop_early_hours:g}h out, "
+              f"every {cfg.prop_minutes}m in the last {cfg.prop_hours:g}h.")
     print(f"\nFull speed would use {sched.forecast:,.0f} credits in the next 24h; "
           f"you can afford {sched.allowance:,.0f}/day.")
-    if sched.scale > 1:
-        print(f"→ Will slow down {sched.scale:.2f}×: live checks every "
-              f"{sched.interval(LIVE):.0f}s instead of {cfg.poll_seconds}s.")
+    if sched.scale > 1 or sched.extra_scale > 1:
+        print(f"→ Upcoming-game checks slowed {sched.extra_scale:.1f}× first "
+              f"(every {sched.interval(EARLY) / 60:.0f}m instead of {cfg.early_minutes}m).")
+        print(f"→ Live checks every {sched.interval(LIVE):.0f}s"
+              + (f" instead of {cfg.poll_seconds}s." if sched.scale > 1 else " (full speed)."))
     else:
         print(f"→ Fits the budget at full speed (live checks every {cfg.poll_seconds}s).")
 
@@ -2344,7 +2419,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         refreshed = any(time.time() - t >= cfg.events_refresh_minutes * 60 for t in sched.events_at.values())
         sched.refresh_events()
         if refreshed or time.time() - sched.budget_at > 300:
-            old = sched.scale
+            old, old_extra = sched.scale, sched.extra_scale
             sched.update_budget(now)
             if sched.scale == math.inf:
                 if not status.budget_warned:
@@ -2353,17 +2428,25 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 time.sleep(3600)
                 continue
             status.budget_warned = False
-            if abs(sched.scale - old) > 0.05:
+            if abs(sched.scale - old) > 0.05 or abs(sched.extra_scale - old_extra) > 0.05:
                 print(f"Budget: {sched.allowance:,.0f} credits/day, next 24h needs "
                       f"{sched.forecast:,.0f} at full speed → live checks every "
-                      f"{sched.interval(LIVE):.0f}s", flush=True)
+                      f"{sched.interval(LIVE):.0f}s, upcoming games every "
+                      f"{sched.interval(EARLY) / 60:.0f}m", flush=True)
 
         due = [s for s in cfg.sports if sched.state(s, now)] if args.once else sched.due(now)
+        prop_games = sched._prop_games(now) if args.once else sched.props_due(now)
+        sched.need_close = tracker.needs_close()
+        # Main lines and props go out together, so neither waits on the other.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            main_job = pool.submit(sched.fetch, due, now) if due else None
+            prop_job = pool.submit(sched.fetch_props, prop_games) if prop_games else None
+            main_events = main_job.result() if main_job else []
+            fetched_props = prop_job.result() if prop_job else []
         if due:
             idle_logged = False
             t0 = time.time()
-            sched.need_close = tracker.needs_close()
-            events = sched.fetch(due, now)
+            events = main_events
             arbs = find_arbs(events, cfg)
             sent = alerter.handle(arbs, checked_sports=due)
             outs = find_outliers(events, cfg)
@@ -2400,10 +2483,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             print(f"[{datetime.now():%H:%M:%S}] No games live or starting soon. Waiting (no credits used).",
                   flush=True)
 
-        prop_games = sched._prop_games(now) if args.once else sched.props_due(now)
         if prop_games:
             t0 = time.time()
-            prop_events = sched.fetch_props(prop_games)
+            prop_events = fetched_props
             checked = {gid for _, gid in prop_games}
             p_outs = find_outliers(prop_events, cfg)
             n_arb = prop_arbs.handle(find_arbs(prop_events, cfg), checked_events=checked)
