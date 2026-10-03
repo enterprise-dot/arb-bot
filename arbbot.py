@@ -26,10 +26,11 @@ import argparse
 import calendar
 import csv
 import gzip
-import http.client
+import hashlib
 import itertools
 import json
 import math
+import re
 import os
 import sys
 import time
@@ -113,6 +114,37 @@ def set_env_value(path: Path, key: str, value: str) -> None:
     lines = [l for l in lines if _env_key(l) != key]
     lines.append(f"{key}={value}")
     path.write_text("\n".join(lines) + "\n")
+
+
+def check_settings(changes: dict[str, str]) -> tuple[str, list[str]]:
+    """Would these new values load? Returns (the problem with one of them, or "", and problems
+    with OTHER settings already in .env). Each key is checked on its own merits: a bad setting
+    elsewhere doesn't hide (or block) a bad new one."""
+    saved = {k: os.environ.get(k) for k in changes}
+    os.environ.update(changes)
+    removed: dict[str, str | None] = {}
+    others: list[str] = []
+    try:
+        for _ in range(50):
+            try:
+                Config.from_env()
+                return "", others
+            except ValueError as ex:
+                msg = str(ex)
+                key = msg.split("=", 1)[0].split(":", 1)[0].strip()
+                if key in changes:
+                    return msg, others
+                if key not in os.environ or key in removed:
+                    return "", others + [msg]   # can't isolate it; it isn't one of the new values
+                others.append(msg)
+                removed[key] = os.environ.pop(key)   # set the other bad one aside and look again
+        return "", others
+    finally:
+        for k, v in {**removed, **saved}.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def set_webhook(channel: str) -> None:
@@ -282,15 +314,19 @@ class Config:
         e = os.environ.get
         d = cls()
 
+        def number(v: str, typ, bad: str):
+            try:
+                f = float(v)
+            except ValueError:
+                raise ValueError(bad) from None
+            if not math.isfinite(f) or (typ is int and not f.is_integer()):
+                raise ValueError(bad + (" (a whole number)" if typ is int else ""))
+            return int(f) if typ is int else f
+
         def num(key: str, default, typ):
             """A number setting; empty means the default."""
             v = (e(key) or "").strip()
-            if not v:
-                return default
-            try:
-                return typ(float(v)) if typ is int else typ(v)
-            except ValueError:
-                raise ValueError(f"{key}={v} should be a number") from None
+            return number(v, typ, f"{key}={v} should be a number") if v else default
 
         def pairs(key: str, typ) -> dict:
             """A name=value list (BUDGET_WEIGHTS=sat=1.6,sun=1.6). Commas or semicolons."""
@@ -299,12 +335,10 @@ class Config:
                 if not x.strip():
                     continue
                 k, sep, v = x.partition("=")
-                try:
-                    out[k.strip()] = typ(float(v)) if typ is int else typ(v)
-                except ValueError:
-                    raise ValueError(f"{key}: '{x.strip()}' should look like name=number") from None
+                bad = f"{key}: '{x.strip()}' should look like name=number"
                 if not sep or not k.strip():
-                    raise ValueError(f"{key}: '{x.strip()}' should look like name=number")
+                    raise ValueError(bad)
+                out[k.strip()] = number(v.strip(), typ, bad)
             return out
         cfg = cls(
             api_key=e("ODDS_API_KEY", ""),
@@ -371,7 +405,7 @@ class Config:
             min_confidence=e("MIN_CONFIDENCE", d.min_confidence).strip().lower(),
             sport_min_ev={**d.sport_min_ev, **pairs("SPORT_MIN_EV", float)},
             move_window_minutes=num("MOVE_WINDOW_MINUTES", d.move_window_minutes, int),
-            confidence_stakes=e("CONFIDENCE_STAKES", d.confidence_stakes),
+            confidence_stakes=(e("CONFIDENCE_STAKES") or d.confidence_stakes).replace(";", ","),
             unit_size=num("UNIT_SIZE", d.unit_size, float),
             bet_at_sharp=e("BET_AT_SHARP", "false").lower() in ("1", "true", "yes"),
             ev_books=e("EV_BOOKS", ""),
@@ -416,7 +450,30 @@ class Config:
             active_hours=e("ACTIVE_HOURS", "").strip(),
             timezone=e("TIMEZONE", d.timezone),
         )
+        cfg.check()
         return cfg.with_mode()
+
+    def check(self) -> None:
+        """Catch settings that would otherwise crash the bot later (raises ValueError naming one)."""
+        for key, v in (("POLL_SECONDS", self.poll_seconds), ("PROP_MINUTES", self.prop_minutes)):
+            if v < 1:
+                raise ValueError(f"{key}={v} should be at least 1")
+        try:
+            ZoneInfo(self.timezone)
+        except Exception:  # noqa: BLE001 - unknown or malformed names raise several types
+            raise ValueError(f"TIMEZONE={self.timezone} isn't a time zone name (like America/New_York)") from None
+        if self.active_hours:
+            try:
+                start_s, end_s = self.active_hours.split("-")
+                dtime.fromisoformat(start_s.strip()), dtime.fromisoformat(end_s.strip())
+            except ValueError:
+                raise ValueError(f"ACTIVE_HOURS={self.active_hours} should look like 08:00-22:00") from None
+        try:
+            stakes = [float(x) for x in _csv(self.confidence_stakes)]
+        except ValueError:
+            stakes = []
+        if len(stakes) != 3 or not all(math.isfinite(x) and x >= 0 for x in stakes):
+            raise ValueError(f"CONFIDENCE_STAKES={self.confidence_stakes} should be 3 numbers, like 1,0.75,0.5")
 
     def with_mode(self) -> "Config":
         """Apply ALERT_MODE. "locks" raises every bar to at least the levels below (your own
@@ -560,6 +617,10 @@ class Arb:
             room = 1 / (1 + keep_pct / 100) - sum(1 / l.price for j, l in enumerate(self.legs) if j != i)
             return 1 / room if room > 0 else None
         worst = self.total_stake * (1 + keep_pct / 100) / leg.stake
+        if worst >= leg.price:
+            # This leg's printed stake returns less than keep_pct over the total (rounding, or a
+            # thin arb): any drop costs money, so the line is break-even.
+            worst = self.total_stake / leg.stake
         return worst if worst < leg.price else None
 
     @property
@@ -987,6 +1048,8 @@ class OpenArb:
     message_id: str | None = None
     url: str = ""             # webhook the message was posted with (edits must use the same one)
     alerted_pct: float = 0.0  # edge when we last sent a (pinging) alert
+    card: str = ""            # hash of the card as last sent; a different one means edit it
+    retry: bool = False       # the first post failed before Discord got it: safe to send again
 
 
 def data_path(name: str) -> Path:
@@ -1039,6 +1102,7 @@ class Alerter:
     log_on_open = False  # arbs are logged when they close, so the row has how long it lasted
 
     RESTORE_GRACE = 900  # seconds a restored alert gets to show up again before it's marked gone
+    scoped = True        # handle() is told which sports/games were checked (parlays: no)
 
     def __init__(self, cfg: Config, dry_run: bool, noun: str | None = None):
         self.cfg = cfg
@@ -1051,6 +1115,7 @@ class Alerter:
         self.max_per_hour = 0          # 0 = no cap
         self.posted_at: list[float] = []
         self.handed: dict[str, float] = {}  # key -> first_seen, for bets taken over from a sibling alerter
+        self.send_retryable = False
         self.reset_stats()
         self._load_state()
 
@@ -1077,8 +1142,9 @@ class Alerter:
         if not path:
             return
         data = {k: {"message_id": op.message_id, "url": op.url, "first_seen": op.first_seen,
-                    "alerted_pct": op.alerted_pct, "best_pct": op.best_pct,
-                    "fingerprint": op.arb.fingerprint, "label": self.label(op.arb)}
+                    "alerted_pct": op.alerted_pct, "best_pct": op.best_pct, "card": op.card,
+                    "label": self.label(op.arb), "sport_key": op.arb.sport_key,
+                    "event_id": op.arb.event_id, "commence_time": getattr(op.arb, "commence_time", "")}
                 for k, op in self.open.items() if op.message_id}
         data.update(self.restored)
         try:
@@ -1096,22 +1162,40 @@ class Alerter:
             return None
         op = OpenArb(arb, saved["first_seen"], now, max(saved.get("best_pct", 0), self.value(arb)),
                      message_id=saved.get("message_id"), url=saved.get("url", ""),
-                     alerted_pct=saved.get("alerted_pct", self.value(arb)))
+                     alerted_pct=saved.get("alerted_pct", self.value(arb)),
+                     card=self.card_hash(arb, saved["first_seen"]))
         self.open[arb.key] = op
-        if saved.get("fingerprint") != arb.fingerprint and op.message_id:
+        if saved.get("card") != op.card and op.message_id:
             self._discord(self.payload(arb, first_seen=op.first_seen), op.message_id, op.url)
         return op
 
+    def _drop_restored(self, key: str, why: str) -> None:
+        saved = self.restored.pop(key)
+        if saved.get("message_id"):
+            self._discord(_gone_card(f"❌ GONE · {saved.get('label', 'alert')}", why),
+                          saved["message_id"], saved.get("url", ""))
+
     def _expire_restored(self, now: float) -> None:
-        """Alerts that closed while the bot was down: mark their cards gone."""
-        if not self.restored or now - self.started < self.RESTORE_GRACE:
+        """Saved alerts nobody has seen again: their game is over, or (for state saved by an
+        older version, and parlays) the grace period after the restart has passed."""
+        if not self.restored:
             return
+        grace_over = now - self.started >= self.RESTORE_GRACE
         for key, saved in list(self.restored.items()):
-            if saved.get("message_id"):
-                self._discord(_gone_card(f"❌ GONE · {saved.get('label', 'alert')}",
-                                         "Ignore this one. It closed while the bot was restarting."),
-                              saved["message_id"], saved.get("url", ""))
-            del self.restored[key]
+            if self.scoped and saved.get("sport_key") and saved.get("commence_time"):
+                end = (_parse_time(saved["commence_time"])
+                       + timedelta(minutes=self.cfg.minutes_for(saved["sport_key"])))
+                if end.timestamp() > now:
+                    continue   # closes when its sport or game is next checked (see handle)
+            elif not grace_over:
+                continue
+            self._drop_restored(key, "Ignore this one. It closed while the bot was restarting.")
+
+    def card_hash(self, item, first_seen: float | None) -> str:
+        """Everything the card shows, so any visible change (a book's price on the list, the
+        confidence, related alerts...) edits it."""
+        emb = {k: v for k, v in self.payload(item, first_seen=first_seen)["embeds"][0].items() if k != "timestamp"}
+        return hashlib.sha1(json.dumps(emb, sort_keys=True).encode()).hexdigest()[:16]
 
     # ---- hooks (overridden for +EV)
     def text(self, item) -> str:
@@ -1151,6 +1235,7 @@ class Alerter:
         return self.cfg.webhook_url
 
     def _discord(self, payload: dict, message_id: str | None = None, url: str = "") -> str | None:
+        self.send_retryable = False
         if self.dry_run:
             return None
         url = url or self.cfg.webhook_url
@@ -1159,9 +1244,14 @@ class Alerter:
                 _webhook(url, payload, "PATCH", message_id)
                 return message_id
             msg = _webhook(url, payload)
+            self.send_retryable = not msg   # rate-limited three times: Discord never took it
             return msg.get("id") if msg else None
         except Exception as e:  # keep scanning even if Discord hiccups
             print(f"  ! Discord send failed: {e}", file=sys.stderr)
+            # urllib wraps errors before Discord has the message (refused, DNS, an HTTP error
+            # reply) in URLError. A timeout or drop while reading the reply isn't: the post may
+            # have gone through, so sending it again could double the alert.
+            self.send_retryable = isinstance(e, urllib.error.URLError)
             return message_id
 
     def handle(self, arbs: list[Arb], checked_sports: list[str] | None = None,
@@ -1186,6 +1276,7 @@ class Alerter:
                 op = OpenArb(arb, first, now, self.value(arb), alerted_pct=self.value(arb),
                              url=self.webhook_for(arb))
                 op.message_id = self._discord(self.payload(arb, self.mention(), first_seen=first), url=op.url)
+                op.card, op.retry = self.card_hash(arb, first), op.message_id is None and self.send_retryable
                 self.open[arb.key] = op
                 if self.log_on_open and handed is None:   # a handed-over bet was logged already
                     self._log(op, now, None)
@@ -1194,8 +1285,9 @@ class Alerter:
                     self.stats["best_pct"], self.stats["best"] = self.value(arb), arb.matchup
                 new += 1
             else:
-                changed = cur.arb.fingerprint != arb.fingerprint
                 self.carry(cur.arb, arb)
+                card = self.card_hash(arb, cur.first_seen)
+                changed = card != cur.card
                 cur.arb, cur.last_seen = arb, now
                 cur.best_pct = max(cur.best_pct, self.value(arb))
                 if self.value(arb) >= cur.alerted_pct + self.cfg.realert_jump_pct:
@@ -1205,19 +1297,23 @@ class Alerter:
                     if cur.message_id:
                         self._discord({"embeds": [{"title": "⬆️ Better price: see the newer alert below",
                                                    "color": 0x95A5A6}]}, cur.message_id, cur.url)
-                    cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=now),
+                    cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=cur.first_seen),
                                                    url=cur.url)
+                    cur.card, cur.retry = card, cur.message_id is None and self.send_retryable
                     cur.alerted_pct = self.value(arb)
                     new += 1
-                elif changed or not cur.message_id:
-                    if cur.message_id:
+                elif changed or cur.retry:
+                    if changed:
                         print(f"  ↻ updated: {self.label(arb)} now {self.value(arb):.2f}%", flush=True)
+                    if cur.message_id:
                         self._discord(self.payload(arb, first_seen=cur.first_seen), cur.message_id, cur.url)
-                    elif not self.dry_run:
-                        # The first post never landed (network error, rate limit): retry it, with
-                        # the ping, and keep its id so later edits and the GONE mark reach it.
+                    elif cur.retry:
+                        # The first post never reached Discord (refused, rate limited): send it
+                        # again, with the ping, and keep its id so edits and the GONE mark reach it.
                         cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=cur.first_seen),
                                                        url=cur.url)
+                        cur.retry = cur.message_id is None and self.send_retryable
+                    cur.card = card
 
         checked = set(checked_sports) if checked_sports is not None else None
         for key in list(self.open):
@@ -1227,6 +1323,16 @@ class Alerter:
             if checked_events is not None and op.arb.event_id not in checked_events:
                 continue  # that game wasn't re-checked this round
             self._close(key, now)
+        # Alerts saved before a restart that this check looked for and didn't find.
+        if self.scoped and (checked is not None or checked_events is not None):
+            for key, saved in list(self.restored.items()):
+                if not saved.get("sport_key"):
+                    continue   # saved by an older version: the grace period decides
+                if checked is not None and saved["sport_key"] not in checked:
+                    continue
+                if checked_events is not None and saved.get("event_id") not in checked_events:
+                    continue
+                self._drop_restored(key, "Ignore this one. The prices moved while the bot was restarting.")
         self.handed.clear()
         self._expire_restored(now)
         self._save_state()
@@ -1419,12 +1525,19 @@ def kelly_stake(fair_prob: float, price: float, cfg: Config, mult: float = 1.0) 
     (confidence, single source) so smaller-confidence bets are smaller even at the cap."""
     edge = (fair_prob * price - 1) / (price - 1)
     cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
-    stake = min(cfg.ev_bankroll * cfg.kelly_fraction * max(0.0, edge), cap) * mult
-    if cfg.round_stakes > 0 and stake >= cfg.round_stakes:
-        r = round(stake / cfg.round_stakes) * cfg.round_stakes
+    return round_stake(min(cfg.ev_bankroll * cfg.kelly_fraction * max(0.0, edge), cap) * mult, cap, cfg)
+
+
+def round_stake(stake: float, cap: float, cfg: Config) -> float:
+    """Round to ROUND_STAKES (else whole dollars, else cents) without ever going over cap."""
+    stake = min(stake, cap)
+    rs = cfg.round_stakes
+    if rs > 0 and stake >= rs:
+        r = round(stake / rs) * rs
         if r > cap:
-            r = math.floor(cap / cfg.round_stakes) * cfg.round_stakes
-        return float(r)
+            r = math.floor(cap / rs) * rs
+        if r > 0:
+            return float(r)
     r = float(round(stake)) if stake >= 1 else round(stake, 2)
     return min(r, float(math.floor(cap)) if cap >= 1 else round(cap, 2))
 
@@ -2059,22 +2172,33 @@ class Parlay:
         return f"{money(self.stake)}{units}"
 
 
+def _parlay_leg_keys(key: str) -> tuple[str, list[str]]:
+    """(book, leg keys) from a Parlay.key ("parlay|<book>|ev|...|ev|...")."""
+    _, book, rest = key.split("|", 2)
+    return book, re.split(r"\|(?=ev\|)", rest)
+
+
 def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = frozenset(),
                  now: datetime | None = None) -> list[Parlay]:
     """Best +EV parlays from the current +EV bets: same book, different games, pre-game only.
     keep = keys of parlays already posted (kept ahead of new ones while they still qualify)."""
     if not cfg.parlays_enabled:
         return []
+
+    def leg_row(b: "EVBet", book: str | None = None):
+        """(book, price, link) rows where this bet is a good parlay leg."""
+        if b.is_live or (now is not None and _parse_time(b.commence_time) <= now):
+            return []   # pre-game only (and it may have started since it was alerted)
+        return [(bk, price, link) for bk, price, ev, link, ok in b.board  # boards only hold EV_BOOKS
+                if (book is None or bk == book) and ok and price <= cfg.ev_max_odds
+                and cfg.parlay_leg_min_ev_pct <= ev <= cfg.max_ev_pct]
+
+    by_key = {b.key: b for b in bets}
     per_book: dict[str, list[tuple["EVBet", float, str]]] = {}
-    for b in bets:
-        if b.is_live:
-            continue
-        if now is not None and _parse_time(b.commence_time) <= now:
-            continue  # started since it was alerted
-        for book, price, ev, link, ok in b.board:
-            if ok and ev >= cfg.parlay_leg_min_ev_pct:  # boards only hold books allowed by EV_BOOKS
-                per_book.setdefault(book, []).append((b, price, link))
-    found: list[Parlay] = []
+    for b in by_key.values():
+        for bk, price, link in leg_row(b):
+            per_book.setdefault(bk, []).append((b, price, link))
+    found: dict[str, Parlay] = {}
     for book, legs in per_book.items():
         legs = sorted(legs, key=lambda x: (x[0].fair_prob * x[1]), reverse=True)[:8]  # keep it small
         for n in range(2, cfg.parlay_max_legs + 1):
@@ -2083,16 +2207,33 @@ def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = froze
                     continue  # same game: legs are correlated and books price them differently
                 p = Parlay(book, list(combo), unit_size=cfg.unit_size)
                 if p.ev_pct >= cfg.parlay_min_ev_pct:
-                    found.append(p)
+                    found[p.key] = p
+    # Parlays already posted are re-scored from today's prices directly, even if their legs
+    # fell outside the top few used above.
+    for key in keep:
+        try:
+            book, leg_keys = _parlay_leg_keys(key)
+        except ValueError:
+            continue
+        legs = []
+        for lk in leg_keys:
+            rows = leg_row(by_key[lk], book) if lk in by_key else []
+            if not rows:
+                break
+            legs.append((by_key[lk], rows[0][1], rows[0][2]))
+        else:
+            p = Parlay(book, legs, unit_size=cfg.unit_size)
+            if p.key == key and p.ev_pct >= cfg.parlay_min_ev_pct:
+                found[key] = p
     # Parlays already posted that still qualify first (replacing one with a slightly better
     # combo would kill a good card), then best first; a leg is never reused across alerts.
     out, used = [], set()
-    for p in sorted(found, key=lambda p: (p.key in keep, p.ev_pct), reverse=True):
+    for p in sorted(found.values(), key=lambda p: (p.key in keep, p.ev_pct), reverse=True):
         keys = {b.key for b, _, _ in p.legs}
         if keys & used:
             continue
-        p.stake = min(kelly_stake(p.fair_prob, p.price, cfg),
-                      round(cfg.ev_bankroll * cfg.parlay_max_stake_pct / 100))
+        p.stake = round_stake(kelly_stake(p.fair_prob, p.price, cfg),
+                              cfg.ev_bankroll * cfg.parlay_max_stake_pct / 100, cfg)
         out.append(p)
         used |= keys
         if len(out) >= cfg.parlay_max_alerts:
@@ -2134,6 +2275,7 @@ LEG_FIELDS = ["event_id", "sport_key", "matchup", "home_team", "away_team", "com
 
 class ParlayAlerter(Alerter):
     noun = "parlays"
+    scoped = False
     log_fields = PARLAY_FIELDS
     log_on_open = True
 
@@ -2672,12 +2814,12 @@ class ClosingTracker:
                     continue
                 k = (r["market"], _row_line(r))
                 p = fair.get(k, {}).get(r["outcome"])
-                if p is None:
-                    # No sharp price on this line (common for props): use the market consensus,
-                    # the same fallback the alert itself used.
+                if p is None and r.get("player"):
+                    # No sharp price on this prop: use the market consensus, the same fallback
+                    # (and minimum number of books) a prop alert uses. Main lines only ever use
+                    # the sharp price, so for those the last sharp reading stands.
                     if market is None:
-                        cons = replace(self.cfg, consensus_min_books=self.cfg.consensus_min_books or 3)
-                        market = consensus_fair(ev, cons, now, False, set(_csv(self.cfg.sharp_books)))
+                        market = consensus_fair(ev, self.cfg.for_props(), now, False, set(_csv(self.cfg.sharp_books)))
                     p = market.get(k, ({}, 0))[0].get(r["outcome"])
                 if p:
                     self.latest[bid] = (p, now)
@@ -2827,7 +2969,9 @@ class Scheduler:
         self.ended: set[str] = set()
         self.need_close: set[str] = set()  # event ids wanting a last pre-kickoff check (CLV)
         self.need_close_props: set[str] = set()  # the same, for games with a logged prop bet
-        self.last_props: dict[str, float] = {}  # event id -> last prop check
+        self.last_props: dict[str, float] = {}  # event id -> last prop check (worked or not)
+        self.props_ok: dict[str, float] = {}    # event id -> last prop check that worked
+        self.odds_ok: dict[str, float] = {s: 0.0 for s in cfg.sports}  # sport -> last good odds check
         self.bad_prop_sports: set[str] = set()  # sports whose prop request the API rejected
         self.scale = 1.0         # slow-down for live and near-kickoff checks
         self.extra_scale = 1.0   # slow-down for early/far-out checks (stretched first)
@@ -2879,15 +3023,16 @@ class Scheduler:
                 continue
             try:
                 evs = self.api.events(sport, horizon_hours=max(26, self.cfg.lookahead_hours + 2))
+                games = [(ev["id"], _parse_time(ev["commence_time"])) for ev in evs]
             except urllib.error.HTTPError as e:
                 if e.code == 401:
                     raise
                 print(f"! Couldn't load {sport} schedule: {e.code}", file=sys.stderr)
                 continue
-            except (OSError, http.client.HTTPException, ValueError) as e:  # timeouts, drops, bad JSON
-                print(f"! Network error loading {sport} schedule: {getattr(e, 'reason', e)}", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001 - timeouts, drops, cut-off or odd data: keep the last good schedule
+                print(f"! Couldn't load {sport} schedule: {getattr(e, 'reason', e)!r:.200}", file=sys.stderr)
                 continue
-            self.games[sport] = [(ev["id"], _parse_time(ev["commence_time"])) for ev in evs]
+            self.games[sport] = games
             self.events_at[sport] = now
 
     def note_feed(self, sport: str, events: list[dict], now: datetime) -> None:
@@ -2980,7 +3125,7 @@ class Scheduler:
         out = [(sport, gid) for sport, gid, near in self._prop_tiers(now)
                if ts - self.last_props.get(gid, 0) >= self._prop_every(near)]
         cfg = self.cfg
-        if cfg.closing_minutes and self.need_close_props:
+        if cfg.closing_minutes and self.need_close_props and cfg.props_enabled and not cfg.live_only:
             # One last prop check just before kickoff for games with a logged prop bet (CLV).
             window = timedelta(minutes=cfg.closing_minutes)
             have = {gid for _, gid in out}
@@ -2988,7 +3133,8 @@ class Scheduler:
                     if sport in self.games and cfg.prop_markets.get(sport) and sport not in self.bad_prop_sports
                     for gid, start in self.games[sport]
                     if gid in self.need_close_props and gid not in have and now < start <= now + window
-                    and self.last_props.get(gid, 0) < (start - window).timestamp()]
+                    and self.props_ok.get(gid, 0) < (start - window).timestamp()   # no good look yet
+                    and ts - self.last_props.get(gid, 0) >= 60]                     # retry a failure each minute
         return out
 
     def fetch_props(self, games: list[tuple[str, str]]) -> tuple[list[dict], set[str]]:
@@ -3017,10 +3163,11 @@ class Scheduler:
                               f"Skipping {sport} props until restart.", file=sys.stderr)
                     else:
                         print(f"! Props error for {sport} {gid}: {result.code}", file=sys.stderr)
-                elif isinstance(result, Exception):
-                    print(f"! Props error for {sport} {gid}: {result}", file=sys.stderr)
+                elif isinstance(result, Exception) or not isinstance(result, dict):
+                    print(f"! Props error for {sport} {gid}: {result!r:.200}", file=sys.stderr)
                 elif isinstance(result, dict):
                     ok.add(gid)   # an answer with no books is still a real "nothing there"
+                    self.props_ok[gid] = time.time()
                     if result.get("bookmakers"):
                         events.append(apply_fees([result], self.cfg)[0])
         return events, ok
@@ -3044,12 +3191,13 @@ class Scheduler:
 
     def closing_due(self, sport: str, now: datetime) -> bool:
         """A game with a logged bet starts within CLOSING_MINUTES and we haven't looked since."""
-        if not self.cfg.closing_minutes or not self.need_close:
+        if not self.cfg.closing_minutes or not self.need_close or self.cfg.live_only:
             return False
         window = timedelta(minutes=self.cfg.closing_minutes)
-        return any(gid in self.need_close and now < start <= now + window
-                   and self.last_odds[sport] < (start - window).timestamp()
-                   for gid, start in self.games[sport])
+        return (time.time() - self.last_odds[sport] >= 60      # a failed look is retried each minute
+                and any(gid in self.need_close and now < start <= now + window
+                        and self.odds_ok[sport] < (start - window).timestamp()
+                        for gid, start in self.games[sport]))
 
     def due(self, now: datetime) -> list[str]:
         ts = time.time()
@@ -3088,10 +3236,11 @@ class Scheduler:
                     if result.code in (401, 429):
                         raise result
                     print(f"! Odds error for {sport}: {result.code}", file=sys.stderr)
-                elif isinstance(result, Exception):
-                    print(f"! Odds error for {sport}: {result}", file=sys.stderr)
+                elif isinstance(result, Exception) or not isinstance(result, list):
+                    print(f"! Odds error for {sport}: {result!r:.200}", file=sys.stderr)
                 else:
                     ok.add(sport)
+                    self.odds_ok[sport] = time.time()
                     apply_fees(result, self.cfg)
                     self.note_feed(sport, result, now)
                     events.extend(result)
@@ -3264,6 +3413,8 @@ def close_started(now: datetime, *alerters: Alerter) -> set[str]:
     kickoff, and no later prop check looks at that game again."""
     started = {op.arb.event_id for a in alerters for op in a.open.values()
                if _parse_time(op.arb.commence_time) <= now}
+    started |= {saved["event_id"] for a in alerters for saved in a.restored.values()
+                if saved.get("event_id") and saved.get("commence_time") and _parse_time(saved["commence_time"]) <= now}
     if started:
         for a in alerters:
             a.handle([], checked_events=started)
@@ -3291,8 +3442,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     parlay_alerter.max_per_hour = cfg.max_parlay_per_hour
 
     def update_parlays() -> int:
-        open_bets = [op.arb for a in (ev_alerter, prop_evs) for op in a.open.values()]
-        return parlay_alerter.handle(find_parlays(open_bets, cfg, keep=set(parlay_alerter.open),
+        # Outliers too: a leg that grew into an outlier is still the same bet (find_parlays
+        # applies the +EV price limits to every leg).
+        open_bets = [op.arb for a in (ev_alerter, prop_evs, out_alerter, prop_outs) for op in a.open.values()]
+        return parlay_alerter.handle(find_parlays(open_bets, cfg,
+                                                  keep=set(parlay_alerter.open) | set(parlay_alerter.restored),
                                                   now=datetime.now(timezone.utc)))
 
     if args.demo:
@@ -3421,6 +3575,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             fetched_props, fetched_gids = prop_job.result() if prop_job else ([], set())
         # Only sports/games whose request worked count as checked: a timeout isn't "the bet is gone".
         checked_sports = [s for s in due if s in fetched_sports]
+        close_started(now, prop_arbs, prop_evs, prop_outs)   # first, so no new card names them
         if due:
             idle_logged = False
             t0 = time.time()
@@ -3466,7 +3621,6 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             print(f"[{datetime.now():%H:%M:%S}] No games live or starting soon. Waiting (no credits used).",
                   flush=True)
 
-        close_started(now, prop_arbs, prop_evs, prop_outs)
         if prop_games:
             t0 = time.time()
             prop_events = [ev for ev in fetched_props if _parse_time(ev["commence_time"]) > now]
@@ -3530,20 +3684,21 @@ def main() -> None:
         return
 
     if args.set:
+        changes = {}
         for item in args.set:
             key, sep, value = item.partition("=")
             key = key.strip().upper()
             if not sep or not key.replace("_", "").isalnum():
                 sys.exit(f"Use KEY=VALUE, like MY_BOOKS=fanduel,draftkings (got: {item!r}). Nothing was changed.")
-            os.environ[key] = value.strip()
-            try:
-                Config.from_env()   # check it before saving, so a typo can't stop the bot starting
-            except ValueError as ex:
-                if str(ex).startswith((key + "=", key + ":")):
-                    sys.exit(f"Bad value: {ex}. Nothing was changed.")
-                print(f"Note: another setting needs fixing too: {ex}")
-            set_env_value(HERE / ".env", key, value.strip())
-            print(f"Saved {key}={value.strip()}")
+            changes[key] = value.strip()
+        problem, others = check_settings(changes)
+        if problem:
+            sys.exit(f"Bad value: {problem}. Nothing was changed.")
+        for key, value in changes.items():
+            set_env_value(HERE / ".env", key, value)
+            print(f"Saved {key}={value}")
+        for ex in others:
+            print(f"Note: another setting in .env needs fixing too: {ex}")
         print("Now restart the bot so it uses the new settings:  systemctl restart arbbot")
         return
 
@@ -3552,7 +3707,8 @@ def main() -> None:
     except ValueError as ex:
         # Exit code 2 tells systemd not to restart-loop on a setting that will fail every time.
         print(f"Bad setting in .env: {ex}. Fix it with: nano /opt/arb-bot/.env", file=sys.stderr)
-        url = os.environ.get("DISCORD_STATUS_WEBHOOK_URL") or os.environ.get("DISCORD_WEBHOOK_URL", "")
+        url = next((u for u in (os.environ.get("DISCORD_STATUS_WEBHOOK_URL", ""), os.environ.get("DISCORD_WEBHOOK_URL", ""))
+                    if u.startswith("https://")), "")   # a placeholder status URL falls back, like Status
         interactive = (args.dry_run, args.demo, args.once, args.plan, args.results, args.test_discord,
                        args.post_guide, args.post_results)
         if url.startswith("https://") and not any(interactive):   # the service: say why it stopped

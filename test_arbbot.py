@@ -834,8 +834,16 @@ class CLV(unittest.TestCase):
         self.assertFalse(s.closing_due("basketball_nba", NOW))          # no logged bet on it
         s.need_close = {"g1"}
         self.assertTrue(s.closing_due("basketball_nba", NOW))
-        s.last_odds["basketball_nba"] = (NOW - timedelta(minutes=0.5)).timestamp()
+        s.last_odds["basketball_nba"] = s.odds_ok["basketball_nba"] = (NOW - timedelta(minutes=0.5)).timestamp()
         self.assertFalse(s.closing_due("basketball_nba", NOW))          # already looked recently
+        # A look that failed doesn't count: it's tried again a minute later.
+        s.odds_ok["basketball_nba"] = 0
+        s.last_odds["basketball_nba"] = time.time() - 30
+        self.assertFalse(s.closing_due("basketball_nba", NOW))
+        s.last_odds["basketball_nba"] = time.time() - 61
+        self.assertTrue(s.closing_due("basketball_nba", NOW))
+        s.cfg = replace(cfg, live_only=True)                             # LIVE_ONLY: no pre-game checks
+        self.assertFalse(s.closing_due("basketball_nba", NOW))
 
 
 def prop_event(books, start="2026-10-03T18:00:00Z", market="player_points", player="LeBron James", line=25.5):
@@ -1430,14 +1438,34 @@ class AlertLifecycle(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def wire(self, a, fail_first=0):
+    def wire(self, a, fail_first=0, retryable=True):
         def fake(payload, message_id=None, url=""):
             self.sent.append(("PATCH" if message_id else "POST", payload["embeds"][0]["title"]))
+            a.send_retryable = False
             if not message_id and fail_first and len([m for m, _ in self.sent if m == "POST"]) <= fail_first:
+                a.send_retryable = retryable
                 return None
             return message_id or f"m{len(self.sent)}"
         a._discord = fake
         return a
+
+    def test_post_lost_after_sending_is_not_doubled(self):
+        # A timeout while reading Discord's reply: the card may be up already, so no second ping.
+        a = self.wire(Alerter(self.cfg, dry_run=False), fail_first=1, retryable=False)
+        arbs = find_arbs(demo_events(), Config())
+        a.handle(arbs, ["basketball_nba"], now=time.time())
+        a.handle(arbs, ["basketball_nba"], now=time.time())
+        self.assertEqual([m for m, _ in self.sent], ["POST"])
+
+    def test_retry_only_for_errors_before_discord_has_it(self):
+        import http.client
+        from unittest import mock
+        a = Alerter(self.cfg, dry_run=False)
+        for err, ok in ((urllib.error.URLError("refused"), True), (urllib.error.HTTPError("u", 500, "x", {}, None), True),
+                        (TimeoutError("read timed out"), False), (http.client.RemoteDisconnected("x"), False)):
+            with mock.patch("arbbot._webhook", side_effect=err):
+                self.assertIsNone(a._discord({"embeds": [{}]}))
+            self.assertEqual(a.send_retryable, ok, err)
 
     def test_failed_first_post_is_retried(self):
         a = self.wire(Alerter(self.cfg, dry_run=False), fail_first=1)
@@ -1549,8 +1577,15 @@ class PropClosingLines(unittest.TestCase):
         self.assertEqual(s.props_due(NOW), [])                       # no logged prop bet on it
         s.need_close_props = {"p1"}
         self.assertEqual(s.props_due(NOW), [("basketball_nba", "p1")])
-        s.last_props["p1"] = (NOW - timedelta(minutes=0.5)).timestamp()
+        s.last_props["p1"] = s.props_ok["p1"] = (NOW - timedelta(minutes=0.5)).timestamp()
         self.assertEqual(s.props_due(NOW), [])                       # already looked inside the window
+        s.props_ok["p1"], s.last_props["p1"] = 0, time.time() - 30   # that look failed...
+        self.assertEqual(s.props_due(NOW), [])
+        s.last_props["p1"] = time.time() - 61                        # ...so it's tried again a minute later
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", "p1")])
+        for off in (dict(props_enabled=False), dict(live_only=True)):   # no paid prop checks at all
+            s.cfg = replace(cfg, **off)
+            self.assertEqual(s.props_due(NOW), [], off)
 
     def test_close_uses_consensus_when_no_sharp_prices_the_prop(self):
         tr = ClosingTracker(self.cfg)
@@ -1764,6 +1799,217 @@ class BetResults(unittest.TestCase):
         self.assertEqual(row_pick({**base, "market": "totals", "outcome": "Over", "point": "47.5"}), "Over 47.5")
         self.assertEqual(row_pick({**base, "market": "player_points", "outcome": "Over", "point": "25.5",
                                    "player": "LeBron James"}), "LeBron James Over 25.5 Points")
+
+
+class ReviewFixes(unittest.TestCase):
+    """Issues found by the independent review of the fix commits."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.d = d
+        self.cfg = Config(webhook_url="https://main", state_dir=str(d / "state"), log_file="", min_ev_pct=3,
+                          round_stakes=0, ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
+                          closing_file=str(d / "close.csv"), pregame_max_age_seconds=10**9)
+        self.sent = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def wire(self, a):
+        def fake(payload, message_id=None, url=""):
+            self.sent.append(("PATCH" if message_id else "POST", payload["embeds"][0]["title"]))
+            a.send_retryable = False
+            return message_id or f"m{len(self.sent)}"
+        a._discord = fake
+        return a
+
+    # ---- closing lines
+    def test_main_line_close_never_from_soft_book_consensus(self):
+        tr = ClosingTracker(self.cfg)
+        tr.add({"event_id": "e1", "market": "h2h", "outcome": "Home", "point": "", "player": "",
+                "home_team": "Home", "first_seen": "2026-10-03T11:00:00+00:00", "commence_time": "2026-10-03T18:00:00Z"})
+        no_sharp = event({b: [("h2h", [("Home", h, None), ("Away", a, None)])]
+                          for b, h, a in (("DK", 2.20, 1.68), ("FD", 1.95, 1.87), ("MGM", 1.93, 1.89), ("CZR", 1.94, 1.88))})
+        tr.observe([no_sharp], NOW)
+        self.assertEqual(tr.latest, {})
+
+    def test_prop_close_consensus_needs_prop_min_books(self):
+        tr = ClosingTracker(self.cfg)
+        tr.add({"event_id": "p1", "market": "player_points", "outcome": "Over", "point": "25.5",
+                "player": "LeBron James", "home_team": "Lakers", "first_seen": "2026-10-03T11:00:00+00:00",
+                "commence_time": "2026-10-03T18:00:00Z"})
+        tr.observe([prop_event({"DK": (1.95, 1.87), "FD": (1.90, 1.92), "MGM": (1.93, 1.89)})], NOW)
+        self.assertEqual(tr.latest, {})                                  # 3 books < PROP_MIN_BOOKS (4)
+
+    # ---- schedule
+    def test_odd_schedule_data_keeps_the_last_good_one(self):
+        replies = [None, {"message": "Unknown sport"}, EOFError("cut off")]
+        class Api:
+            remaining = None
+            def events(self, sport, horizon_hours):
+                r = replies.pop(0)
+                if isinstance(r, Exception):
+                    raise r
+                return r
+        s = sched_with({"basketball_nba": [("g1", NOW)]})
+        s.api = Api()
+        for _ in range(3):
+            s.refresh_events(force=True)
+        self.assertEqual(s.games["basketball_nba"], [("g1", NOW)])
+
+    # ---- restarts
+    def restored_alerter(self, cls=Alerter, items=None, checked=None, **kw):
+        a = self.wire(cls(self.cfg, dry_run=False, **kw))
+        a.handle(items, checked, now=time.time())
+        b = self.wire(cls(self.cfg, dry_run=False, **kw))          # restart
+        self.sent.clear()
+        return b
+
+    def test_restored_alert_closes_on_the_first_check_that_misses_it(self):
+        ev = event({"A": [("h2h", [("Home", 2.10, None), ("Away", 1.80, None)])],
+                    "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])]}, start="2030-01-05T18:00:00Z")
+        ev["sport_key"] = "basketball_nba"
+        arbs = find_arbs([ev], Config(min_profit_pct=0), NOW)
+        b = self.restored_alerter(items=arbs, checked=["basketball_nba"])
+        b.handle([], ["icehockey_nhl"], now=time.time())                  # another sport: stays
+        self.assertEqual(self.sent, [])
+        b.handle([], ["basketball_nba"], now=time.time())                 # its sport, not found: gone now
+        self.assertEqual(self.sent[0][0], "PATCH")
+        self.assertTrue(self.sent[0][1].startswith("❌ GONE"))
+        self.assertEqual(b.restored, {})
+
+    def test_restored_prop_waits_for_its_game_not_the_grace_period(self):
+        from arbbot import close_started
+        ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)}, start="2026-10-03T23:00:00Z")
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        [bet] = find_evs([ev], self.cfg.for_props(), NOW)
+        b = self.restored_alerter(EVAlerter, [bet], noun="+EV props")
+        b.started -= 10_000                                              # long past the grace period
+        b.handle([], checked_events={"p2"}, now=time.time())              # another game's props
+        self.assertEqual(self.sent, [])
+        self.assertIn(bet.key, b.restored)
+        close_started(datetime(2026, 10, 3, 23, 1, tzinfo=timezone.utc), b)   # its game starts
+        self.assertTrue(self.sent and self.sent[0][1].startswith("❌ GONE"))
+        self.assertEqual(b.restored, {})
+
+    def test_old_state_files_still_use_the_grace_period(self):
+        import json
+        ev = event({"A": [("h2h", [("Home", 2.10, None), ("Away", 1.80, None)])],
+                    "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])]}, start="2030-01-05T18:00:00Z")
+        ev["sport_key"] = "basketball_nba"
+        arbs = find_arbs([ev], Config(min_profit_pct=0), NOW)
+        a = self.wire(Alerter(self.cfg, dry_run=False))
+        a.handle(arbs, ["basketball_nba"], now=time.time())
+        path = a._state_path()
+        data = json.loads(path.read_text())
+        for v in data.values():
+            for k in ("sport_key", "event_id", "commence_time", "card"):
+                v.pop(k, None)
+        path.write_text(json.dumps(data))
+        b = self.wire(Alerter(self.cfg, dry_run=False))
+        self.sent.clear()
+        b.handle([], ["basketball_nba"], now=time.time())
+        self.assertEqual(self.sent, [])                                  # no scope saved: wait
+        b.started -= 1000
+        b.handle([], ["basketball_nba"], now=time.time())
+        self.assertTrue(self.sent[0][1].startswith("❌ GONE"))
+
+    # ---- card edits
+    def test_card_edited_when_anything_on_it_changes(self):
+        a = self.wire(EVAlerter(self.cfg, dry_run=False))
+        def scan(b_price, sharp=(1.91, 1.91)):
+            ev = ev_event([("Home", sharp[0], None), ("Away", sharp[1], None)],
+                          {"A": [("Home", 2.15, None)], "B": [("Home", b_price, None)]})
+            [bet] = find_evs([ev], self.cfg, NOW)
+            a.handle([bet], ["Test"], now=time.time())
+            return bet
+        scan(2.10)
+        scan(2.10)
+        self.assertEqual([m for m, _ in self.sent], ["POST"])            # nothing changed: no edit
+        scan(1.80)                                                       # only the 'every book' list changed
+        self.assertEqual([m for m, _ in self.sent], ["POST", "PATCH"])
+
+    def test_dry_run_still_prints_updates(self):
+        import io, contextlib
+        a = Alerter(Config(log_file=""), dry_run=True)
+        arbs = find_arbs(demo_events(), Config())
+        a.handle(arbs, ["basketball_nba"], now=1000)
+        moved = find_arbs(demo_events(), Config())
+        moved[0].legs[0].price += 0.05
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            a.handle(moved, ["basketball_nba"], now=1060)
+        self.assertIn("↻ updated", out.getvalue())
+
+    # ---- money
+    def test_thin_arb_still_gets_skip_lines(self):
+        ev = event({"A": [("h2h", [("Home", 2.02, None), ("Away", 1.80, None)])],
+                    "B": [("h2h", [("Home", 1.80, None), ("Away", 1.995, None)])]})
+        [arb] = find_arbs([ev], Config(alert_mode="balanced", min_profit_pct=0.3, bankroll=100), NOW)
+        for i, leg in enumerate(arb.legs):
+            worst = arb.worst_ok_price(i)
+            self.assertIsNotNone(worst)
+            self.assertLess(worst, leg.price)
+            self.assertGreaterEqual(worst * leg.stake, arb.total_stake - 0.01)   # never a losing line
+
+    def test_stake_rounding_corner_cases(self):
+        from arbbot import round_stake
+        small_cap = Config(round_stakes=5, ev_bankroll=100, kelly_fraction=1, ev_max_stake_pct=3)
+        self.assertEqual(kelly_stake(0.6, 2.10, small_cap, mult=1.5), 3.0)       # not $0
+        self.assertEqual(round_stake(40, 12.5, Config(round_stakes=5)), 10.0)    # parlay cap $12.50
+        legs = [ev_leg("g1", {"DK": 2.30}), ev_leg("g2", {"DK": 2.30})]
+        cfg = Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, round_stakes=5, ev_bankroll=1250,
+                     parlay_max_stake_pct=1, kelly_fraction=1)
+        [p] = find_parlays(legs, cfg)
+        self.assertLessEqual(p.stake, 12.5)
+
+    def test_kept_parlay_survives_many_better_legs(self):
+        cfg = Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2, parlay_max_alerts=3)
+        a, b = ev_leg("g1", {"DK": 2.10}), ev_leg("g2", {"DK": 2.12})
+        [ab] = find_parlays([a, b], cfg)
+        more = [ev_leg(f"g{i}", {"DK": 2.20 + i / 100}) for i in range(3, 11)]
+        self.assertNotIn(ab.key, {p.key for p in find_parlays([a, b] + more, cfg)})
+        self.assertIn(ab.key, {p.key for p in find_parlays([a, b] + more, cfg, keep={ab.key})})
+
+    def test_parlay_legs_follow_the_ev_price_limits(self):
+        cfg = Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, max_ev_pct=25)
+        a, b = ev_leg("g1", {"DK": 2.20}), ev_leg("g2", {"DK": 2.20})
+        self.assertTrue(find_parlays([a, b], cfg))
+        b.board = [(bk, 2.80, 40.0, ln, True) for bk, _, _, ln, _ in b.board]   # an outlier-sized edge
+        self.assertEqual(find_parlays([a, b], cfg), [])
+
+    # ---- settings
+    def env(self, **kv):
+        import os
+        from unittest import mock
+        return mock.patch.dict(os.environ, kv)
+
+    def test_numbers_must_be_whole_and_finite(self):
+        for kv, key in ((dict(POLL_SECONDS="0.5"), "POLL_SECONDS"), (dict(POLL_SECONDS="inf"), "POLL_SECONDS"),
+                        (dict(MONTHLY_CREDITS="1e400"), "MONTHLY_CREDITS"), (dict(POLL_SECONDS="0"), "POLL_SECONDS"),
+                        (dict(GAME_MINUTES="basketball_nba=inf"), "GAME_MINUTES"),
+                        (dict(TIMEZONE="America/New York"), "TIMEZONE"), (dict(ACTIVE_HOURS="8am-10pm"), "ACTIVE_HOURS"),
+                        (dict(CONFIDENCE_STAKES="1,0.75"), "CONFIDENCE_STAKES")):
+            with self.env(**kv), self.assertRaisesRegex(ValueError, key):
+                Config.from_env()
+        with self.env(CONFIDENCE_STAKES="1;0.8;0.6"):
+            self.assertEqual(Config.from_env().confidence_stakes, "1,0.8,0.6")
+
+    def test_set_checks_each_new_value_on_its_own(self):
+        import os
+        from arbbot import check_settings
+        with self.env(POLL_SECONDS="6o"):
+            problem, others = check_settings({"BANKROLL": "2OO"})
+            self.assertTrue(problem.startswith("BANKROLL"), problem)
+            problem, others = check_settings({"BANKROLL": "200"})
+            self.assertEqual(problem, "")
+            self.assertTrue(others and others[0].startswith("POLL_SECONDS"))
+            self.assertEqual(os.environ["POLL_SECONDS"], "6o")           # environment left as it was
+            self.assertNotIn("BANKROLL", os.environ)
+        problem, _ = check_settings({"MY_BOOKS": "fanduel", "BANKROLL": "abc"})
+        self.assertTrue(problem.startswith("BANKROLL"))
 
 
 if __name__ == "__main__":
