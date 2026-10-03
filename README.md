@@ -35,13 +35,25 @@ Watches odds from many sportsbooks and pings Discord about two kinds of bets:
 **How it works:** Pinnacle takes big bettors and keeps a thin margin, so its lines are the
 market's best guess at the real odds. The bot removes Pinnacle's margin (the "vig") to get each
 side's fair probability. It alerts when a book you can bet at pays more than that, by at least
-`MIN_EV_PCT` (3%).
+`MIN_EV_PCT` (4%).
+
+The margin is removed with the **power method**. Books hide most of their margin in the long
+shot, and this method takes more of it out there, so long shots don't look better than they are.
 
 **What it costs:** nothing extra. Pinnacle is one of the 10 books in `BOOKMAKERS`, and 10 books
 cost the same as one region.
 
 **Stakes** use the Kelly formula: bet more when the edge is bigger. It uses a quarter of full
-Kelly to soften the swings, and never more than 3% of `EV_BANKROLL` on one bet.
+Kelly to soften the swings, and never more than 3% of `EV_BANKROLL` on one bet. Set `UNIT_SIZE`
+to see stakes in units too.
+
+**More than one sharp book (optional).** List several in `SHARP_BOOKS` (for example
+`pinnacle,betfair_ex_eu`) and the bot blends their fair odds. Each alert shows how many sources
+priced it ("Sources 2/2"). If the sharps disagree by more than `SHARP_DISAGREE_PCT`, the line is
+skipped. If only one of them priced it, the stake is halved (`SINGLE_SOURCE_STAKE`).
+
+**Bigger edge, new alert.** Discord doesn't ping you when a message is edited. So if a bet's edge
+grows by 2.5 points or more while it's open (`REALERT_JUMP_PCT`), you get a fresh alert.
 
 **Is it working?** Every +EV alert is logged to `ev_bets.csv`. Once games finish, the bot grades
 them with final scores and keeps a record in `ev_results.csv`. Grading costs 2 credits per sport

@@ -87,9 +87,14 @@ class FindArbs(unittest.TestCase):
             "A": [("h2h", [("Home", 2.10, None), ("Away", 1.80, None)])],
             "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])],
         })
-        old = (NOW - timedelta(minutes=10)).isoformat()
-        ev["bookmakers"][1]["markets"][0]["last_update"] = old
-        self.assertEqual(find_arbs([ev], CFG, NOW), [])
+        ten_min = (NOW - timedelta(minutes=10)).isoformat()
+        ev["bookmakers"][1]["markets"][0]["last_update"] = ten_min
+        self.assertEqual(len(find_arbs([ev], CFG, NOW)), 1)       # pre-game: 10 min is fine
+        ev["commence_time"] = "2026-10-03T11:00:00Z"
+        self.assertEqual(find_arbs([ev], CFG, NOW), [])           # live: too old
+        ev["commence_time"] = "2026-10-03T18:00:00Z"
+        ev["bookmakers"][1]["markets"][0]["last_update"] = (NOW - timedelta(minutes=20)).isoformat()
+        self.assertEqual(find_arbs([ev], CFG, NOW), [])           # pre-game: 20 min is too old
 
     def test_profit_filters_and_live_only(self):
         ev = event({
@@ -182,6 +187,14 @@ class AlerterLifecycle(unittest.TestCase):
         a.handle([], ["icehockey_nhl"], now=1060)
         self.assertIn(self.arbs[0].key, a.open)
 
+    def test_big_improvement_sends_fresh_alert(self):
+        a = self.alerter
+        a.handle(self.arbs, ["basketball_nba"], now=1000)
+        self.arbs[0].legs[0].price = 1.95   # 3.76% -> ~7.9%: jump of more than 2.5 points
+        self.arbs[0].margin = 1 / 1.95 + 1 / 2.45
+        self.assertEqual(a.handle(self.arbs, ["basketball_nba"], now=1060), 1)
+        self.assertEqual(a.handle(self.arbs, ["basketball_nba"], now=1120), 0)  # no repeat
+
     def test_price_change_updates_not_new(self):
         a = self.alerter
         a.handle(self.arbs, ["basketball_nba"], now=1000)
@@ -208,11 +221,57 @@ EVCFG = Config(min_ev_pct=3, round_stakes=0, ev_bankroll=1000, kelly_fraction=0.
 
 class PlusEV(unittest.TestCase):
     def test_devig(self):
-        p = devig([1.91, 1.91])
-        self.assertAlmostEqual(p[0], 0.5)
-        p = devig([1.70, 2.25])
-        self.assertAlmostEqual(sum(p), 1)
-        self.assertGreater(p[0], p[1])
+        for method in ("multiplicative", "power"):
+            p = devig([1.91, 1.91], method)
+            self.assertAlmostEqual(p[0], 0.5)
+            p = devig([1.70, 2.25], method)
+            self.assertAlmostEqual(sum(p), 1)
+            self.assertGreater(p[0], p[1])
+
+    def test_power_devig_shades_long_shots(self):
+        mult = devig([1.25, 4.50], "multiplicative")
+        power = devig([1.25, 4.50], "power")
+        self.assertAlmostEqual(sum(power), 1)
+        self.assertLess(power[1], mult[1])   # long shot gets a lower fair probability
+
+    def two_sharps(self, pin, bf, soft):
+        ev = event({"Pinnacle": [("h2h", pin)], "Betfair": [("h2h", bf)], "B": [("h2h", soft)]})
+        ev["bookmakers"][0]["key"], ev["bookmakers"][1]["key"] = "pinnacle", "betfair_ex_eu"
+        return ev
+
+    def test_blends_two_sharps(self):
+        ev = self.two_sharps([("Home", 1.90, None), ("Away", 1.90, None)],
+                             [("Home", 1.80, None), ("Away", 2.00, None)],
+                             [("Home", 2.20, None)])
+        cfg = Config(min_ev_pct=3, sharp_books="pinnacle,betfair_ex_eu", round_stakes=0)
+        [b] = find_evs([ev], cfg, NOW)
+        self.assertAlmostEqual(b.fair_prob, (0.5 + devig([1.80, 2.00], "power")[0]) / 2)
+        self.assertEqual((b.sources_used, b.sources_total), (2, 2))
+        self.assertEqual(b.sharp_book, "Pinnacle + Betfair")
+        weighted = Config(min_ev_pct=3, sharp_books="pinnacle,betfair_ex_eu",
+                          sharp_weights={"pinnacle": 3, "betfair_ex_eu": 1})
+        [w] = find_evs([ev], weighted, NOW)
+        self.assertAlmostEqual(w.fair_prob, (3 * 0.5 + devig([1.80, 2.00], "power")[0]) / 4)
+
+    def test_sharps_disagree_suppresses(self):
+        ev = self.two_sharps([("Home", 1.60, None), ("Away", 2.50, None)],
+                             [("Home", 2.00, None), ("Away", 1.85, None)],
+                             [("Home", 2.20, None)])
+        cfg = Config(min_ev_pct=3, sharp_books="pinnacle,betfair_ex_eu")
+        self.assertEqual(find_evs([ev], cfg, NOW), [])
+
+    def test_single_source_stake_cut(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
+        both = Config(min_ev_pct=3, round_stakes=0, sharp_books="pinnacle,betfair_ex_eu")
+        [b] = find_evs([ev], both, NOW)
+        self.assertEqual((b.sources_used, b.sources_total), (1, 2))
+        self.assertEqual(b.stake, 6.0)   # half of the 11.4 one-sharp stake, rounded
+        self.assertAlmostEqual(b.ev_pct, 5.0, places=1)   # the edge itself is unchanged
+
+    def test_units_label(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
+        [b] = find_evs([ev], Config(min_ev_pct=3, round_stakes=0, unit_size=10), NOW)
+        self.assertEqual(b.stake_label, "$11 (1.1u)")
 
     def test_finds_price_above_fair(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
