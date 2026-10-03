@@ -457,6 +457,18 @@ def sched_with(games, cfg=None, remaining=None):
     return s
 
 
+class DotEnv(unittest.TestCase):
+    def test_forgives_doubled_key(self):
+        import os, tempfile
+        from arbbot import load_dotenv
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / ".env"
+            f.write_text("ARBTEST_SPORTS=ARBTEST_SPORTS=americanfootball_nfl,icehockey_nhl\n")
+            os.environ.pop("ARBTEST_SPORTS", None)
+            load_dotenv(f)
+            self.assertEqual(os.environ.pop("ARBTEST_SPORTS"), "americanfootball_nfl,icehockey_nhl")
+
+
 class Credits(unittest.TestCase):
     def test_cost_markets_times_regions(self):
         self.assertEqual(Config(markets="h2h,spreads,totals", regions="us", bookmakers="").credits_per_call(), 3)

@@ -69,7 +69,10 @@ def load_dotenv(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        while value.startswith(key + "="):  # forgive "SPORTS=SPORTS=..." from pasting a whole line
+            value = value[len(key) + 1:]
+        os.environ.setdefault(key, value)
 
 
 def _csv(s: str) -> list[str]:
