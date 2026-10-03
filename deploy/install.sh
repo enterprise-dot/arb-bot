@@ -12,15 +12,18 @@ apt-get install -y -qq python3 git tzdata
 id arbbot &>/dev/null || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin arbbot
 
 if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" pull --ff-only
+  # Already installed: update as the bot's user (git refuses repos owned by someone else).
+  sudo -u arbbot git -C "$APP_DIR" remote set-url origin "$REPO_URL"
+  sudo -u arbbot git -C "$APP_DIR" pull --ff-only
 else
   git clone "$REPO_URL" "$APP_DIR"
 fi
-git -C "$APP_DIR" remote set-url origin "$(echo "$REPO_URL" | sed -E 's#https://[^@]+@#https://#')"
 
 [ -f "$APP_DIR/.env" ] || cp "$APP_DIR/.env.example" "$APP_DIR/.env"
 chown -R arbbot:arbbot "$APP_DIR"
-chmod 600 "$APP_DIR/.env"
+# The clone URL keeps the read-only GitHub token so `git pull` updates work. Lock both
+# secrets files down to the bot's user.
+chmod 600 "$APP_DIR/.env" "$APP_DIR/.git/config"
 
 cp "$APP_DIR/deploy/arbbot.service" /etc/systemd/system/arbbot.service
 systemctl daemon-reload

@@ -113,6 +113,8 @@ Any small Ubuntu server works (DigitalOcean, Hetzner, Vultr, Linode: the cheapes
    (For a private repo, copy `deploy/install.sh` over with `scp` instead of curl.)
 3. Follow the 4 steps it prints: fill in `.env`, check `--plan`, start the bot, watch the logs.
 
+Never set up a server before? Follow [docs/SERVER_SETUP.md](docs/SERVER_SETUP.md). It covers every click on DigitalOcean.
+
 After that it starts when the server boots and restarts itself within a minute if it crashes.
 A wrong API key stops it instead of restart-looping, and you'll get a 🔴 message on Discord either way.
 
