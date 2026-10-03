@@ -35,6 +35,20 @@ python arbbot.py --post-guide
 - **`arbs.csv`:** every gap and how long it stayed open. After a week, this tells you whether you can realistically catch them.
 - **Bot health in Discord:** 🟢 online, 🔴 crashed, ⚠️ credits running low, and a 📊 daily summary.
 
+## Your books
+
+`MY_BOOKS` lists the books you bet at (e.g. `draftkings,fanduel,betmgm,williamhill_us,kalshi`).
+Arbs, +EV, outliers, parlays and lock-in hedges only ever point to those books, and each card's
+"Every book" list shows only them. The rest of `BOOKMAKERS` still helps: Pinnacle sets the true
+odds and the others confirm the market price for outlier alerts, at no extra cost.
+
+Kalshi (an exchange) charges a fee per trade, so its prices are lowered by that fee before any
+comparison (`KALSHI_FEE_RATE`). Change settings without editing files:
+
+```bash
+python arbbot.py --set MY_BOOKS=draftkings,fanduel --set EV_BOOKS=
+```
+
 ## Channels
 
 Arbs post to `DISCORD_WEBHOOK_URL`. Set `DISCORD_EV_WEBHOOK_URL` to send +EV alerts (and props,

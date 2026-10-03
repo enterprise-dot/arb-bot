@@ -810,6 +810,61 @@ class Channels(unittest.TestCase):
                                                outlier_webhook_url="out"), True).webhook_for(arb), "out")
 
 
+class MyBooks(unittest.TestCase):
+    def test_arbs_only_use_my_books(self):
+        ev = event({
+            "A": [("h2h", [("Home", 2.10, None), ("Away", 1.80, None)])],
+            "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])],
+        })
+        self.assertEqual(len(find_arbs([ev], Config(min_profit_pct=0, my_books="a,b"), NOW)), 1)
+        self.assertEqual(find_arbs([ev], Config(min_profit_pct=0, my_books="a,c"), NOW), [])
+
+    def test_ev_only_at_my_books(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"B": [("Home", 2.10, None)], "C": [("Home", 2.15, None)]})
+        [b] = find_evs([ev], Config(min_ev_pct=3, my_books="b"), NOW)
+        self.assertEqual(b.book, "B")
+        self.assertEqual([r[0] for r in b.board], ["B"])     # the list shows only your books
+        [b2] = find_evs([ev], Config(min_ev_pct=3), NOW)      # no MY_BOOKS: best of all
+        self.assertEqual(b2.book, "C")
+
+    def test_outliers_flag_and_hedge_only_my_books(self):
+        ev = outlier_event(1.85, 1.95)
+        self.assertEqual(find_outliers([ev], Config(my_books="dk,fd"), NOW), [])     # "Stale" isn't yours
+        [o] = find_outliers([ev], Config(my_books="stale,fd"), NOW)
+        self.assertEqual(o.hedge[0][1], "FD")                 # hedge at your book, not DK
+        self.assertEqual({r[0] for r in o.board}, {"Stale", "FD"})
+        self.assertEqual(o.sources_used, 4)                   # but all books still set the market price
+
+
+class KalshiFees(unittest.TestCase):
+    def kalshi_event(self, price):
+        ev = event({"Kalshi": [("h2h", [("Home", price, None), ("Away", 2.0, None)])]})
+        ev["bookmakers"][0]["key"] = "kalshi"
+        return ev
+
+    def test_fee_lowers_price(self):
+        from arbbot import apply_fees
+        ev = apply_fees([self.kalshi_event(2.0)], Config())[0]
+        # P = 0.50, fee = 0.07 x 0.5 x 0.5 = 0.0175 -> 1 / 0.5175
+        self.assertAlmostEqual(ev["bookmakers"][0]["markets"][0]["outcomes"][0]["price"], 1 / 0.5175, places=3)
+
+    def test_applied_once_and_can_be_off(self):
+        from arbbot import apply_fees
+        ev = self.kalshi_event(2.0)
+        apply_fees([ev], Config())
+        once = ev["bookmakers"][0]["markets"][0]["outcomes"][0]["price"]
+        apply_fees([ev], Config())
+        self.assertEqual(ev["bookmakers"][0]["markets"][0]["outcomes"][0]["price"], once)
+        off = apply_fees([self.kalshi_event(2.0)], Config(kalshi_fee_rate=0))[0]
+        self.assertEqual(off["bookmakers"][0]["markets"][0]["outcomes"][0]["price"], 2.0)
+
+    def test_other_books_untouched(self):
+        from arbbot import apply_fees
+        ev = apply_fees([event({"DK": [("h2h", [("Home", 2.0, None), ("Away", 2.0, None)])]})], Config())[0]
+        self.assertEqual(ev["bookmakers"][0]["markets"][0]["outcomes"][0]["price"], 2.0)
+
+
 class ActiveHours(unittest.TestCase):
     def at(self, hhmm):  # a New York local time on a fixed day, as UTC
         from zoneinfo import ZoneInfo

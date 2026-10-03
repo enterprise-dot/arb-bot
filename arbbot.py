@@ -135,7 +135,11 @@ class Config:
     markets: str = "h2h,spreads,totals"
     # Up to 10 books cost the same as one region. Pinnacle is read only, as the sharp
     # reference for +EV; you never bet there.
-    bookmakers: str = "pinnacle,draftkings,fanduel,betmgm,williamhill_us,espnbet,betrivers,fanatics,hardrockbet,ballybet"
+    bookmakers: str = "pinnacle,draftkings,fanduel,betmgm,williamhill_us,kalshi,espnbet,betrivers,fanatics,hardrockbet"
+    # Books you actually bet at. Alerts only ever tell you to bet at these; the rest of
+    # BOOKMAKERS is used for reference (true odds, market consensus). Empty = all of them.
+    my_books: str = ""
+    kalshi_fee_rate: float = 0.07   # Kalshi's trading fee factor (fee = rate x P x (1-P) per $1 contract)
     poll_seconds: int = 60        # fastest check rate for sports with live games
     pregame_minutes: int = 15     # check rate before kickoff (0 = live games only)
     pregame_hours: float = 2.0    # how far before kickoff pre-game checks start
@@ -235,6 +239,8 @@ class Config:
             regions=e("REGIONS", d.regions),
             markets=e("MARKETS", d.markets),
             bookmakers=e("BOOKMAKERS", d.bookmakers),
+            my_books=e("MY_BOOKS", ""),
+            kalshi_fee_rate=float(e("KALSHI_FEE_RATE", d.kalshi_fee_rate)),
             poll_seconds=int(e("POLL_SECONDS", d.poll_seconds)),
             pregame_minutes=int(e("PREGAME_MINUTES", d.pregame_minutes)),
             pregame_hours=float(e("PREGAME_HOURS", d.pregame_hours)),
@@ -335,6 +341,11 @@ class Config:
                 bad.append(env)
                 setattr(self, attr, "")
         return bad
+
+    def bettable(self, book_key: str) -> bool:
+        """Can alerts tell you to bet at this book?"""
+        mine = _csv(self.my_books)
+        return not mine or book_key in mine
 
     def credits_per_call(self) -> int:
         """The Odds API charges markets x regions; every 10 bookmakers count as one region."""
@@ -535,6 +546,29 @@ def is_fresh(mkt: dict, bm: dict, now: datetime, live: bool, cfg: Config,
     return (now - _parse_time(updated)).total_seconds() <= limit
 
 
+def apply_fees(events: list[dict], cfg: Config) -> list[dict]:
+    """Lower exchange prices by their trading fee, so every comparison uses what you'd really get.
+
+    Kalshi: a contract costs P and pays $1; the fee is rate x P x (1 - P) on top, so the real
+    decimal odds are 1 / (P + fee)."""
+    rate = cfg.kalshi_fee_rate
+    if rate <= 0:
+        return events
+    for ev in events:
+        for bm in ev.get("bookmakers", []):
+            if bm["key"] != "kalshi" or bm.get("_fees_applied"):
+                continue
+            for mkt in bm.get("markets", []):
+                for oc in mkt.get("outcomes", []):
+                    price = float(oc.get("price") or 0)
+                    if price > 1.0:
+                        p = 1 / price
+                        oc["price"] = round(1 / (p + rate * p * (1 - p)), 4)
+            bm["_fees_applied"] = True
+            bm["title"] = bm.get("title", "Kalshi")
+    return events
+
+
 def _line_for(market: str, outcome: dict, home_team: str):
     """Return a key so that both sides of the same line group together.
 
@@ -569,8 +603,8 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
         n_outcomes: dict[tuple, int] = {}
 
         for bm in ev.get("bookmakers", []):
-            if bm["key"] in sharp_only:
-                continue  # reference-only book (e.g. Pinnacle): not bettable from the US
+            if bm["key"] in sharp_only or not cfg.bettable(bm["key"]):
+                continue  # reference-only book (e.g. Pinnacle), or one you don't bet at
             for mkt in bm.get("markets", []):
                 if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue  # stale price, likely already moved
@@ -1232,7 +1266,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
         return []
     now = now or datetime.now(timezone.utc)
     sharp = _csv(cfg.sharp_books)
-    allowed = set(_csv(cfg.ev_books))
+    allowed = set(_csv(cfg.ev_books) or _csv(cfg.my_books))
     out: list[EVBet] = []
 
     for ev in events:
@@ -1456,7 +1490,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
             probs = {bk: dict(zip(o, devig(list(o.values()), cfg.devig_method))) for bk, o in full.items()}
             for name in names:
                 for bk, o in full.items():
-                    if bk in reference_only:
+                    if bk in reference_only or not cfg.bettable(bk):
                         continue
                     others = sorted(probs[ob][name] for ob in probs if ob != bk)
                     if len(others) < cfg.outlier_min_books:
@@ -1469,7 +1503,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
                         continue
                     board = sorted(((titles[b], oo[name], (fair_p * oo[name] - 1) * 100,
                                      links.get((k, b, name), ""))
-                                    for b, oo in full.items() if b not in reference_only),
+                                    for b, oo in full.items() if b not in reference_only and cfg.bettable(b)),
                                    key=lambda r: r[1], reverse=True)
                     bet = EVBet(
                         event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
@@ -1487,7 +1521,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
                     hedge = []
                     for other in sorted(names - {name}):
                         cands = [(oo[other], b) for b, oo in full.items()
-                                 if b != bk and b not in reference_only]
+                                 if b != bk and b not in reference_only and cfg.bettable(b)]
                         if cands:
                             pr, b = max(cands)
                             hedge.append((other, titles[b], pr, links.get((k, b, other), "")))
@@ -2145,7 +2179,7 @@ class Scheduler:
                 elif isinstance(result, Exception):
                     print(f"! Props error for {sport} {gid}: {result}", file=sys.stderr)
                 elif isinstance(result, dict) and result.get("bookmakers"):
-                    events.append(result)
+                    events.append(apply_fees([result], self.cfg)[0])
         return events
 
     # ---- polling
@@ -2197,6 +2231,7 @@ class Scheduler:
                 elif isinstance(result, Exception):
                     print(f"! Odds error for {sport}: {result}", file=sys.stderr)
                 else:
+                    apply_fees(result, self.cfg)
                     self.note_feed(sport, result, now)
                     events.extend(result)
         return events
@@ -2240,6 +2275,8 @@ Optional: also place the 🔒 bets it lists to lock in a guaranteed profit.
 
 📦 **PARLAY** (purple)
 One ticket with 2-3 +EV bets from different games, all at the same book. Every leg must win. Bigger payout, wins less often, so the stake is small.
+
+🏦 **Kalshi** prices in alerts already include Kalshi's trading fee.
 
 🎯 **Player props** show up as normal +EV, arb or outlier alerts, e.g. "LeBron James Over 25.5 Points".
 
@@ -2518,6 +2555,8 @@ def main() -> None:
     p.add_argument("--demo", action="store_true", help="use bundled sample data (no API key needed)")
     p.add_argument("--dry-run", action="store_true", help="print alerts instead of sending to Discord")
     p.add_argument("--test-discord", action="store_true", help="send one sample alert to Discord and exit")
+    p.add_argument("--set", metavar="KEY=VALUE", action="append",
+                   help="change a setting in .env, e.g. --set MY_BOOKS=fanduel,draftkings (repeatable)")
     p.add_argument("--set-webhook", choices=sorted(WEBHOOK_SETTINGS), metavar="CHANNEL",
                    help="paste a Discord webhook URL for a channel: " + ", ".join(sorted(WEBHOOK_SETTINGS)))
     p.add_argument("--post-guide", action="store_true",
@@ -2528,6 +2567,17 @@ def main() -> None:
 
     if args.set_webhook:
         set_webhook(args.set_webhook)
+        return
+
+    if args.set:
+        for item in args.set:
+            key, sep, value = item.partition("=")
+            key = key.strip().upper()
+            if not sep or not key.replace("_", "").isalnum():
+                sys.exit(f"Use KEY=VALUE, like MY_BOOKS=fanduel,draftkings (got: {item!r}). Nothing was changed.")
+            set_env_value(HERE / ".env", key, value.strip())
+            print(f"Saved {key}={value.strip()}")
+        print("Now restart the bot so it uses the new settings:  systemctl restart arbbot")
         return
 
     cfg = Config.from_env()
