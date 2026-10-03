@@ -562,10 +562,30 @@ class PlusEV(unittest.TestCase):
         [ml] = find_evs([ev], EVCFG, NOW)
         sp = replace(ml, market="spreads", line=-3.5, point=-3.5)
         other = replace(ml, event_id="e2")
-        note_related([ml, sp, other])
+        a = EVAlerter(EVCFG, dry_run=True)
+        note_related([([ml, sp, other], a, set())])
         self.assertEqual(ml.related, ["Home -3.5"])
         self.assertEqual(other.related, [])
         self.assertIn("Also alerted on this game: Home -3.5", ev_payload(ml)["embeds"][0]["description"])
+
+    def test_related_only_names_alerts_that_will_exist(self):
+        from arbbot import note_related
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [ml] = find_evs([ev], EVCFG, NOW)
+        over = replace(ml, market="totals", line=220.5, point=220.5, outcome="Over")
+        # Hourly cap with one slot left: only the first (best) bet will be posted.
+        a = EVAlerter(EVCFG, dry_run=True)
+        a.max_per_hour, a.posted_at = 2, [time.time()]
+        note_related([([over, ml], a, {ml.sport_key})])
+        self.assertEqual(over.related, [])           # ML will be skipped by the cap, so not named
+        # An open alert that this scan re-checked and didn't find is about to close: not named.
+        b = EVAlerter(EVCFG, dry_run=True)
+        b.handle([ml], now=1000)
+        note_related([([over], b, {ml.sport_key})])
+        self.assertEqual(over.related, [])
+        # ...but an open alert this scan didn't look at stays open, so it is named.
+        note_related([([over], b, set())])
+        self.assertEqual(over.related, [ml.pick])
 
     def test_payload(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
@@ -1339,6 +1359,245 @@ class Budget(unittest.TestCase):
         s.update_budget(NOW)
         self.assertEqual(s.forecast, 0)
         self.assertEqual(s.due(NOW), [])
+
+
+class FetchFailures(unittest.TestCase):
+    """A request that fails must not count as "looked, and the bet is gone"."""
+
+    def test_fetch_reports_only_sports_that_answered(self):
+        class Api:
+            remaining = None
+            def odds(self, sport, until):
+                if sport == "basketball_nba":
+                    raise TimeoutError("read timed out")
+                return []
+        s = sched_with({"basketball_nba": [], "icehockey_nhl": []})
+        s.api = Api()
+        events, ok = s.fetch(["basketball_nba", "icehockey_nhl"], NOW)
+        self.assertEqual((events, ok), ([], {"icehockey_nhl"}))
+
+    def test_fetch_props_counts_empty_answers_not_errors(self):
+        import http.client
+        class Api:
+            remaining = None
+            def event_odds(self, sport, gid, markets):
+                if gid == "g2":
+                    raise http.client.RemoteDisconnected("dropped")
+                return {"id": gid, "bookmakers": []}
+        s = sched_with({"basketball_nba": []}, Config(sports=["basketball_nba"]))
+        s.api = Api()
+        events, ok = s.fetch_props([("basketball_nba", "g1"), ("basketball_nba", "g2")])
+        self.assertEqual((events, ok), ([], {"g1"}))
+
+    def test_schedule_errors_dont_crash(self):
+        import http.client
+        errors = [TimeoutError("slow"), http.client.RemoteDisconnected("dropped"), ValueError("bad json")]
+        class Api:
+            remaining = None
+            def events(self, sport, horizon_hours):
+                raise errors.pop(0)
+        s = sched_with({"basketball_nba": [("g1", NOW)]})
+        s.api = Api()
+        for _ in range(3):
+            s.refresh_events(force=True)
+        self.assertEqual(s.games["basketball_nba"], [("g1", NOW)])   # kept the last good schedule
+        class Rejected:
+            remaining = None
+            def events(self, sport, horizon_hours):
+                raise urllib.error.HTTPError("u", 401, "bad key", {}, None)
+        s.api = Rejected()
+        with self.assertRaises(urllib.error.HTTPError):
+            s.refresh_events(force=True)
+
+    def test_live_only_pays_for_nothing_pregame(self):
+        cfg = Config(sports=["basketball_nba"], live_only=True)
+        s = sched_with({"basketball_nba": [("g1", NOW + timedelta(hours=1))]}, cfg)
+        self.assertIsNone(s.state("basketball_nba", NOW))
+        self.assertEqual(s._prop_tiers(NOW), [])
+        s.games["basketball_nba"].append(("g0", NOW - timedelta(minutes=30)))
+        self.assertEqual(s.state("basketball_nba", NOW), LIVE)
+
+
+class AlertLifecycle(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.cfg = Config(webhook_url="https://main", state_dir=str(d), log_file="", min_ev_pct=3,
+                          round_stakes=0, ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"))
+        self.sent = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def wire(self, a, fail_first=0):
+        def fake(payload, message_id=None, url=""):
+            self.sent.append(("PATCH" if message_id else "POST", payload["embeds"][0]["title"]))
+            if not message_id and fail_first and len([m for m, _ in self.sent if m == "POST"]) <= fail_first:
+                return None
+            return message_id or f"m{len(self.sent)}"
+        a._discord = fake
+        return a
+
+    def test_failed_first_post_is_retried(self):
+        a = self.wire(Alerter(self.cfg, dry_run=False), fail_first=1)
+        arbs = find_arbs(demo_events(), Config())
+        a.handle(arbs, ["basketball_nba"], now=time.time())
+        self.assertIsNone(a.open[arbs[0].key].message_id)
+        a.handle(arbs, ["basketball_nba"], now=time.time())          # same prices: retried anyway
+        self.assertEqual([m for m, _ in self.sent], ["POST", "POST"])
+        self.assertIsNotNone(a.open[arbs[0].key].message_id)
+        a.handle(arbs, ["basketball_nba"], now=time.time())          # landed: nothing more to send
+        self.assertEqual(len(self.sent), 2)
+
+    def test_prop_alerts_close_at_kickoff(self):
+        from arbbot import close_started
+        a = EVAlerter(self.cfg, dry_run=True)
+        ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)})
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        [b] = find_evs([ev], self.cfg.for_props(), NOW)
+        a.handle([b], now=1000)
+        self.assertEqual(close_started(NOW, a), set())                # not started: stays
+        self.assertIn(b.key, a.open)
+        tip = datetime(2026, 10, 3, 18, 1, tzinfo=timezone.utc)
+        self.assertEqual(close_started(tip, a), {"p1"})
+        self.assertEqual(a.open, {})
+
+    def test_ev_to_outlier_and_back_is_one_bet(self):
+        from arbbot import hand_over
+        ev_alr, out_alr = self.wire(EVAlerter(self.cfg, dry_run=False)), self.wire(OutlierAlerter(self.cfg, dry_run=False))
+        logged = []
+        ev_alr.on_log = out_alr.on_log = logged.append
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [b] = find_evs([ev], self.cfg, NOW)
+        ev_alr.handle([b], ["Test"], now=1000)
+        # The same bet becomes an outlier: the +EV card is retired with a pointer, not "GONE".
+        hand_over([], [b], ev_alr, out_alr)
+        out_alr.handle([b], now=1100)
+        ev_alr.handle([], now=1100)
+        titles = [t for _, t in self.sent]
+        self.assertTrue(titles[1].startswith("⬆️ Now an OUTLIER"))
+        self.assertFalse(any("GONE" in t for t in titles))
+        self.assertEqual(out_alr.open[b.key].first_seen, 1000)       # same bet, same start time
+        self.assertEqual(len(logged), 1)                             # logged once, not twice
+        # ...and back to a normal +EV edge.
+        hand_over([b], [], ev_alr, out_alr)
+        ev_alr.handle([b], now=1200)
+        out_alr.handle([], now=1200)
+        self.assertTrue(self.sent[-2][1].startswith("↘️ Back to a normal +EV edge"))
+        self.assertIn(b.key, ev_alr.open)
+        self.assertEqual(out_alr.open, {})
+        self.assertEqual(len(logged), 1)
+        self.assertFalse(any("GONE" in t for _, t in self.sent))
+
+
+class ParlayFixes(unittest.TestCase):
+    def test_open_parlay_kept_over_a_slightly_better_one(self):
+        a, b, c = ev_leg("g1", {"DK": 2.10}), ev_leg("g2", {"DK": 2.12}), ev_leg("g3", {"DK": 2.30})
+        cfg = Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2, parlay_max_alerts=1)
+        [ab] = find_parlays([a, b], cfg)
+        [best] = find_parlays([a, b, c], cfg)
+        self.assertNotEqual(best.key, ab.key)                        # a new leg makes a better combo...
+        [kept] = find_parlays([a, b, c], cfg, keep={ab.key})
+        self.assertEqual(kept.key, ab.key)                           # ...but the posted one stays
+
+    def test_started_legs_dropped(self):
+        legs = [ev_leg("g1", {"DK": 2.20}), ev_leg("g2", {"DK": 2.20})]
+        cfg = Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1)
+        self.assertTrue(find_parlays(legs, cfg, now=NOW))
+        self.assertEqual(find_parlays(legs, cfg, now=datetime(2026, 10, 3, 18, 1, tzinfo=timezone.utc)), [])
+
+    def test_rejected_prices_not_green_or_parlayed(self):
+        from arbbot import _board_lines
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"B": [("Home", 2.10, None)], "C": [("Home", 2.90, None)]})  # C: +45%, a stale line
+        [b] = find_evs([ev], Config(min_ev_pct=3, max_ev_pct=25), NOW)
+        self.assertEqual(b.book, "B")
+        self.assertEqual({r[0]: r[4] for r in b.board}, {"C": False, "B": True})
+        self.assertIn("⚪ C", _board_lines(b))
+        self.assertNotIn("Any 🟢 book below works", ev_payload(b)["embeds"][0]["description"])
+        other = ev_leg("g2", {"C": 2.20})
+        self.assertEqual(find_parlays([b, other], Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1)), [])
+        [o] = find_outliers([outlier_event(1.85, 1.95)], Config(), NOW)
+        self.assertTrue(all(r[4] for r in o.board))
+
+
+class PropClosingLines(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.cfg = Config(ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
+                          closing_file=str(d / "close.csv"), pregame_max_age_seconds=10**9)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def row(self, event_id, player=""):
+        return {"event_id": event_id, "market": "player_points" if player else "h2h", "outcome": "Over" if player else "Home",
+                "point": "25.5" if player else "", "player": player, "home_team": "Lakers",
+                "first_seen": "2026-10-03T11:00:00+00:00", "commence_time": "2026-10-03T18:00:00Z"}
+
+    def test_prop_bets_get_their_own_closing_check(self):
+        tr = ClosingTracker(self.cfg)
+        tr.add(self.row("e1"))
+        tr.add(self.row("p1", "LeBron James"))
+        self.assertEqual((tr.needs_close(), tr.needs_close_props()), ({"e1"}, {"p1"}))
+        cfg = Config(sports=["basketball_nba"], closing_minutes=5, prop_minutes=10**6, prop_early_minutes=10**6)
+        s = sched_with({"basketball_nba": [("p1", NOW + timedelta(minutes=4))]}, cfg)
+        s.last_props["p1"] = (NOW - timedelta(minutes=10)).timestamp()
+        self.assertEqual(s.props_due(NOW), [])                       # no logged prop bet on it
+        s.need_close_props = {"p1"}
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", "p1")])
+        s.last_props["p1"] = (NOW - timedelta(minutes=0.5)).timestamp()
+        self.assertEqual(s.props_due(NOW), [])                       # already looked inside the window
+
+    def test_close_uses_consensus_when_no_sharp_prices_the_prop(self):
+        tr = ClosingTracker(self.cfg)
+        tr.add(self.row("p1", "LeBron James"))
+        ev = prop_event({"DK": (1.95, 1.87), "FD": (1.90, 1.92), "MGM": (1.93, 1.89), "CZR": (1.92, 1.90)})
+        tr.observe([ev], NOW)
+        [(p, _)] = tr.latest.values()
+        self.assertAlmostEqual(p, 0.5, delta=0.02)
+
+
+class Settings(unittest.TestCase):
+    def env(self, **kv):
+        import os
+        from unittest import mock
+        return mock.patch.dict(os.environ, kv)
+
+    def test_empty_number_means_default_and_maps_take_semicolons(self):
+        with self.env(POLL_SECONDS="", BANKROLL=" ", BUDGET_WEIGHTS="sat=2;sun=3", GAME_MINUTES="basketball_ncaab=140",
+                      PREGAME_MINUTES="20.0"):
+            cfg = Config.from_env()
+        self.assertEqual(cfg.poll_seconds, Config().poll_seconds)
+        self.assertEqual(cfg.bankroll, Config().bankroll)
+        self.assertEqual((cfg.budget_weights["sat"], cfg.budget_weights["sun"]), (2.0, 3.0))
+        self.assertEqual(cfg.game_minutes, {"basketball_ncaab": 140})
+        self.assertEqual(cfg.pregame_minutes, 20)
+
+    def test_bad_values_name_the_setting(self):
+        with self.env(POLL_SECONDS="abc"), self.assertRaisesRegex(ValueError, "POLL_SECONDS"):
+            Config.from_env()
+        with self.env(BUDGET_WEIGHTS="sat"), self.assertRaisesRegex(ValueError, "BUDGET_WEIGHTS"):
+            Config.from_env()
+        with self.env(SHARP_WEIGHTS="pinnacle=heavy"), self.assertRaisesRegex(ValueError, "SHARP_WEIGHTS"):
+            Config.from_env()
+
+    def test_set_replaces_spaced_lines(self):
+        import os, tempfile
+        from arbbot import set_env_value, load_dotenv
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / ".env"
+            f.write_text("ARBTEST_BOOKS = fanduel\n# ARBTEST_BOOKS=old\nARBTEST_OTHER=1\n")
+            set_env_value(f, "ARBTEST_BOOKS", "draftkings")
+            self.assertEqual(f.read_text(), "# ARBTEST_BOOKS=old\nARBTEST_OTHER=1\nARBTEST_BOOKS=draftkings\n")
+            os.environ.pop("ARBTEST_BOOKS", None)
+            os.environ.pop("ARBTEST_OTHER", None)
+            load_dotenv(f)
+            self.assertEqual(os.environ.pop("ARBTEST_BOOKS"), "draftkings")
+            os.environ.pop("ARBTEST_OTHER", None)
 
 
 if __name__ == "__main__":

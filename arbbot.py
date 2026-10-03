@@ -26,6 +26,7 @@ import argparse
 import calendar
 import csv
 import gzip
+import http.client
 import itertools
 import json
 import math
@@ -97,10 +98,18 @@ WEBHOOK_SETTINGS = {
 }
 
 
+def _env_key(line: str) -> str | None:
+    """The setting a .env line sets, read the way load_dotenv reads it ("KEY = v" counts)."""
+    s = line.strip()
+    if not s or s.startswith("#") or "=" not in s:
+        return None
+    return s.split("=", 1)[0].strip()
+
+
 def set_env_value(path: Path, key: str, value: str) -> None:
     """Replace KEY=... in .env (or add it), keeping every other line as it is."""
     lines = path.read_text().splitlines() if path.exists() else []
-    lines = [l for l in lines if not l.strip().startswith(key + "=")]
+    lines = [l for l in lines if _env_key(l) != key]
     lines.append(f"{key}={value}")
     path.write_text("\n".join(lines) + "\n")
 
@@ -269,6 +278,31 @@ class Config:
     def from_env(cls) -> "Config":
         e = os.environ.get
         d = cls()
+
+        def num(key: str, default, typ):
+            """A number setting; empty means the default."""
+            v = (e(key) or "").strip()
+            if not v:
+                return default
+            try:
+                return typ(float(v)) if typ is int else typ(v)
+            except ValueError:
+                raise ValueError(f"{key}={v} should be a number") from None
+
+        def pairs(key: str, typ) -> dict:
+            """A name=value list (BUDGET_WEIGHTS=sat=1.6,sun=1.6). Commas or semicolons."""
+            out = {}
+            for x in (e(key) or "").replace(";", ",").split(","):
+                if not x.strip():
+                    continue
+                k, sep, v = x.partition("=")
+                try:
+                    out[k.strip()] = typ(float(v)) if typ is int else typ(v)
+                except ValueError:
+                    raise ValueError(f"{key}: '{x.strip()}' should look like name=number") from None
+                if not sep or not k.strip():
+                    raise ValueError(f"{key}: '{x.strip()}' should look like name=number")
+            return out
         cfg = cls(
             api_key=e("ODDS_API_KEY", ""),
             webhook_url=e("DISCORD_WEBHOOK_URL", ""),
@@ -277,39 +311,38 @@ class Config:
             markets=e("MARKETS", d.markets),
             bookmakers=e("BOOKMAKERS", d.bookmakers),
             my_books=e("MY_BOOKS", ""),
-            kalshi_fee_rate=float(e("KALSHI_FEE_RATE", d.kalshi_fee_rate)),
+            kalshi_fee_rate=num("KALSHI_FEE_RATE", d.kalshi_fee_rate, float),
             us_state=e("US_STATE", "").strip().lower(),
-            poll_seconds=int(e("POLL_SECONDS", d.poll_seconds)),
-            pregame_minutes=int(e("PREGAME_MINUTES", d.pregame_minutes)),
-            pregame_hours=float(e("PREGAME_HOURS", d.pregame_hours)),
-            early_minutes=int(e("EARLY_MINUTES", d.early_minutes)),
-            lookahead_hours=float(e("LOOKAHEAD_HOURS", d.lookahead_hours)),
-            far_minutes=int(e("FAR_MINUTES", d.far_minutes)),
-            far_max_age_seconds=int(e("FAR_MAX_AGE_SECONDS", d.far_max_age_seconds)),
-            extra_max_stretch=float(e("EXTRA_MAX_STRETCH", d.extra_max_stretch)),
-            budget_weights={**d.budget_weights, **{k.strip().lower()[:3]: float(v) for k, v in
-                            (x.split("=") for x in _csv(e("BUDGET_WEIGHTS", "")))}},
-            monthly_credits=int(e("MONTHLY_CREDITS", d.monthly_credits)),
-            billing_day=int(e("BILLING_DAY", d.billing_day)),
-            events_refresh_minutes=int(e("EVENTS_REFRESH_MINUTES", d.events_refresh_minutes)),
-            game_minutes={k.strip(): int(v) for k, v in
-                          (p.split("=") for p in _csv(e("GAME_MINUTES", "")))},
-            min_profit_pct=float(e("MIN_PROFIT_PCT", d.min_profit_pct)),
+            poll_seconds=num("POLL_SECONDS", d.poll_seconds, int),
+            pregame_minutes=num("PREGAME_MINUTES", d.pregame_minutes, int),
+            pregame_hours=num("PREGAME_HOURS", d.pregame_hours, float),
+            early_minutes=num("EARLY_MINUTES", d.early_minutes, int),
+            lookahead_hours=num("LOOKAHEAD_HOURS", d.lookahead_hours, float),
+            far_minutes=num("FAR_MINUTES", d.far_minutes, int),
+            far_max_age_seconds=num("FAR_MAX_AGE_SECONDS", d.far_max_age_seconds, int),
+            extra_max_stretch=num("EXTRA_MAX_STRETCH", d.extra_max_stretch, float),
+            budget_weights={**d.budget_weights,
+                            **{k.lower()[:3]: v for k, v in pairs("BUDGET_WEIGHTS", float).items()}},
+            monthly_credits=num("MONTHLY_CREDITS", d.monthly_credits, int),
+            billing_day=num("BILLING_DAY", d.billing_day, int),
+            events_refresh_minutes=num("EVENTS_REFRESH_MINUTES", d.events_refresh_minutes, int),
+            game_minutes=pairs("GAME_MINUTES", int),
+            min_profit_pct=num("MIN_PROFIT_PCT", d.min_profit_pct, float),
             alert_mode=e("ALERT_MODE", d.alert_mode).strip().lower(),
-            max_ev_per_hour=int(e("MAX_EV_PER_HOUR", d.max_ev_per_hour)),
-            max_prop_per_hour=int(e("MAX_PROP_PER_HOUR", d.max_prop_per_hour)),
-            max_parlay_per_hour=int(e("MAX_PARLAY_PER_HOUR", d.max_parlay_per_hour)),
-            min_profit_dollars=float(e("MIN_PROFIT_DOLLARS", d.min_profit_dollars)),
-            max_profit_pct=float(e("MAX_PROFIT_PCT", d.max_profit_pct)),
-            max_age_seconds=int(e("MAX_AGE_SECONDS", d.max_age_seconds)),
-            pregame_max_age_seconds=int(e("PREGAME_MAX_AGE_SECONDS", d.pregame_max_age_seconds)),
-            realert_jump_pct=float(e("REALERT_JUMP_PCT", d.realert_jump_pct)),
-            bankroll=float(e("BANKROLL", d.bankroll)),
-            round_stakes=float(e("ROUND_STAKES", d.round_stakes)),
-            round_keep_pct=float(e("ROUND_KEEP_PCT", d.round_keep_pct)),
+            max_ev_per_hour=num("MAX_EV_PER_HOUR", d.max_ev_per_hour, int),
+            max_prop_per_hour=num("MAX_PROP_PER_HOUR", d.max_prop_per_hour, int),
+            max_parlay_per_hour=num("MAX_PARLAY_PER_HOUR", d.max_parlay_per_hour, int),
+            min_profit_dollars=num("MIN_PROFIT_DOLLARS", d.min_profit_dollars, float),
+            max_profit_pct=num("MAX_PROFIT_PCT", d.max_profit_pct, float),
+            max_age_seconds=num("MAX_AGE_SECONDS", d.max_age_seconds, int),
+            pregame_max_age_seconds=num("PREGAME_MAX_AGE_SECONDS", d.pregame_max_age_seconds, int),
+            realert_jump_pct=num("REALERT_JUMP_PCT", d.realert_jump_pct, float),
+            bankroll=num("BANKROLL", d.bankroll, float),
+            round_stakes=num("ROUND_STAKES", d.round_stakes, float),
+            round_keep_pct=num("ROUND_KEEP_PCT", d.round_keep_pct, float),
             arb_live=e("ARB_LIVE", "true").lower() in ("1", "true", "yes"),
-            min_live_profit_pct=float(e("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct)),
-            live_arb_max_skew=int(e("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew)),
+            min_live_profit_pct=num("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct, float),
+            live_arb_max_skew=num("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew, int),
             live_sports=_csv(e("LIVE_SPORTS", "")),
             live_webhook_url=e("DISCORD_LIVE_WEBHOOK_URL", ""),
             ev_webhook_url=e("DISCORD_EV_WEBHOOK_URL", ""),
@@ -317,35 +350,33 @@ class Config:
             include_links=e("INCLUDE_LINKS", "true").lower() in ("1", "true", "yes"),
             discord_mention=e("DISCORD_MENTION", ""),
             status_webhook_url=e("DISCORD_STATUS_WEBHOOK_URL", ""),
-            low_credits=int(e("LOW_CREDITS", d.low_credits)),
+            low_credits=num("LOW_CREDITS", d.low_credits, int),
             log_file=e("LOG_FILE", d.log_file),
             state_dir=e("STATE_DIR", d.state_dir),
-            summary_hour=int(e("SUMMARY_HOUR", d.summary_hour)),
+            summary_hour=num("SUMMARY_HOUR", d.summary_hour, int),
             odds_format=e("ODDS_FORMAT", d.odds_format).strip().lower(),
             ev_enabled=e("EV_ENABLED", "true").lower() in ("1", "true", "yes"),
             sharp_books=e("SHARP_BOOKS", d.sharp_books),
-            sharp_weights={k.strip(): float(v) for k, v in
-                           (x.split("=") for x in _csv(e("SHARP_WEIGHTS", "")))},
-            sharp_disagree_pct=float(e("SHARP_DISAGREE_PCT", d.sharp_disagree_pct)),
-            single_source_stake=float(e("SINGLE_SOURCE_STAKE", d.single_source_stake)),
+            sharp_weights=pairs("SHARP_WEIGHTS", float),
+            sharp_disagree_pct=num("SHARP_DISAGREE_PCT", d.sharp_disagree_pct, float),
+            single_source_stake=num("SINGLE_SOURCE_STAKE", d.single_source_stake, float),
             devig_method=e("DEVIG_METHOD", d.devig_method).strip().lower(),
-            max_sharp_hold_pct=float(e("MAX_SHARP_HOLD_PCT", d.max_sharp_hold_pct)),
-            sharp_consensus_max_gap=float(e("SHARP_CONSENSUS_MAX_GAP", d.sharp_consensus_max_gap)),
+            max_sharp_hold_pct=num("MAX_SHARP_HOLD_PCT", d.max_sharp_hold_pct, float),
+            sharp_consensus_max_gap=num("SHARP_CONSENSUS_MAX_GAP", d.sharp_consensus_max_gap, float),
             min_confidence=e("MIN_CONFIDENCE", d.min_confidence).strip().lower(),
-            sport_min_ev={**d.sport_min_ev, **{k.strip(): float(v) for k, v in
-                          (x.split("=") for x in _csv(e("SPORT_MIN_EV", "")))}},
-            move_window_minutes=int(e("MOVE_WINDOW_MINUTES", d.move_window_minutes)),
+            sport_min_ev={**d.sport_min_ev, **pairs("SPORT_MIN_EV", float)},
+            move_window_minutes=num("MOVE_WINDOW_MINUTES", d.move_window_minutes, int),
             confidence_stakes=e("CONFIDENCE_STAKES", d.confidence_stakes),
-            unit_size=float(e("UNIT_SIZE", d.unit_size)),
+            unit_size=num("UNIT_SIZE", d.unit_size, float),
             bet_at_sharp=e("BET_AT_SHARP", "false").lower() in ("1", "true", "yes"),
             ev_books=e("EV_BOOKS", ""),
-            min_ev_pct=float(e("MIN_EV_PCT", d.min_ev_pct)),
-            max_ev_pct=float(e("MAX_EV_PCT", d.max_ev_pct)),
-            ev_max_odds=float(e("EV_MAX_ODDS", d.ev_max_odds)),
+            min_ev_pct=num("MIN_EV_PCT", d.min_ev_pct, float),
+            max_ev_pct=num("MAX_EV_PCT", d.max_ev_pct, float),
+            ev_max_odds=num("EV_MAX_ODDS", d.ev_max_odds, float),
             ev_live=e("EV_LIVE", "false").lower() in ("1", "true", "yes"),
-            ev_bankroll=float(e("EV_BANKROLL", d.ev_bankroll)),
-            kelly_fraction=float(e("KELLY_FRACTION", d.kelly_fraction)),
-            ev_max_stake_pct=float(e("EV_MAX_STAKE_PCT", d.ev_max_stake_pct)),
+            ev_bankroll=num("EV_BANKROLL", d.ev_bankroll, float),
+            kelly_fraction=num("KELLY_FRACTION", d.kelly_fraction, float),
+            ev_max_stake_pct=num("EV_MAX_STAKE_PCT", d.ev_max_stake_pct, float),
             ev_mention=e("EV_MENTION", ""),
             ev_log_file=e("EV_LOG_FILE", d.ev_log_file),
             ev_results_file=e("EV_RESULTS_FILE", d.ev_results_file),
@@ -354,24 +385,24 @@ class Config:
             prop_sports=_csv(e("PROP_SPORTS", "")) or d.prop_sports,
             prop_markets={**d.prop_markets, **{k.strip(): v.strip().replace("|", ",") for k, v in
                           (x.split("=", 1) for x in e("PROP_MARKETS", "").split(";") if "=" in x)}},
-            prop_minutes=int(e("PROP_MINUTES", d.prop_minutes)),
-            prop_hours=float(e("PROP_HOURS", d.prop_hours)),
-            prop_early_hours=float(e("PROP_EARLY_HOURS", d.prop_early_hours)),
-            prop_early_minutes=int(e("PROP_EARLY_MINUTES", d.prop_early_minutes)),
-            prop_min_ev_pct=float(e("PROP_MIN_EV_PCT", d.prop_min_ev_pct)),
-            prop_min_books=int(e("PROP_MIN_BOOKS", d.prop_min_books)),
+            prop_minutes=num("PROP_MINUTES", d.prop_minutes, int),
+            prop_hours=num("PROP_HOURS", d.prop_hours, float),
+            prop_early_hours=num("PROP_EARLY_HOURS", d.prop_early_hours, float),
+            prop_early_minutes=num("PROP_EARLY_MINUTES", d.prop_early_minutes, int),
+            prop_min_ev_pct=num("PROP_MIN_EV_PCT", d.prop_min_ev_pct, float),
+            prop_min_books=num("PROP_MIN_BOOKS", d.prop_min_books, int),
             parlays_enabled=e("PARLAYS_ENABLED", "true").lower() in ("1", "true", "yes"),
-            parlay_max_legs=int(e("PARLAY_MAX_LEGS", d.parlay_max_legs)),
-            parlay_min_ev_pct=float(e("PARLAY_MIN_EV_PCT", d.parlay_min_ev_pct)),
-            parlay_leg_min_ev_pct=float(e("PARLAY_LEG_MIN_EV_PCT", d.parlay_leg_min_ev_pct)),
-            parlay_max_alerts=int(e("PARLAY_MAX_ALERTS", d.parlay_max_alerts)),
-            parlay_max_stake_pct=float(e("PARLAY_MAX_STAKE_PCT", d.parlay_max_stake_pct)),
+            parlay_max_legs=num("PARLAY_MAX_LEGS", d.parlay_max_legs, int),
+            parlay_min_ev_pct=num("PARLAY_MIN_EV_PCT", d.parlay_min_ev_pct, float),
+            parlay_leg_min_ev_pct=num("PARLAY_LEG_MIN_EV_PCT", d.parlay_leg_min_ev_pct, float),
+            parlay_max_alerts=num("PARLAY_MAX_ALERTS", d.parlay_max_alerts, int),
+            parlay_max_stake_pct=num("PARLAY_MAX_STAKE_PCT", d.parlay_max_stake_pct, float),
             parlay_mention=e("PARLAY_MENTION", ""),
             parlay_log_file=e("PARLAY_LOG_FILE", d.parlay_log_file),
-            closing_minutes=int(e("CLOSING_MINUTES", d.closing_minutes)),
+            closing_minutes=num("CLOSING_MINUTES", d.closing_minutes, int),
             outliers_enabled=e("OUTLIERS_ENABLED", "true").lower() in ("1", "true", "yes"),
-            outlier_min_pct=float(e("OUTLIER_MIN_PCT", d.outlier_min_pct)),
-            outlier_min_books=int(e("OUTLIER_MIN_BOOKS", d.outlier_min_books)),
+            outlier_min_pct=num("OUTLIER_MIN_PCT", d.outlier_min_pct, float),
+            outlier_min_books=num("OUTLIER_MIN_BOOKS", d.outlier_min_books, int),
             outlier_live=e("OUTLIER_LIVE", "true").lower() in ("1", "true", "yes"),
             outlier_mention=e("OUTLIER_MENTION", ""),
             outlier_webhook_url=e("DISCORD_OUTLIER_WEBHOOK_URL", ""),
@@ -1013,6 +1044,7 @@ class Alerter:
         self.started = time.time()
         self.max_per_hour = 0          # 0 = no cap
         self.posted_at: list[float] = []
+        self.handed: dict[str, float] = {}  # key -> first_seen, for bets taken over from a sibling alerter
         self.reset_stats()
         self._load_state()
 
@@ -1136,18 +1168,20 @@ class Alerter:
         for arb in arbs:
             seen.add(arb.key)
             cur = self.open.get(arb.key) or self._restore(arb, now)
-            if cur is None and self.max_per_hour:
+            handed = self.handed.pop(arb.key, None)
+            if cur is None and self.max_per_hour and handed is None:
                 self.posted_at = [t for t in self.posted_at if now - t < 3600]
                 if len(self.posted_at) >= self.max_per_hour:
                     continue  # hourly cap reached; items arrive best-first, so the best already went out
                 self.posted_at.append(now)
             if cur is None:
                 print(self.text(arb), flush=True)
-                op = OpenArb(arb, now, now, self.value(arb), alerted_pct=self.value(arb),
+                first = handed or now
+                op = OpenArb(arb, first, now, self.value(arb), alerted_pct=self.value(arb),
                              url=self.webhook_for(arb))
-                op.message_id = self._discord(self.payload(arb, self.mention(), first_seen=now), url=op.url)
+                op.message_id = self._discord(self.payload(arb, self.mention(), first_seen=first), url=op.url)
                 self.open[arb.key] = op
-                if self.log_on_open:
+                if self.log_on_open and handed is None:   # a handed-over bet was logged already
                     self._log(op, now, None)
                 self.stats["found"] += 1
                 if self.value(arb) > self.stats["best_pct"]:
@@ -1169,9 +1203,15 @@ class Alerter:
                                                    url=cur.url)
                     cur.alerted_pct = self.value(arb)
                     new += 1
-                elif changed:
-                    print(f"  ↻ updated: {self.label(arb)} now {self.value(arb):.2f}%", flush=True)
-                    self._discord(self.payload(arb, first_seen=cur.first_seen), cur.message_id, cur.url)
+                elif changed or not cur.message_id:
+                    if cur.message_id:
+                        print(f"  ↻ updated: {self.label(arb)} now {self.value(arb):.2f}%", flush=True)
+                        self._discord(self.payload(arb, first_seen=cur.first_seen), cur.message_id, cur.url)
+                    elif not self.dry_run:
+                        # The first post never landed (network error, rate limit): retry it, with
+                        # the ping, and keep its id so later edits and the GONE mark reach it.
+                        cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=cur.first_seen),
+                                                       url=cur.url)
 
         checked = set(checked_sports) if checked_sports is not None else None
         for key in list(self.open):
@@ -1181,6 +1221,7 @@ class Alerter:
             if checked_events is not None and op.arb.event_id not in checked_events:
                 continue  # that game wasn't re-checked this round
             self._close(key, now)
+        self.handed.clear()
         self._expire_restored(now)
         self._save_state()
         return new
@@ -1288,7 +1329,8 @@ class EVBet:
     sources_total: int = 1
     unit_size: float = 0.0
     sharp_quotes: list[tuple[str, list[float]]] = field(default_factory=list)  # (book, [this side, other side(s)])
-    board: list[tuple[str, float, float, str]] = field(default_factory=list)   # every book: (book, price, EV%, link)
+    # Every book: (book, price, EV%, link, ok). ok = passes the +EV filters (odds cap, not a stale line).
+    board: list[tuple[str, float, float, str, bool]] = field(default_factory=list)
     hedge: list[tuple[str, str, float, str]] = field(default_factory=list)  # (outcome, book, price, link)
     hedge_pct: float = 0.0           # guaranteed profit % if the hedge is placed too
     related: list[str] = field(default_factory=list)  # other alerts open on the same game
@@ -1567,7 +1609,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
 
         # Every soft-book price that beats fair by enough (and every price, for the board).
         offers: dict[tuple, list[tuple[float, str, str, float | None]]] = {}
-        boards: dict[tuple, list[tuple[str, float, float]]] = {}
+        boards: dict[tuple, list[tuple[str, float, float, str, bool]]] = {}
         for key, bm in books.items():
             if key in sharp or (allowed and key not in allowed):
                 continue
@@ -1582,7 +1624,8 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                         continue
                     ev_pct = (p * price - 1) * 100
                     link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
-                    boards.setdefault((k, oc["name"]), []).append((bm.get("title", key), price, ev_pct, link))
+                    ok = price <= cfg.ev_max_odds and ev_pct <= cfg.max_ev_pct
+                    boards.setdefault((k, oc["name"]), []).append((bm.get("title", key), price, ev_pct, link, ok))
                     if price > cfg.ev_max_odds:
                         continue
                     if max(cfg.min_ev_pct, cfg.sport_min_ev.get(ev.get("sport_key", ""), 0)) <= ev_pct <= cfg.max_ev_pct:
@@ -1646,7 +1689,7 @@ def _fair_line(b: EVBet) -> str:
 
 
 def _board(b: EVBet, rows: int = 12) -> str:
-    lines = [f"{bk[:14]:<14} {odds(pr):>6} {ev:+5.1f}%" for bk, pr, ev, _ in b.board[:rows]]
+    lines = [f"{bk[:14]:<14} {odds(pr):>6} {ev:+5.1f}%" for bk, pr, ev, *_ in b.board[:rows]]
     return "```\n" + "\n".join(lines) + "\n```" if lines else ""
 
 
@@ -1668,8 +1711,8 @@ def format_ev_text(b: EVBet) -> str:
 def _board_lines(b: EVBet, rows: int = 12) -> str:
     """Every book's price on this bet, best first, each with its link."""
     lines = []
-    for bk, pr, ev, link in b.board[:rows]:
-        mark = "🟢" if ev > 0 else "⚪"
+    for bk, pr, ev, link, ok in b.board[:rows]:
+        mark = "🟢" if ev > 0 and ok else "⚪"
         lines.append(f"{mark} {_link(bk, link)} — **{odds(pr)}** · {ev:+.1f}%")
     return "\n".join(lines)
 
@@ -1688,7 +1731,7 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
         + (f"\nConfidence: **{CONFIDENCE_BADGE[b.confidence]}**"
            + (f" · {', '.join(b.confidence_notes)}" if b.confidence_notes else "") if b.confidence else ""),
     ]
-    if len([r for r in b.board if r[2] > 0]) > 1:
+    if len([r for r in b.board if r[2] > 0 and r[4]]) > 1:
         parts.append("Can't use that book? Any 🟢 book below works too, at its price.")
     if b.related:
         parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}. These move together, "
@@ -1810,7 +1853,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
                     if edge < cfg.outlier_min_pct:
                         continue
                     board = sorted(((titles[b], oo[name], (fair_p * oo[name] - 1) * 100,
-                                     links.get((k, b, name), ""))
+                                     links.get((k, b, name), ""), True)
                                     for b, oo in full.items() if b not in reference_only and cfg.bettable(b)),
                                    key=lambda r: r[1], reverse=True)
                     bet = EVBet(
@@ -1851,18 +1894,56 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
     return list(best.values())
 
 
-def note_related(bets: list[EVBet], *alerters: "Alerter") -> None:
+def note_related(groups: list[tuple[list[EVBet], "Alerter", set[str]]], now: float | None = None) -> None:
     """Tell each +EV/outlier alert about other alerts on the same game (they tend to win or lose
-    together, so they aren't independent bets)."""
-    pool = {b.key: b for b in bets}
-    for a in alerters:
-        for op in a.open.values():
-            pool.setdefault(op.arb.key, op.arb)
+    together, so they aren't independent bets).
+
+    groups: (bets about to be handled, their alerter, what this scan re-checked: sport keys or
+    event ids). Only alerts that will exist after this scan count: a bet the hourly cap will
+    skip was never sent, and an open alert that was re-checked but not found is about to close.
+    """
+    now = now or time.time()
+    pool: dict[str, EVBet] = {}
+    for bets, a, checked in groups:
+        slots = None
+        if a.max_per_hour:
+            slots = a.max_per_hour - len([t for t in a.posted_at if now - t < 3600])
+        for b in bets:  # best first, the same order handle() posts them in
+            if b.key in a.open or b.key in a.restored or b.key in a.handed:
+                pool[b.key] = b
+            elif slots is None or slots > 0:
+                pool[b.key] = b
+                slots = None if slots is None else slots - 1
+        for k, op in a.open.items():
+            if k not in pool and op.arb.sport_key not in checked and op.arb.event_id not in checked:
+                pool[k] = op.arb  # not looked at this scan, so it stays open
     by_game: dict[str, list[EVBet]] = {}
     for b in pool.values():
         by_game.setdefault(b.event_id, []).append(b)
-    for b in bets:
-        b.related = [o.pick for o in by_game.get(b.event_id, []) if o.key != b.key][:3]
+    for bets, _, _ in groups:
+        for b in bets:
+            b.related = [o.pick for o in by_game.get(b.event_id, []) if o.key != b.key][:3]
+
+
+def hand_over(evs: list[EVBet], outs: list[EVBet], ev_alr: "EVAlerter", out_alr: "OutlierAlerter") -> None:
+    """A bet that turns from +EV into an outlier (or back) is the same bet: retire its old card
+    with a pointer instead of a false "GONE", and let the other alerter post it without logging
+    it twice. Call right before both handle() calls."""
+    out_keys, ev_keys = {o.key for o in outs}, {b.key for b in evs}
+    for src, dst, keys, note in (
+            (ev_alr, out_alr, out_keys, "⬆️ Now an OUTLIER (bigger edge): see the new 🚨 alert"),
+            (out_alr, ev_alr, ev_keys - out_keys, "↘️ Back to a normal +EV edge: see the new 📈 alert")):
+        for k in [k for k in src.open if k in keys and k not in dst.open]:
+            op = src.open.pop(k)
+            dst.handed[k] = op.first_seen
+            if op.message_id:
+                src._discord(_gone_card(note, f"{op.arb.pick} {odds(op.arb.price)} at {op.arb.book} · "
+                                              f"{op.arb.matchup}"), op.message_id, op.url)
+        for k in [k for k in src.restored if k in keys and k not in dst.open]:
+            saved = src.restored.pop(k)
+            dst.handed[k] = saved.get("first_seen", time.time())
+            if saved.get("message_id"):
+                src._discord(_gone_card(note, saved.get("label", "")), saved["message_id"], saved.get("url", ""))
 
 
 def without_outliers(evs: list[EVBet], outs: list[EVBet]) -> list[EVBet]:
@@ -1972,16 +2053,20 @@ class Parlay:
         return f"{money(self.stake)}{units}"
 
 
-def find_parlays(bets: list["EVBet"], cfg: Config) -> list[Parlay]:
-    """Best +EV parlays from the current +EV bets: same book, different games, pre-game only."""
+def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = frozenset(),
+                 now: datetime | None = None) -> list[Parlay]:
+    """Best +EV parlays from the current +EV bets: same book, different games, pre-game only.
+    keep = keys of parlays already posted (kept ahead of new ones while they still qualify)."""
     if not cfg.parlays_enabled:
         return []
     per_book: dict[str, list[tuple["EVBet", float, str]]] = {}
     for b in bets:
         if b.is_live:
             continue
-        for book, price, ev, link in b.board:
-            if ev >= cfg.parlay_leg_min_ev_pct:  # boards only hold books allowed by EV_BOOKS
+        if now is not None and _parse_time(b.commence_time) <= now:
+            continue  # started since it was alerted
+        for book, price, ev, link, ok in b.board:
+            if ok and ev >= cfg.parlay_leg_min_ev_pct:  # boards only hold books allowed by EV_BOOKS
                 per_book.setdefault(book, []).append((b, price, link))
     found: list[Parlay] = []
     for book, legs in per_book.items():
@@ -1993,9 +2078,10 @@ def find_parlays(bets: list["EVBet"], cfg: Config) -> list[Parlay]:
                 p = Parlay(book, list(combo), unit_size=cfg.unit_size)
                 if p.ev_pct >= cfg.parlay_min_ev_pct:
                     found.append(p)
-    # Best first, and don't reuse a leg across alerts.
+    # Parlays already posted that still qualify first (replacing one with a slightly better
+    # combo would kill a good card), then best first; a leg is never reused across alerts.
     out, used = [], set()
-    for p in sorted(found, key=lambda p: p.ev_pct, reverse=True):
+    for p in sorted(found, key=lambda p: (p.key in keep, p.ev_pct), reverse=True):
         keys = {b.key for b, _, _ in p.legs}
         if keys & used:
             continue
@@ -2225,20 +2311,34 @@ class ClosingTracker:
         self.tracked[bid] = row
 
     def needs_close(self) -> set[str]:
-        """Event ids that still need a last look before kickoff."""
-        return {r["event_id"] for r in self.tracked.values()}
+        """Event ids with a main-line bet that still needs a last look before kickoff."""
+        return {r["event_id"] for r in self.tracked.values() if not r.get("player")}
+
+    def needs_close_props(self) -> set[str]:
+        """Event ids with a player-prop bet that still needs a last look (props come from a
+        separate per-game request, so a main-line check can't close them)."""
+        return {r["event_id"] for r in self.tracked.values() if r.get("player")}
 
     def observe(self, events: list[dict], now: datetime | None = None) -> None:
         now = now or datetime.now(timezone.utc)
-        wanted = self.needs_close()
+        wanted = {r["event_id"] for r in self.tracked.values()}
         for ev in events:
             if ev["id"] not in wanted or _parse_time(ev["commence_time"]) <= now:
                 continue
             fair = sharp_fair(ev, self.cfg, now, False)[0]
+            market = None
             for bid, r in self.tracked.items():
                 if r["event_id"] != ev["id"]:
                     continue
-                p = fair.get((r["market"], _row_line(r)), {}).get(r["outcome"])
+                k = (r["market"], _row_line(r))
+                p = fair.get(k, {}).get(r["outcome"])
+                if p is None:
+                    # No sharp price on this line (common for props): use the market consensus,
+                    # the same fallback the alert itself used.
+                    if market is None:
+                        cons = replace(self.cfg, consensus_min_books=self.cfg.consensus_min_books or 3)
+                        market = consensus_fair(ev, cons, now, False, set(_csv(self.cfg.sharp_books)))
+                    p = market.get(k, ({}, 0))[0].get(r["outcome"])
                 if p:
                     self.latest[bid] = (p, now)
 
@@ -2386,6 +2486,7 @@ class Scheduler:
         self.misses: dict[str, int] = {}
         self.ended: set[str] = set()
         self.need_close: set[str] = set()  # event ids wanting a last pre-kickoff check (CLV)
+        self.need_close_props: set[str] = set()  # the same, for games with a logged prop bet
         self.last_props: dict[str, float] = {}  # event id -> last prop check
         self.bad_prop_sports: set[str] = set()  # sports whose prop request the API rejected
         self.scale = 1.0         # slow-down for live and near-kickoff checks
@@ -2413,7 +2514,7 @@ class Scheduler:
                 continue  # nothing live is wanted: don't pay to check games in progress
             if start > now and (soonest is None or start < soonest):
                 soonest = start
-        if soonest is None:
+        if soonest is None or cfg.live_only:   # LIVE_ONLY: pre-game checks would be thrown away
             return None
         ahead = soonest - now
         if cfg.pregame_minutes and ahead <= timedelta(hours=cfg.pregame_hours):
@@ -2443,8 +2544,8 @@ class Scheduler:
                     raise
                 print(f"! Couldn't load {sport} schedule: {e.code}", file=sys.stderr)
                 continue
-            except urllib.error.URLError as e:
-                print(f"! Network error loading {sport} schedule: {e.reason}", file=sys.stderr)
+            except (OSError, http.client.HTTPException, ValueError) as e:  # timeouts, drops, bad JSON
+                print(f"! Network error loading {sport} schedule: {getattr(e, 'reason', e)}", file=sys.stderr)
                 continue
             self.games[sport] = [(ev["id"], _parse_time(ev["commence_time"])) for ev in evs]
             self.events_at[sport] = now
@@ -2507,7 +2608,7 @@ class Scheduler:
     def _prop_tiers(self, now: datetime) -> list[tuple[str, str, bool]]:
         """(sport, event id, near_kickoff) for games inside a props window."""
         cfg = self.cfg
-        if not cfg.props_enabled:
+        if not cfg.props_enabled or cfg.live_only:   # props are pre-game only
             return []
         near = timedelta(hours=cfg.prop_hours)
         early = timedelta(hours=max(cfg.prop_hours, cfg.prop_early_hours if cfg.prop_early_minutes else 0))
@@ -2536,10 +2637,23 @@ class Scheduler:
 
     def props_due(self, now: datetime) -> list[tuple[str, str]]:
         ts = time.time()
-        return [(sport, gid) for sport, gid, near in self._prop_tiers(now)
-                if ts - self.last_props.get(gid, 0) >= self._prop_every(near)]
+        out = [(sport, gid) for sport, gid, near in self._prop_tiers(now)
+               if ts - self.last_props.get(gid, 0) >= self._prop_every(near)]
+        cfg = self.cfg
+        if cfg.closing_minutes and self.need_close_props:
+            # One last prop check just before kickoff for games with a logged prop bet (CLV).
+            window = timedelta(minutes=cfg.closing_minutes)
+            have = {gid for _, gid in out}
+            out += [(sport, gid) for sport in cfg.prop_sports
+                    if sport in self.games and cfg.prop_markets.get(sport) and sport not in self.bad_prop_sports
+                    for gid, start in self.games[sport]
+                    if gid in self.need_close_props and gid not in have and now < start <= now + window
+                    and self.last_props.get(gid, 0) < (start - window).timestamp()]
+        return out
 
-    def fetch_props(self, games: list[tuple[str, str]]) -> list[dict]:
+    def fetch_props(self, games: list[tuple[str, str]]) -> tuple[list[dict], set[str]]:
+        """Prop odds per game, plus the ids of games whose request worked (a failed request
+        must not count as "looked and the bet is gone")."""
         def one(item):
             sport, gid = item
             try:
@@ -2548,6 +2662,7 @@ class Scheduler:
                 return item, e
 
         events: list[dict] = []
+        ok: set[str] = set()
         with ThreadPoolExecutor(max_workers=min(8, len(games))) as pool:
             for (sport, gid), result in pool.map(one, games):
                 self.last_props[gid] = time.time()
@@ -2564,9 +2679,11 @@ class Scheduler:
                         print(f"! Props error for {sport} {gid}: {result.code}", file=sys.stderr)
                 elif isinstance(result, Exception):
                     print(f"! Props error for {sport} {gid}: {result}", file=sys.stderr)
-                elif isinstance(result, dict) and result.get("bookmakers"):
-                    events.append(apply_fees([result], self.cfg)[0])
-        return events
+                elif isinstance(result, dict):
+                    ok.add(gid)   # an answer with no books is still a real "nothing there"
+                    if result.get("bookmakers"):
+                        events.append(apply_fees([result], self.cfg)[0])
+        return events, ok
 
     def day_weight(self, t: datetime) -> float:
         day = WEEKDAYS[t.astimezone(ZoneInfo(self.cfg.timezone)).weekday()]
@@ -2611,7 +2728,8 @@ class Scheduler:
                   for _, gid, near in self._prop_tiers(now)]
         return min([15.0] + waits)
 
-    def fetch(self, sports: list[str], now: datetime) -> list[dict]:
+    def fetch(self, sports: list[str], now: datetime) -> tuple[list[dict], set[str]]:
+        """Odds for these sports, plus the sports whose request worked."""
         ahead = max(self.cfg.pregame_hours if self.cfg.pregame_minutes else 0, self.cfg.lookahead_hours)
         until = now + timedelta(hours=ahead, minutes=1)
 
@@ -2622,6 +2740,7 @@ class Scheduler:
                 return sport, e
 
         events: list[dict] = []
+        ok: set[str] = set()
         with ThreadPoolExecutor(max_workers=len(sports)) as pool:
             for sport, result in pool.map(one, sports):
                 self.last_odds[sport] = time.time()
@@ -2632,10 +2751,11 @@ class Scheduler:
                 elif isinstance(result, Exception):
                     print(f"! Odds error for {sport}: {result}", file=sys.stderr)
                 else:
+                    ok.add(sport)
                     apply_fees(result, self.cfg)
                     self.note_feed(sport, result, now)
                     events.extend(result)
-        return events
+        return events, ok
 
 
 # --------------------------------------------------------------------------- main loop
@@ -2796,6 +2916,17 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
         print(f"→ Fits the budget at full speed (live checks every {cfg.poll_seconds}s).")
 
 
+def close_started(now: datetime, *alerters: Alerter) -> set[str]:
+    """Close pre-game-only alerts (props) whose game has started: those lines come down at
+    kickoff, and no later prop check looks at that game again."""
+    started = {op.arb.event_id for a in alerters for op in a.open.values()
+               if _parse_time(op.arb.commence_time) <= now}
+    if started:
+        for a in alerters:
+            a.handle([], checked_events=started)
+    return started
+
+
 def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     alerter = Alerter(cfg, dry_run=args.dry_run)
     ev_alerter = EVAlerter(cfg, dry_run=args.dry_run)
@@ -2817,7 +2948,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
 
     def update_parlays() -> int:
         open_bets = [op.arb for a in (ev_alerter, prop_evs) for op in a.open.values()]
-        return parlay_alerter.handle(find_parlays(open_bets, cfg))
+        return parlay_alerter.handle(find_parlays(open_bets, cfg, keep=set(parlay_alerter.open),
+                                                  now=datetime.now(timezone.utc)))
 
     if args.demo:
         # Sample data must never reach the real logs (it would be graded and counted).
@@ -2906,9 +3038,14 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             old, old_extra = sched.scale, sched.extra_scale
             sched.update_budget(now)
             if sched.scale == math.inf:
+                broke = api.remaining is not None and api.remaining <= 0
+                if args.once:
+                    sys.exit("Out of Odds API credits until the plan resets; not scanning." if broke else
+                             "BUDGET_WEIGHTS gives the next 24h no budget (weight 0); not scanning.")
                 if not status.budget_warned:
                     status.budget_warned = True
-                    status.send("⛔ Out of Odds API credits until the plan resets. Pausing.")
+                    status.send("⛔ Out of Odds API credits until the plan resets. Pausing." if broke else
+                                "⏸️ BUDGET_WEIGHTS gives the next 24h no budget (weight 0). Pausing.")
                 time.sleep(3600)
                 continue
             status.budget_warned = False
@@ -2920,25 +3057,30 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
 
         due = [s for s in cfg.sports if sched.state(s, now)] if args.once else sched.due(now)
         prop_games = sched._prop_games(now) if args.once else sched.props_due(now)
-        sched.need_close = tracker.needs_close()
+        sched.need_close, sched.need_close_props = tracker.needs_close(), tracker.needs_close_props()
         # Main lines and props go out together, so neither waits on the other.
         with ThreadPoolExecutor(max_workers=2) as pool:
             main_job = pool.submit(sched.fetch, due, now) if due else None
             prop_job = pool.submit(sched.fetch_props, prop_games) if prop_games else None
-            main_events = main_job.result() if main_job else []
-            fetched_props = prop_job.result() if prop_job else []
+            main_events, fetched_sports = main_job.result() if main_job else ([], set())
+            fetched_props, fetched_gids = prop_job.result() if prop_job else ([], set())
+        # Only sports/games whose request worked count as checked: a timeout isn't "the bet is gone".
+        checked_sports = [s for s in due if s in fetched_sports]
         if due:
             idle_logged = False
             t0 = time.time()
             events = main_events
             arbs = find_arbs(events, cfg)
-            sent = alerter.handle(arbs, checked_sports=due)
+            sent = alerter.handle(arbs, checked_sports=checked_sports)
             outs = find_outliers(events, cfg)
             evs = without_outliers(find_evs(events, cfg, history=sharp_history), outs)  # outliers cover those
-            note_related(evs + outs, ev_alerter, out_alerter, prop_evs, prop_outs)
+            hand_over(evs, outs, ev_alerter, out_alerter)
+            scope = set(checked_sports)
+            note_related([(outs, out_alerter, scope), (evs, ev_alerter, scope),
+                          ([], prop_outs, set()), ([], prop_evs, set())])
             sharp_history.prune(now)
-            out_sent = out_alerter.handle(outs, checked_sports=due)
-            ev_sent = ev_alerter.handle(evs, checked_sports=due)
+            out_sent = out_alerter.handle(outs, checked_sports=checked_sports)
+            ev_sent = ev_alerter.handle(evs, checked_sports=checked_sports)
             tracker.observe(events, now)
             tracker.finalize()
             status.check_credits(api.remaining)
@@ -2969,18 +3111,22 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             print(f"[{datetime.now():%H:%M:%S}] No games live or starting soon. Waiting (no credits used).",
                   flush=True)
 
+        close_started(now, prop_arbs, prop_evs, prop_outs)
         if prop_games:
             t0 = time.time()
-            prop_events = fetched_props
-            checked = {gid for _, gid in prop_games}
+            prop_events = [ev for ev in fetched_props if _parse_time(ev["commence_time"]) > now]
+            checked = fetched_gids
             p_outs = find_outliers(prop_events, cfg)
             p_evs = without_outliers(find_evs(prop_events, prop_cfg, history=sharp_history), p_outs)
-            note_related(p_evs + p_outs, ev_alerter, out_alerter, prop_evs, prop_outs)
+            hand_over(p_evs, p_outs, prop_evs, prop_outs)
+            note_related([(p_outs, prop_outs, checked), (p_evs, prop_evs, checked),
+                          ([], out_alerter, set()), ([], ev_alerter, set())])
             n_arb = prop_arbs.handle(find_arbs(prop_events, cfg), checked_events=checked)
             n_out = prop_outs.handle(p_outs, checked_events=checked)
             n_ev = prop_evs.handle(p_evs,
                                    checked_events=checked)
             tracker.observe(prop_events, now)
+            tracker.finalize()
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             print(f"[{datetime.now():%H:%M:%S}] props: {len(prop_games)} games ({time.time() - t0:.1f}s) | "
                   f"{n_arb} new arbs, {n_ev} new +EV, {n_out} new outliers | credits left {left}", flush=True)
@@ -3026,12 +3172,33 @@ def main() -> None:
             key = key.strip().upper()
             if not sep or not key.replace("_", "").isalnum():
                 sys.exit(f"Use KEY=VALUE, like MY_BOOKS=fanduel,draftkings (got: {item!r}). Nothing was changed.")
+            os.environ[key] = value.strip()
+            try:
+                Config.from_env()   # check it before saving, so a typo can't stop the bot starting
+            except ValueError as ex:
+                if str(ex).startswith((key + "=", key + ":")):
+                    sys.exit(f"Bad value: {ex}. Nothing was changed.")
+                print(f"Note: another setting needs fixing too: {ex}")
             set_env_value(HERE / ".env", key, value.strip())
             print(f"Saved {key}={value.strip()}")
         print("Now restart the bot so it uses the new settings:  systemctl restart arbbot")
         return
 
-    cfg = Config.from_env()
+    try:
+        cfg = Config.from_env()
+    except ValueError as ex:
+        # Exit code 2 tells systemd not to restart-loop on a setting that will fail every time.
+        print(f"Bad setting in .env: {ex}. Fix it with: nano /opt/arb-bot/.env", file=sys.stderr)
+        url = os.environ.get("DISCORD_STATUS_WEBHOOK_URL") or os.environ.get("DISCORD_WEBHOOK_URL", "")
+        interactive = (args.dry_run, args.demo, args.once, args.plan, args.results, args.test_discord,
+                       args.post_guide)
+        if url.startswith("https://") and not any(interactive):   # the service: say why it stopped
+            try:
+                _webhook(url, {"username": "Arb Bot", "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
+                               "Fix it (nano /opt/arb-bot/.env), then: systemctl restart arbbot"})
+            except Exception:  # noqa: BLE001 - already exiting with the reason printed
+                pass
+        sys.exit(2)
     global ODDS_FORMAT
     ODDS_FORMAT = cfg.odds_format
 
