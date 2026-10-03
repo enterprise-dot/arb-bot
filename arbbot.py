@@ -136,6 +136,8 @@ class Config:
     ev_mention: str = ""
     ev_log_file: str = "ev_bets.csv"
     ev_results_file: str = "ev_results.csv"
+    closing_file: str = "closing_lines.csv"
+    closing_minutes: int = 5        # one last check this close to kickoff for games with logged bets
     # Outliers: one book far off every other book's price
     outliers_enabled: bool = True
     outlier_min_pct: float = 10.0   # edge vs the other books' median fair price
@@ -206,6 +208,8 @@ class Config:
             ev_mention=e("EV_MENTION", ""),
             ev_log_file=e("EV_LOG_FILE", d.ev_log_file),
             ev_results_file=e("EV_RESULTS_FILE", d.ev_results_file),
+            closing_file=e("CLOSING_FILE", d.closing_file),
+            closing_minutes=int(e("CLOSING_MINUTES", d.closing_minutes)),
             outliers_enabled=e("OUTLIERS_ENABLED", "true").lower() in ("1", "true", "yes"),
             outlier_min_pct=float(e("OUTLIER_MIN_PCT", d.outlier_min_pct)),
             outlier_min_books=int(e("OUTLIER_MIN_BOOKS", d.outlier_min_books)),
@@ -649,6 +653,7 @@ class Alerter:
 
     noun = "arbs"
     log_fields = LOG_FIELDS
+    on_log = None  # optional callback(row) after a row is logged
     log_on_open = False  # arbs are logged when they close, so the row has how long it lasted
 
     def __init__(self, cfg: Config, dry_run: bool):
@@ -779,6 +784,8 @@ class Alerter:
             **self.row(op),
         }
         append_csv(self.log_path(), self.log_fields, row)
+        if self.on_log:
+            self.on_log(row)
 
     def summary(self) -> str:
         s = self.stats
@@ -919,6 +926,57 @@ def kelly_stake(fair_prob: float, price: float, cfg: Config, mult: float = 1.0) 
     return float(round(stake)) if stake >= 1 else round(stake, 2)
 
 
+def sharp_fair(ev: dict, cfg: Config, now: datetime, is_live: bool):
+    """Fair (no-vig) probabilities per line for one game, from the sharp book(s).
+
+    Returns (fair, sharp_name, n_used, raw_src, titles): fair[(market, line)][outcome] = prob.
+    """
+    sharp = _csv(cfg.sharp_books)
+    books = {bm["key"]: bm for bm in ev.get("bookmakers", [])}
+    # Each sharp book's no-vig probabilities, per line (and its raw prices, for display).
+    raw_src: dict[tuple, dict[str, dict[str, float]]] = {}
+    per_src: dict[tuple, dict[str, dict[str, float]]] = {}
+    titles: dict[str, str] = {}
+    for sk in sharp:
+        bm = books.get(sk)
+        if not bm:
+            continue
+        titles[sk] = bm.get("title", sk)
+        for mkt in bm.get("markets", []):
+            if not is_fresh(mkt, bm, now, is_live, cfg):
+                continue
+            groups: dict[tuple, dict[str, float]] = {}
+            for oc in mkt.get("outcomes", []):
+                price = float(oc.get("price") or 0)
+                if price > 1.0:
+                    k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
+                    groups.setdefault(k, {})[oc["name"]] = price
+            for k, outs in groups.items():
+                if len(outs) >= 2:
+                    names = list(outs)
+                    raw_src.setdefault(k, {})[sk] = outs
+                    per_src.setdefault(k, {})[sk] = dict(
+                        zip(names, devig([outs[n] for n in names], cfg.devig_method)))
+
+    # Blend them into one fair price per line (weights renormalised over the sources present).
+    fair: dict[tuple, dict[str, float]] = {}
+    sharp_name: dict[tuple, str] = {}
+    n_used: dict[tuple, int] = {}
+    for k, srcs in per_src.items():
+        first = next(iter(srcs.values()))
+        same = {sk: pr for sk, pr in srcs.items() if set(pr) == set(first)}  # same outcomes
+        if len(same) >= 2 and any(
+                max(pr[n] for pr in same.values()) - min(pr[n] for pr in same.values())
+                > cfg.sharp_disagree_pct / 100 for n in first):
+            continue  # the sharps disagree: no reliable fair price for this line
+        weights = {sk: cfg.sharp_weights.get(sk, 1.0) for sk in same}
+        total_w = sum(weights.values()) or 1.0
+        fair[k] = {n: sum(same[sk][n] * w for sk, w in weights.items()) / total_w for n in first}
+        sharp_name[k] = " + ".join(titles[sk] for sk in same)
+        n_used[k] = len(same)
+    return fair, sharp_name, n_used, raw_src, titles
+
+
 def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> list[EVBet]:
     if not cfg.ev_enabled:
         return []
@@ -933,47 +991,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None) -> li
             continue
         books = {bm["key"]: bm for bm in ev.get("bookmakers", [])}
 
-        # Each sharp book's no-vig probabilities, per line (and its raw prices, for display).
-        raw_src: dict[tuple, dict[str, dict[str, float]]] = {}
-        per_src: dict[tuple, dict[str, dict[str, float]]] = {}
-        titles: dict[str, str] = {}
-        for sk in sharp:
-            bm = books.get(sk)
-            if not bm:
-                continue
-            titles[sk] = bm.get("title", sk)
-            for mkt in bm.get("markets", []):
-                if not is_fresh(mkt, bm, now, is_live, cfg):
-                    continue
-                groups: dict[tuple, dict[str, float]] = {}
-                for oc in mkt.get("outcomes", []):
-                    price = float(oc.get("price") or 0)
-                    if price > 1.0:
-                        k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
-                        groups.setdefault(k, {})[oc["name"]] = price
-                for k, outs in groups.items():
-                    if len(outs) >= 2:
-                        names = list(outs)
-                        raw_src.setdefault(k, {})[sk] = outs
-                        per_src.setdefault(k, {})[sk] = dict(
-                            zip(names, devig([outs[n] for n in names], cfg.devig_method)))
-
-        # Blend them into one fair price per line (weights renormalised over the sources present).
-        fair: dict[tuple, dict[str, float]] = {}
-        sharp_name: dict[tuple, str] = {}
-        n_used: dict[tuple, int] = {}
-        for k, srcs in per_src.items():
-            first = next(iter(srcs.values()))
-            same = {sk: pr for sk, pr in srcs.items() if set(pr) == set(first)}  # same outcomes
-            if len(same) >= 2 and any(
-                    max(pr[n] for pr in same.values()) - min(pr[n] for pr in same.values())
-                    > cfg.sharp_disagree_pct / 100 for n in first):
-                continue  # the sharps disagree: no reliable fair price for this line
-            weights = {sk: cfg.sharp_weights.get(sk, 1.0) for sk in same}
-            total_w = sum(weights.values()) or 1.0
-            fair[k] = {n: sum(same[sk][n] * w for sk, w in weights.items()) / total_w for n in first}
-            sharp_name[k] = " + ".join(titles[sk] for sk in same)
-            n_used[k] = len(same)
+        fair, sharp_name, n_used, raw_src, titles = sharp_fair(ev, cfg, now, is_live)
 
         # Every soft-book price that beats fair by enough (and every price, for the board).
         offers: dict[tuple, list[tuple[float, str, str, float | None]]] = {}
@@ -1277,7 +1295,8 @@ class OutlierAlerter(EVAlerter):
 
 # --------------------------------------------------------------------------- +EV results
 
-RESULT_FIELDS = EV_LOG_FIELDS + ["home_score", "away_score", "result", "profit"]
+RESULT_FIELDS = EV_LOG_FIELDS + ["home_score", "away_score", "result", "profit", "kind",
+                                 "closing_fair_odds", "clv_pct"]
 
 
 def settle(bet: dict, home_score: float, away_score: float) -> tuple[str, float]:
@@ -1325,13 +1344,18 @@ def settle_pending(cfg: Config, api: "OddsAPI") -> int:
     done = {_bet_id(r) for r in _read_csv(cfg.ev_results_file)}
     pending: dict[str, dict] = {}
     cutoff = datetime.now(timezone.utc) - timedelta(days=3)
-    for r in _read_csv(cfg.ev_log_file):
-        bid = _bet_id(r)
-        if bid in done or bid in pending:
-            continue  # first alert for a bet counts; repeats of the same bet don't
-        start = _parse_time(r["commence_time"])
-        if cutoff < start < datetime.now(timezone.utc) - timedelta(hours=2):
-            pending[bid] = r
+    closing = {r["bet_id"]: float(r["closing_fair_prob"]) for r in _read_csv(cfg.closing_file)}
+    for kind, name in (("ev", cfg.ev_log_file), ("outlier", cfg.outlier_log_file)):
+        for r in _read_csv(name) if name else []:
+            bid = _bet_id(r)
+            if bid in done or bid in pending:
+                continue  # first alert for a bet counts; repeats of the same bet don't
+            start = _parse_time(r["commence_time"])
+            if cutoff < start < datetime.now(timezone.utc) - timedelta(hours=2):
+                cp = closing.get(bid)
+                pending[bid] = {**r, "kind": kind,
+                                "closing_fair_odds": round(1 / cp, 3) if cp else "",
+                                "clv_pct": round(clv_pct(float(r["price"]), cp), 2) if cp else ""}
     if not pending:
         return 0
     graded = 0
@@ -1373,6 +1397,114 @@ def ev_record(cfg: Config, days: int | None = None) -> str:
     roi = profit / staked * 100 if staked else 0
     return (f"{len(rows)} bets, {w}-{l}-{pu}, {'+' if profit >= 0 else '-'}${abs(profit):,.2f} "
             f"on ${staked:,.0f} staked (ROI {roi:+.1f}%, avg edge {avg_ev:.1f}%)")
+
+
+# --------------------------------------------------------------------------- closing line value (CLV)
+
+CLOSING_FIELDS = ["bet_id", "closing_fair_prob", "closing_fair_odds", "closed_at"]
+
+
+def _row_line(row: dict) -> float | None:
+    """The (market, line) grouping key's line for a logged bet (see _line_for)."""
+    if row.get("point") in ("", None):
+        return None
+    point = float(row["point"])
+    if row["market"] == "spreads":
+        return point if row["outcome"] == row["home_team"] else -point
+    return point
+
+
+def clv_pct(price: float, closing_fair_prob: float) -> float:
+    """Edge of the price you got, measured against the closing fair line."""
+    return (price * closing_fair_prob - 1) * 100
+
+
+class ClosingTracker:
+    """Keeps the latest sharp fair price for every logged pre-game bet until kickoff, then
+    saves it as the closing line. Restarts are fine: pending bets reload from the logs."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.latest: dict[str, tuple[float, datetime]] = {}
+        self.written = {r["bet_id"] for r in _read_csv(cfg.closing_file)}
+        self.tracked: dict[str, dict] = {}
+        now = datetime.now(timezone.utc)
+        for name in (cfg.ev_log_file, cfg.outlier_log_file):
+            for r in _read_csv(name) if name else []:
+                if _parse_time(r["commence_time"]) > now:
+                    self.add(r)
+
+    def add(self, row: dict) -> None:
+        bid = _bet_id(row)
+        if bid in self.written or bid in self.tracked:
+            return
+        if _parse_time(row["first_seen"]) >= _parse_time(row["commence_time"]):
+            return  # live bet: there's no closing line to beat
+        self.tracked[bid] = row
+
+    def needs_close(self) -> set[str]:
+        """Event ids that still need a last look before kickoff."""
+        return {r["event_id"] for r in self.tracked.values()}
+
+    def observe(self, events: list[dict], now: datetime | None = None) -> None:
+        now = now or datetime.now(timezone.utc)
+        wanted = self.needs_close()
+        for ev in events:
+            if ev["id"] not in wanted or _parse_time(ev["commence_time"]) <= now:
+                continue
+            fair = sharp_fair(ev, self.cfg, now, False)[0]
+            for bid, r in self.tracked.items():
+                if r["event_id"] != ev["id"]:
+                    continue
+                p = fair.get((r["market"], _row_line(r)), {}).get(r["outcome"])
+                if p:
+                    self.latest[bid] = (p, now)
+
+    def finalize(self, now: datetime | None = None) -> int:
+        """Save closing lines for games that have started. Returns how many were saved."""
+        now = now or datetime.now(timezone.utc)
+        saved = 0
+        for bid, r in list(self.tracked.items()):
+            if _parse_time(r["commence_time"]) > now:
+                continue
+            del self.tracked[bid]
+            if bid in self.latest:
+                p, ts = self.latest.pop(bid)
+                append_csv(self.cfg.closing_file, CLOSING_FIELDS, {
+                    "bet_id": bid, "closing_fair_prob": round(p, 5), "closing_fair_odds": round(1 / p, 3),
+                    "closed_at": ts.isoformat(timespec="seconds")})
+                self.written.add(bid)
+                saved += 1
+        return saved
+
+
+def clv_rows(cfg: Config, days: int | None = None) -> list[dict]:
+    """Every logged bet (first alert only) that has a closing line, with its CLV."""
+    closing = {r["bet_id"]: float(r["closing_fair_prob"]) for r in _read_csv(cfg.closing_file)}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days is not None else None
+    out, seen = [], set()
+    for kind, name in (("ev", cfg.ev_log_file), ("outlier", cfg.outlier_log_file)):
+        for r in _read_csv(name) if name else []:
+            bid = _bet_id(r)
+            if bid in seen or bid not in closing:
+                continue
+            if cutoff and _parse_time(r["commence_time"]) < cutoff:
+                continue
+            seen.add(bid)
+            p = closing[bid]
+            out.append({**r, "kind": kind, "closing_fair_odds": 1 / p,
+                        "clv_pct": clv_pct(float(r["price"]), p),
+                        "beat_close": float(r["price"]) > 1 / p})
+    return out
+
+
+def clv_record(cfg: Config, days: int | None = None) -> str:
+    rows = clv_rows(cfg, days)
+    if not rows:
+        return "no closing lines yet"
+    avg = sum(r["clv_pct"] for r in rows) / len(rows)
+    beat = sum(r["beat_close"] for r in rows) / len(rows) * 100
+    return f"avg {avg:+.1f}%, beat the close on {beat:.0f}% of {len(rows)} bets"
 
 
 # --------------------------------------------------------------------------- schedule
@@ -1424,6 +1556,7 @@ class Scheduler:
         self.last_odds: dict[str, float] = {s: 0.0 for s in cfg.sports}
         self.misses: dict[str, int] = {}
         self.ended: set[str] = set()
+        self.need_close: set[str] = set()  # event ids wanting a last pre-kickoff check (CLV)
         self.scale = 1.0
         self.forecast = 0.0      # credits the next 24h would cost at full speed
         self.allowance = 0.0     # credits we can afford per day
@@ -1513,12 +1646,21 @@ class Scheduler:
 
     # ---- polling
 
+    def closing_due(self, sport: str, now: datetime) -> bool:
+        """A game with a logged bet starts within CLOSING_MINUTES and we haven't looked since."""
+        if not self.cfg.closing_minutes or not self.need_close:
+            return False
+        window = timedelta(minutes=self.cfg.closing_minutes)
+        return any(gid in self.need_close and now < start <= now + window
+                   and self.last_odds[sport] < (start - window).timestamp()
+                   for gid, start in self.games[sport])
+
     def due(self, now: datetime) -> list[str]:
         ts = time.time()
         out = []
         for sport in self.cfg.sports:
             st = self.state(sport, now)
-            if st and ts - self.last_odds[sport] >= self.interval(st):
+            if (st and ts - self.last_odds[sport] >= self.interval(st)) or self.closing_due(sport, now):
                 out.append(sport)
         return out
 
@@ -1625,8 +1767,13 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     alerter = Alerter(cfg, dry_run=args.dry_run)
     ev_alerter = EVAlerter(cfg, dry_run=args.dry_run)
     out_alerter = OutlierAlerter(cfg, dry_run=args.dry_run)
+    tracker = ClosingTracker(cfg)
+    ev_alerter.on_log = out_alerter.on_log = tracker.add
 
     if args.demo:
+        # Sample data must never reach the real logs (it would be graded and counted).
+        for a in (alerter, ev_alerter, out_alerter):
+            a.log_path = lambda: ""
         events = demo_events()
         outs = find_outliers(events, cfg)
         arbs, evs = find_arbs(events, cfg), without_outliers(find_evs(events, cfg), outs)
@@ -1648,6 +1795,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         print(f"Graded {n} new bet(s).")
         print(f"+EV record, last 7 days (every alert, at the alerted price): {ev_record(cfg, 7)}")
         print(f"+EV record, all time: {ev_record(cfg)}")
+        print(f"CLV (price you got vs the closing fair line), last 7 days: {clv_record(cfg, 7)}")
+        print(f"CLV, all time: {clv_record(cfg)}")
         return
 
     mode = "dry run (console only)" if alerter.dry_run else "sending to Discord"
@@ -1681,7 +1830,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                     print(f"! Grading +EV bets failed: {e}", file=sys.stderr)
                 msg += (f"\n📈 {ev_alerter.summary()}.\n"
                         f"+EV results if you bet every alert: last 7 days {ev_record(cfg, 7)}; "
-                        f"all time {ev_record(cfg)}.")
+                        f"all time {ev_record(cfg)}.\n"
+                        f"📐 CLV: last 7 days {clv_record(cfg, 7)}; all time {clv_record(cfg)}.")
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             status.send(f"{msg}\nCredits left: {left}.")
             alerter.reset_stats()
@@ -1716,6 +1866,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         if due:
             idle_logged = False
             t0 = time.time()
+            sched.need_close = tracker.needs_close()
             events = sched.fetch(due, now)
             arbs = find_arbs(events, cfg)
             sent = alerter.handle(arbs, checked_sports=due)
@@ -1723,6 +1874,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             out_sent = out_alerter.handle(outs, checked_sports=due)
             evs = without_outliers(find_evs(events, cfg), outs)  # the outlier alert covers those
             ev_sent = ev_alerter.handle(evs, checked_sports=due)
+            tracker.observe(events, now)
+            tracker.finalize()
             status.check_credits(api.remaining)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             ev_note = f" | {len(evs)} +EV, {ev_sent} new" if cfg.ev_enabled else ""

@@ -88,6 +88,16 @@ python arbbot.py --results
 # Example output: +EV record, all time: 212 bets, 108-98-6, +$187.40 on $2,450 staked (ROI +7.6%, avg edge 4.3%)
 ```
 
+**Closing line value (CLV)** is the faster test. For every logged +EV and outlier bet, the bot
+keeps tracking Pinnacle's fair price until kickoff and saves it as the closing line
+(`closing_lines.csv`), with one last check in the final 5 minutes for games you have a bet on.
+CLV is how much better your price was than that closing fair price. Beating the close on most
+bets is the clearest sign the edge is real, long before the win/loss record settles down:
+
+```
+CLV, all time: avg +2.4%, beat the close on 68% of 54 bets      (example)
+```
+
 This assumes you bet every alert at the alerted price. Give it a few hundred bets before judging;
 50 bets is mostly luck.
 

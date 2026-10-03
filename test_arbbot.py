@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 from arbbot import (LIVE, PREGAME, Alerter, Config, EVAlerter, OutlierAlerter, Scheduler,
                     demo_events, devig, find_outliers, outlier_payload, without_outliers,
                     discord_payload, ev_payload, ev_record, find_arbs, find_evs, kelly_stake,
-                    next_reset, seconds_until_active, settle, settle_pending)
+                    next_reset, seconds_until_active, settle, settle_pending,
+                    ClosingTracker, clv_pct, clv_record, clv_rows)
 
 NOW = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
 FRESH = NOW.isoformat().replace("+00:00", "Z")
@@ -434,7 +435,8 @@ class EVLifecycle(unittest.TestCase):
         import tempfile
         self.tmp = tempfile.TemporaryDirectory()
         d = Path(self.tmp.name)
-        self.cfg = Config(min_ev_pct=3, ev_log_file=str(d / "ev.csv"), ev_results_file=str(d / "res.csv"))
+        self.cfg = Config(min_ev_pct=3, ev_log_file=str(d / "ev.csv"), ev_results_file=str(d / "res.csv"),
+                          outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -533,6 +535,76 @@ class ArbDollarMinimum(unittest.TestCase):
         self.assertEqual(find_arbs([ev], Config(min_profit_pct=0, min_profit_dollars=10), NOW), [])
         self.assertEqual(len(find_arbs([ev], Config(min_profit_pct=0, min_profit_dollars=10,
                                                     bankroll=300), NOW)), 1)
+
+
+class CLV(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.cfg = Config(min_ev_pct=3, ev_log_file=str(d / "ev.csv"), ev_results_file=str(d / "res.csv"),
+                          outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"),
+                          pregame_max_age_seconds=10**9)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def game(self, home_price, away_price, start):
+        ev = ev_event([("Home", home_price, None), ("Away", away_price, None)],
+                      {"B": [("Home", 2.20, None)]}, start=start)
+        ev["sport_key"] = "basketball_nba"
+        return ev
+
+    def test_clv_math(self):
+        self.assertAlmostEqual(clv_pct(2.20, 0.5), 10.0)    # got +120, closed fair at +100
+        self.assertAlmostEqual(clv_pct(2.20, 0.40), -12.0)  # line moved away from you
+
+    def test_tracks_until_kickoff_then_saves_close(self):
+        from datetime import datetime as dt
+        start_dt = dt.now(timezone.utc) + timedelta(hours=1)
+        start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        a = EVAlerter(self.cfg, dry_run=True)
+        tr = ClosingTracker(self.cfg)
+        a.on_log = tr.add
+        [b] = find_evs([self.game(1.91, 1.91, start)], self.cfg, start_dt - timedelta(hours=1))
+        a.handle([b], now=1000)                                   # logged -> tracked
+        self.assertEqual(tr.needs_close(), {"e1"})
+        tr.observe([self.game(1.91, 1.91, start)], start_dt - timedelta(minutes=30))
+        tr.observe([self.game(1.80, 2.05, start)], start_dt - timedelta(minutes=3))  # line moves our way
+        self.assertEqual(tr.finalize(start_dt - timedelta(minutes=1)), 0)   # not started yet
+        self.assertEqual(tr.finalize(start_dt + timedelta(minutes=1)), 1)   # kickoff: saved
+        self.assertEqual(tr.needs_close(), set())
+        [row] = clv_rows(self.cfg)
+        closing_p = devig([1.80, 2.05], "power")[0]
+        self.assertAlmostEqual(row["clv_pct"], clv_pct(2.20, closing_p), places=2)
+        self.assertTrue(row["beat_close"])
+        self.assertIn("beat the close on 100% of 1 bets", clv_record(self.cfg))
+        # A restart reloads nothing for a game that already has its close saved.
+        self.assertEqual(ClosingTracker(self.cfg).tracked, {})
+
+    def test_restart_reloads_pending_bets(self):
+        from datetime import datetime as dt
+        start_dt = dt.now(timezone.utc) + timedelta(hours=2)
+        start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        a = EVAlerter(self.cfg, dry_run=True)
+        [b] = find_evs([self.game(1.91, 1.91, start)], self.cfg, start_dt - timedelta(hours=1))
+        a.handle([b], now=1000)
+        self.assertEqual(ClosingTracker(self.cfg).needs_close(), {"e1"})
+
+    def test_live_bets_have_no_close(self):
+        tr = ClosingTracker(self.cfg)
+        tr.add({"event_id": "e1", "market": "h2h", "outcome": "Home", "point": "",
+                "first_seen": "2026-10-03T12:00:00+00:00", "commence_time": "2026-10-03T11:00:00Z"})
+        self.assertEqual(tr.tracked, {})
+
+    def test_last_check_before_kickoff(self):
+        cfg = Config(sports=["basketball_nba"], closing_minutes=5)
+        s = sched_with({"basketball_nba": [("g1", NOW + timedelta(minutes=4))]}, cfg)
+        self.assertFalse(s.closing_due("basketball_nba", NOW))          # no logged bet on it
+        s.need_close = {"g1"}
+        self.assertTrue(s.closing_due("basketball_nba", NOW))
+        s.last_odds["basketball_nba"] = (NOW - timedelta(minutes=0.5)).timestamp()
+        self.assertFalse(s.closing_due("basketball_nba", NOW))          # already looked recently
 
 
 class ActiveHours(unittest.TestCase):
