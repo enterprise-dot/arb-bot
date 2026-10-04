@@ -36,4 +36,5 @@ Installed. Next:
   2. sudo -u arbbot python3 $APP_DIR/arbbot.py --plan
   3. systemctl start arbbot
   4. journalctl -u arbbot -f         # watch it live (Ctrl+C to stop watching)
+  5. bash $APP_DIR/deploy/enable-auto-update.sh   # optional: update itself from GitHub every 10 min
 MSG

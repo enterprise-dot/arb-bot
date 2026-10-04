@@ -3487,5 +3487,33 @@ class KalshiCrossCheck(unittest.TestCase):
         self.assertIn("EPL: Kalshi has no game markets", text)
 
 
+
+class AutoUpdate(unittest.TestCase):
+    """deploy/: the self-updater's script parses, and its Discord notice finds the right channel."""
+
+    def test_script_parses(self):
+        import shutil, subprocess
+        if not shutil.which("bash"):
+            self.skipTest("no bash")
+        for name in ("auto-update.sh", "enable-auto-update.sh"):
+            r = subprocess.run(["bash", "-n", str(Path(__file__).parent / "deploy" / name)], capture_output=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_notice_goes_to_the_status_channel(self):
+        import importlib.util, tempfile
+        spec = importlib.util.spec_from_file_location("notify", Path(__file__).parent / "deploy" / "notify.py")
+        notify = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(notify)
+        with tempfile.TemporaryDirectory() as d:
+            env = Path(d) / ".env"
+            env.write_text("DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1/main\n"
+                           "DISCORD_STATUS_WEBHOOK_URL='https://discord.com/api/webhooks/2/status'\n")
+            self.assertTrue(notify.webhook(env).endswith("/2/status"))
+            env.write_text("DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1/main\nDISCORD_STATUS_WEBHOOK_URL=\n")
+            self.assertTrue(notify.webhook(env).endswith("/1/main"))       # no status channel: the main one
+            env.write_text("# DISCORD_WEBHOOK_URL=https://x\nDISCORD_WEBHOOK_URL=paste-here\n")
+            self.assertEqual(notify.webhook(env), "")                       # placeholders aren't posted to
+            self.assertEqual(notify.webhook(Path(d) / "missing"), "")
+
 if __name__ == "__main__":
     unittest.main()

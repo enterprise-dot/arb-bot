@@ -225,6 +225,15 @@ Run these one at a time and read what each prints.
 You can close the console and the browser. The bot keeps running on the server, starts again
 by itself if the server reboots, and restarts within a minute if it ever crashes.
 
+6. **Turn on automatic updates** (once):
+   ```bash
+   bash /opt/arb-bot/deploy/enable-auto-update.sh
+   ```
+   From then on the server checks GitHub every 10 minutes. New code is tested first, then the
+   bot restarts on it, and if it crashes after that it goes back to the previous version by
+   itself. Each update (or problem) is posted in your Discord status channel, so you never have
+   to run update commands again.
+
 ---
 
 ## Everyday use
@@ -245,7 +254,9 @@ Open the console the same way (Droplet → Access → Launch Droplet Console), t
 | Post today's results to Discord | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --post-results` |
 | Check prop grading works | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --check-props` |
 | Check the Kalshi second opinion | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --check-kalshi` |
-| Get the latest code | `cd /opt/arb-bot && sudo -u arbbot git pull && systemctl restart arbbot` |
+| Get the latest code | Happens by itself every 10 minutes once automatic updates are on (step 6). By hand: `cd /opt/arb-bot && sudo -u arbbot git pull && systemctl restart arbbot` |
+| See what the updater did | `journalctl -u arbbot-update -n 30` |
+| Turn automatic updates off / on | `systemctl disable --now arbbot-update.timer` / `bash /opt/arb-bot/deploy/enable-auto-update.sh` |
 | See the arb log | `cat /opt/arb-bot/arbs.csv` |
 
 ---
@@ -257,7 +268,8 @@ Open the console the same way (Droplet → Access → Launch Droplet Console), t
 | No 🟢 message after `systemctl start arbbot` | Run `journalctl -u arbbot -n 50` and send Claude the output |
 | 🔴 "Odds API rejected the key" in Discord | Fix `ODDS_API_KEY` in `.env`, then `systemctl restart arbbot` |
 | ⚠️ "No pinnacle odds in the feed" | Make sure `pinnacle` is in `BOOKMAKERS`, then restart |
-| `git pull` asks for a username | The GitHub token expired. Make a new one (Part 2b) and rerun the Part 4 install command with it. Your `.env` is kept. |
+| ⚠️ "Couldn't update the bot by itself: the code on the server was changed by hand" | Run the command in the message once; automatic updates carry on after that |
+| `git pull` asks for a username (or no 🔄 updates arrive) | The GitHub token expired. Make a new one (Part 2b) and rerun the Part 4 install command with it. Your `.env` is kept. |
 | Console window is blank or frozen | Close it and launch it again. The bot isn't affected. |
 | Forgot the root password | Droplet page → **Access** → **Reset Root Password** (the new one is emailed). |
 

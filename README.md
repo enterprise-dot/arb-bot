@@ -279,7 +279,7 @@ A wrong API key stops it instead of restart-looping, and you'll get a 🔴 messa
 |---|---|
 | Watch live | `journalctl -u arbbot -f` |
 | Stop / start | `systemctl stop arbbot` / `systemctl start arbbot` |
-| Update to the latest code | `cd /opt/arb-bot && sudo -u arbbot git pull && systemctl restart arbbot` |
+| Update to the latest code | Automatic every 10 minutes after `bash /opt/arb-bot/deploy/enable-auto-update.sh` (tested first, undone if it breaks, posted in Discord). By hand: `cd /opt/arb-bot && sudo -u arbbot git pull && systemctl restart arbbot` |
 | Download the arb log | `scp root@SERVER:/opt/arb-bot/arbs.csv .` |
 
 ## Before betting real money

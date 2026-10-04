@@ -1,0 +1,10 @@
+[Unit]
+Description=Update the arb bot from GitHub (tested first, undone if it breaks)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=arbbot
+WorkingDirectory=/opt/arb-bot
+ExecStart=/bin/bash /opt/arb-bot/deploy/auto-update.sh
