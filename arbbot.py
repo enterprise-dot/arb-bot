@@ -262,6 +262,7 @@ class Config:
     sharp_weights: dict[str, float] = field(default_factory=dict)  # e.g. pinnacle=0.6; default equal
     sharp_disagree_pct: float = 3.0  # skip a line if two sharps' fair odds differ by more (points)
     single_source_stake: float = 0.5  # stake multiplier when only 1 of several sharps priced it
+    consensus_stake: float = 0.7      # stake multiplier when no sharp priced it (props: median of 4+ books)
     devig_method: str = "power"     # "power" (handles long-shot bias) or "multiplicative"
     # Bet-quality checks on +EV
     max_sharp_hold_pct: float = 8.0       # skip if the sharp's own margin is wider than this
@@ -408,6 +409,7 @@ class Config:
             sharp_weights=pairs("SHARP_WEIGHTS", float),
             sharp_disagree_pct=num("SHARP_DISAGREE_PCT", d.sharp_disagree_pct, float),
             single_source_stake=num("SINGLE_SOURCE_STAKE", d.single_source_stake, float),
+            consensus_stake=num("CONSENSUS_STAKE", d.consensus_stake, float),
             devig_method=e("DEVIG_METHOD", d.devig_method).strip().lower(),
             max_sharp_hold_pct=num("MAX_SHARP_HOLD_PCT", d.max_sharp_hold_pct, float),
             sharp_consensus_max_gap=num("SHARP_CONSENSUS_MAX_GAP", d.sharp_consensus_max_gap, float),
@@ -1860,6 +1862,12 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 continue
             # Less certainty -> smaller bet (the edge itself isn't changed).
             mult = cfg.single_source_stake if n_total[k] > 1 and n_used[k] == 1 else 1.0
+            if not from_sharp and cfg.consensus_stake < 1:
+                # No sharp price (usually a prop Pinnacle doesn't offer): the fair price is the
+                # median of other books, which is less certain, so the stake is smaller.
+                mult *= cfg.consensus_stake
+                bet.confidence_notes.append(f"no {_csv(cfg.sharp_books)[0].title()} price: stake "
+                                            f"{round((1 - cfg.consensus_stake) * 100)}% smaller")
             stakes = [float(x) for x in _csv(cfg.confidence_stakes)] or [1, 1, 1]
             mult *= dict(zip(("high", "medium", "low"), stakes + [1] * 3)).get(bet.confidence, 1)
             bet.stake = kelly_stake(bet.fair_prob, bet.price, cfg, mult)

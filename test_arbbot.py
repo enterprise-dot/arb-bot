@@ -2947,5 +2947,25 @@ class OnlyYourBooksCount(unittest.TestCase):
         self.assertEqual(len(day_bets(everyone, date(2026, 10, 3))), 3)
 
 
+
+class ConsensusStake(unittest.TestCase):
+    def test_props_without_a_pinnacle_price_bet_30_percent_less(self):
+        ev = prop_event({"A": (1.87, 1.95), "B": (1.91, 1.91), "C": (1.95, 1.87), "D": (1.89, 1.93),
+                         "E": (2.20, 1.68)})                         # no Pinnacle: median of the other books
+        cfg = Config(round_stakes=0, ev_bankroll=1000, confidence_stakes="1,1,1").for_props()
+        [b] = find_evs([ev], cfg, NOW)
+        self.assertTrue(b.sharp_book.startswith("consensus"))
+        full = kelly_stake(b.fair_prob, b.price, cfg)
+        self.assertEqual(b.stake, kelly_stake(b.fair_prob, b.price, cfg, 0.7))
+        self.assertLess(b.stake, full)
+        self.assertIn("no Pinnacle price: stake 30% smaller", b.confidence_notes)
+        with_pinnacle = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)})
+        with_pinnacle["bookmakers"][0]["key"] = "pinnacle"
+        [p] = find_evs([with_pinnacle], cfg, NOW)
+        self.assertEqual(p.stake, kelly_stake(p.fair_prob, p.price, cfg))   # Pinnacle-priced: full stake
+        same = find_evs([ev], replace(cfg, consensus_stake=1.0), NOW)[0]
+        self.assertEqual(same.stake, full)
+
+
 if __name__ == "__main__":
     unittest.main()

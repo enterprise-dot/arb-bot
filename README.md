@@ -139,6 +139,8 @@ to see stakes in units too.
 `pinnacle,betfair_ex_eu`) and the bot blends their fair odds. Each alert shows how many sources
 priced it ("Sources 2/2"). If the sharps disagree by more than `SHARP_DISAGREE_PCT`, the line is
 skipped. If only one of them priced it, the stake is halved (`SINGLE_SOURCE_STAKE`).
+A prop Pinnacle doesn't price uses the median of at least 4 other books instead, with a 30%
+smaller stake (`CONSENSUS_STAKE=0.7`).
 
 **Bigger edge, new alert.** Discord doesn't ping you when a message is edited. So if a bet's edge
 grows by 2.5 points or more while it's open (`REALERT_JUMP_PCT`), you get a fresh alert.
