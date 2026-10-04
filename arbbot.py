@@ -1733,19 +1733,21 @@ class SharpHistory:
 
 
 class PriceHistory:
-    """Each book's last price per line (and the other books' fair price then), across scans, to
-    tell a stale book (its price sits still while the market moves) from a fast one (it moves
-    away from a market that hasn't caught up yet: in a live game, after a goal)."""
+    """Per book and line, across scans: the price and market fair price when the book was last
+    in line with the market (its anchor), and since when it's been out in front. Tells a stale
+    book (it sits still while the market moves) from a fast one (it moves away from a market
+    that hasn't caught up yet: in a live game, after a goal). Kept for a day, because pre-game
+    lines can go hours between checks."""
 
-    def __init__(self, keep_minutes: int = 30):
+    def __init__(self, keep_minutes: int = 26 * 60):
         self.keep = timedelta(minutes=keep_minutes)
-        self.seen: dict[tuple, tuple[datetime, float, float, bool]] = {}   # key -> (when, price, fair, leading)
+        self.seen: dict[tuple, tuple[datetime, datetime | None, tuple | None]] = {}   # key -> (when, leading since, anchor)
 
     def get(self, key: tuple):
         return self.seen.get(key)
 
-    def put(self, key: tuple, now: datetime, price: float, fair: float, leading: bool) -> None:
-        self.seen[key] = (now, price, fair, leading)
+    def put(self, key: tuple, now: datetime, since: datetime | None, anchor: tuple | None) -> None:
+        self.seen[key] = (now, since, anchor)
 
     def prune(self, now: datetime) -> None:
         self.seen = {k: v for k, v in self.seen.items() if now - v[0] <= self.keep}
@@ -2047,12 +2049,13 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                     # from the others (in a live game: it reacted to a goal first) is probably the
                     # right one, and the rest are behind: betting it is no edge at all.
                     hkey = (ev["id"], k, bk, name)
-                    leading = _leading(history.get(hkey) if history else None, price, fair_p, edge, cfg,
-                                       stamps.get((k, bk)),
-                                       sorted(t for (kk, ob), t in stamps.items() if kk == k and ob != bk and ob in full),
-                                       is_live)
+                    since, anchor = _leading(history.get(hkey) if history else None, now, price, fair_p, edge, cfg,
+                                             stamps.get((k, bk)),
+                                             sorted(t for (kk, ob), t in stamps.items() if kk == k and ob != bk and ob in full),
+                                             is_live)
                     if history:
-                        history.put(hkey, now, price, fair_p, leading)
+                        history.put(hkey, now, since, anchor)
+                    leading = since is not None
                     if bk in reference_only or not cfg.bettable(bk) or edge < cfg.outlier_min_pct or leading:
                         continue
                     # And when the sharp book prices this line, it has to agree the price is good.
@@ -2103,26 +2106,35 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
     return list(best.values())
 
 
-def _leading(prev, price: float, fair_p: float, edge: float, cfg: Config,
-             mine: datetime | None, theirs: list[datetime], is_live: bool) -> bool:
-    """Is this book out in front of the market (not a stale one worth betting)?
+def _leading(prev, now: datetime, price: float, fair_p: float, edge: float, cfg: Config,
+             mine: datetime | None, theirs: list[datetime], is_live: bool) -> tuple[datetime | None, tuple | None]:
+    """Is this book out in front of the market (not a stale one worth betting)? Returns (out in
+    front since, anchor) for the history; since is None when it isn't.
 
-    With a previous sighting: it moved its own price away from the others by a real amount while
-    they stayed put, or it was already out in front and the others still haven't caught up.
-    Without one (first look at this line): only if its quote is much newer than theirs."""
-    if prev is not None:
-        _, p_price, p_fair, p_leading = prev
-        if edge < cfg.outlier_min_pct:
-            return False   # back in line with the market
-        if p_leading:
-            return True    # still out in front, the others haven't caught up
-        moved = abs(1 / price - 1 / p_price)
-        p_edge = (p_fair * p_price - 1) * 100
-        return price != p_price and moved > abs(fair_p - p_fair) and edge - p_edge >= cfg.outlier_min_pct / 2
-    if mine and theirs:
-        gap = (mine - theirs[len(theirs) // 2]).total_seconds()
-        return gap >= (max(30, cfg.live_arb_max_skew) if is_live else 300)
-    return False
+    - In line with the market (edge under half the outlier bar): remember this price as the
+      anchor; not out in front.
+    - Out in front already: stays so for up to 5 minutes live (30 pre-game) for the others to
+      catch up. If they never do, it's this book that's off after all.
+    - Otherwise: out in front if, since its anchor, it moved its own price away from the market
+      by a real amount (in one step or several) while the market moved less.
+    - No anchor yet (first look at a live line): only if its quote is much newer than theirs."""
+    _, since, anchor = prev if prev is not None else (None, None, None)
+    if edge < cfg.outlier_min_pct / 2:
+        return None, (price, fair_p)
+    if since is not None:
+        if (now - since).total_seconds() <= (300 if is_live else 1800):
+            return since, anchor
+        return None, (price, fair_p)   # the market never followed: re-anchor so it isn't flagged again
+    if anchor is not None:
+        a_price, a_fair = anchor
+        moved, market = abs(1 / price - 1 / a_price), abs(fair_p - a_fair)
+        if price != a_price and moved > market and edge - (a_fair * a_price - 1) * 100 >= cfg.outlier_min_pct / 2:
+            return now, anchor
+        return None, anchor
+    if is_live and mine and theirs:
+        if (mine - theirs[len(theirs) // 2]).total_seconds() >= max(30, cfg.live_arb_max_skew):
+            return now, None
+    return None, None
 
 
 def note_related(groups: list[tuple[list[EVBet], "Alerter", set[str]]], now: float | None = None) -> None:
@@ -2733,10 +2745,9 @@ BOX_STATS = {   # (sport family, prop market) -> columns added together
         _t(("TD",), ("rushingTouchdowns",), ("rushing",), optional=True),
         _t(("TD",), ("receivingTouchdowns",), ("receiving",), optional=True),
         _t(("TD",), ("kickReturnTouchdowns",), ("kickreturns",), optional=True),
-        _t(("TD",), ("puntReturnTouchdowns",), ("puntreturns",), optional=True),
-        _t(("TD",), ("interceptionTouchdowns",), ("interceptions",), optional=True),
-        _t(("TD",), ("defensiveTouchdowns",), ("defensive",), optional=True)],
+        _t(("TD",), ("puntReturnTouchdowns",), ("puntreturns",), optional=True)],
     ("baseball", "batter_hits"): [_t(("H",), ("hits",), ("batting",))],
+    ("baseball", "batter_total_bases"): [_t(("TB",), ("totalBases",), ("batting",))],   # MLB's own box score
     ("baseball", "batter_home_runs"): [_t(("HR",), ("homeRuns",), ("batting",))],
     ("baseball", "batter_rbis"): [_t(("RBI",), ("RBIs", "rbis"), ("batting",))],
     ("baseball", "batter_runs_scored"): [_t(("R",), ("runs",), ("batting",))],
@@ -2748,7 +2759,7 @@ BOX_STATS = {   # (sport family, prop market) -> columns added together
     ("baseball", "pitcher_earned_runs"): [_t(("ER",), ("earnedRuns",), ("pitching",))],
     ("baseball", "pitcher_outs"): [_t(("IP",), ("fullInnings.partInnings", "inningsPitched"), ("pitching",), "outs")],
 }
-# Total bases isn't in the ESPN box score (no doubles/triples column), so it stays a manual check.
+# Total bases isn't in the ESPN box score (no doubles/triples column); MLB's own box score has it.
 
 
 def _family(sport_key: str) -> str:
@@ -2756,8 +2767,12 @@ def _family(sport_key: str) -> str:
 
 
 def box_supported(leg: dict) -> bool:
-    return (PROP_GRADING and leg.get("sport_key") in ESPN_LEAGUES
-            and (_family(leg["sport_key"]), leg.get("market")) in BOX_STATS)
+    sport = leg.get("sport_key")
+    if not PROP_GRADING or (sport not in ESPN_LEAGUES and sport not in BOX_SOURCES):
+        return False
+    if leg.get("market") == "batter_total_bases":
+        return sport in BOX_SOURCES   # only MLB's own box score has total bases
+    return (_family(sport), leg.get("market")) in BOX_STATS
 
 
 def _words(name: str) -> list[str]:
@@ -2774,10 +2789,10 @@ def _norm(name: str) -> str:
 _ESPN_CACHE: dict[str, tuple[float, dict]] = {}
 
 
-def _espn_get(path: str) -> dict:
-    """GET an ESPN site-API JSON page (free, no key)."""
-    req = urllib.request.Request(f"{ESPN_BASE}/{path}", headers={
-        "User-Agent": "Mozilla/5.0 (arbbot results)", "Accept-Encoding": "gzip", "Accept": "application/json"})
+def _get_json(url: str) -> dict:
+    """GET a public JSON page (free stats sites, no key)."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "arbbot/3.0 (bet results)", "Accept-Encoding": "gzip", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         raw = resp.read()
         if resp.headers.get("Content-Encoding") == "gzip":
@@ -2785,13 +2800,37 @@ def _espn_get(path: str) -> dict:
         return json.loads(raw)
 
 
+ESPN_HOSTS = [ESPN_BASE, ESPN_BASE.replace("://site.api.", "://site.web.api.")]
+
+
+def _espn_get(path: str) -> dict:
+    """GET an ESPN site-API page, trying its second host if the first refuses (403)."""
+    last: Exception | None = None
+    for base in dict.fromkeys(ESPN_HOSTS):
+        try:
+            return _get_json(f"{base}/{path}")
+        except urllib.error.HTTPError as e:
+            if e.code not in (403, 404):
+                raise
+            last = e
+    raise last
+
+
 def _espn(path: str, ttl: float = 600) -> dict:
-    hit = _ESPN_CACHE.get(path)
+    return _cached("espn:" + path, lambda: _espn_get(path), ttl)
+
+
+def _cached(key: str, fetch, ttl: float) -> dict:
+    hit = _ESPN_CACHE.get(key)
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
-    data = _espn_get(path)
-    _ESPN_CACHE[path] = (time.time(), data)
+    data = fetch()
+    _ESPN_CACHE[key] = (time.time(), data)
     return data
+
+
+def _web(url: str, ttl: float = 600) -> dict:
+    return _cached(url, lambda: _get_json(url), ttl)
 
 
 def _team_match(odds_name: str, team: dict) -> int:
@@ -2886,6 +2925,19 @@ def parse_box(summary: dict) -> dict:
             "touchdowns": tds}
 
 
+_DEFENSE_TD = [_t(("TD",), ("interceptionTouchdowns",), ("interceptions",), optional=True),
+               _t(("TD",), ("defensiveTouchdowns",), ("defensive",), optional=True)]
+
+
+def _read_stat(player: dict, market: str, sport_key: str) -> float | None:
+    """A player's number for a prop market. For anytime TD, a pick-six shows up both as an
+    interception TD and a defensive TD, so the larger of the two counts, not both."""
+    value = _read(player, BOX_STATS[(_family(sport_key), market)])
+    if market == "player_anytime_td" and value is not None:
+        value += max((_read(player, [t]) or 0) for t in _DEFENSE_TD)
+    return value
+
+
 def _read(player: dict, terms: list) -> float | None:
     total, found = 0.0, False
     for cats, labels, keys, part, optional in terms:
@@ -2938,24 +2990,170 @@ def box_checks(sport_key: str, box: dict) -> list[str]:
     return problems
 
 
+
+# ---- the leagues' own stats sites (free, public), tried before ESPN
+
+NHL_API = os.environ.get("NHL_API_BASE", "https://api-web.nhle.com/v1")
+MLB_API = os.environ.get("MLB_API_BASE", "https://statsapi.mlb.com/api/v1")
+
+
+def _game_days(commence: str) -> list:
+    start = _parse_time(commence)
+    return sorted({start.astimezone(ZoneInfo("America/New_York")).date(), start.date()})
+
+
+def _pick_game(games: list[tuple[str, datetime, list[dict]]], home: str, away: str, commence: str) -> str | None:
+    """The one game whose two teams match (either way round), within 12 hours of the start."""
+    start, found = _parse_time(commence), []
+    for gid, when, teams in games:
+        if abs(when - start) > timedelta(hours=12) or len(teams) != 2:
+            continue
+        a, b = teams
+        score = max(min(_team_match(home, a), _team_match(away, b)), min(_team_match(home, b), _team_match(away, a)))
+        if score:
+            found.append((score, gid))
+    best = {gid for sc, gid in found if sc == max((x for x, _ in found), default=0)}
+    return best.pop() if len(best) == 1 else None
+
+
+def _txt(v) -> str:
+    return v.get("default", "") if isinstance(v, dict) else str(v or "")
+
+
+def _nhl_box(sport_key: str, home: str, away: str, commence: str) -> tuple[str | None, dict | None]:
+    """NHL.com: the day's scores, then the game's box score and its roster (for full names)."""
+    games = []
+    for d in _game_days(commence):
+        for g in _web(f"{NHL_API}/score/{d:%Y-%m-%d}").get("games", []):
+            teams = [{"name": _txt(t.get("commonName") or t.get("name")), "location": _txt(t.get("placeName")),
+                      "displayName": " ".join(x for x in (_txt(t.get("placeName")), _txt(t.get("commonName") or t.get("name"))) if x)}
+                     for t in (g.get("homeTeam", {}), g.get("awayTeam", {}))]
+            games.append((str(g.get("id")), _parse_time(g.get("startTimeUTC", "1970-01-01T00:00:00Z")), teams))
+    gid = _pick_game(games, home, away, commence)
+    if not gid:
+        return None, None
+    raw = _web(f"{NHL_API}/gamecenter/{gid}/boxscore", ttl=300)
+    try:
+        roster = _web(f"{NHL_API}/gamecenter/{gid}/play-by-play", ttl=3600).get("rosterSpots", [])
+    except Exception:  # noqa: BLE001 - without full names, players just aren't matched (manual)
+        roster = []
+    full = {r.get("playerId"): f"{_txt(r.get('firstName'))} {_txt(r.get('lastName'))}".strip() for r in roster}
+    teams = {}
+    for side in ("homeTeam", "awayTeam"):
+        t = raw.get(side, {})
+        team = teams.setdefault(str(t.get("id", side)), {"name": _txt(t.get("commonName")) or side,
+                                                         "score": _num(str(t.get("score", ""))), "players": {}})
+        stats = raw.get("playerByGameStats", {}).get(side, {})
+        for group in ("forwards", "defense", "goalies"):
+            for p in stats.get(group, []):
+                name = full.get(p.get("playerId")) or _txt(p.get("name"))
+                cols = {"G": p.get("goals"), "A": p.get("assists"), "S": p.get("sog", p.get("shots")),
+                        "BS": p.get("blockedShots")}
+                if group == "goalies":
+                    saves = p.get("saves")
+                    if saves is None and p.get("shotsAgainst") is not None and p.get("goalsAgainst") is not None:
+                        saves = p["shotsAgainst"] - p["goalsAgainst"]
+                    if saves is None and "/" in str(p.get("saveShotsAgainst", "")):
+                        saves = str(p["saveShotsAgainst"]).split("/")[0]
+                    cols = {"G": p.get("goals", 0), "A": p.get("assists", 0), "SV": saves}
+                team["players"][_norm(name)] = {"name": name, "dnp": False, "groups": {
+                    "goalies" if group == "goalies" else "skaters":
+                        {k: str(v) for k, v in cols.items() if v is not None}}}
+    return f"nhl:{gid}", {"final": raw.get("gameState") in ("OFF", "FINAL"), "teams": teams, "touchdowns": None}
+
+
+def _mlb_box(sport_key: str, home: str, away: str, commence: str) -> tuple[str | None, dict | None]:
+    """MLB's stats API: the day's schedule, then the game's box score."""
+    games, final = [], {}
+    for d in _game_days(commence):
+        for day in _web(f"{MLB_API}/schedule?sportId=1&date={d:%Y-%m-%d}").get("dates", []):
+            for g in day.get("games", []):
+                teams = [{"displayName": g["teams"][s]["team"].get("name", ""),
+                          "name": g["teams"][s]["team"].get("teamName", "")} for s in ("home", "away")]
+                pk = str(g.get("gamePk"))
+                games.append((pk, _parse_time(g.get("gameDate", "1970-01-01T00:00:00Z")), teams))
+                final[pk] = g.get("status", {}).get("abstractGameState") == "Final"
+    pk = _pick_game(games, home, away, commence)
+    if not pk:
+        return None, None
+    raw = _web(f"{MLB_API}/game/{pk}/boxscore", ttl=300)
+    teams = {}
+    for side in ("home", "away"):
+        t = raw.get("teams", {}).get(side, {})
+        team = teams.setdefault(side, {"name": t.get("team", {}).get("name", side),
+                                       "score": _num(str(t.get("teamStats", {}).get("batting", {}).get("runs", ""))),
+                                       "players": {}})
+        for p in t.get("players", {}).values():
+            name = p.get("person", {}).get("fullName", "")
+            bat, pit = p.get("stats", {}).get("batting") or {}, p.get("stats", {}).get("pitching") or {}
+            groups = {}
+            if bat:
+                groups["batting"] = {k: str(bat[f]) for k, f in (("H", "hits"), ("R", "runs"), ("HR", "homeRuns"),
+                                     ("RBI", "rbi"), ("BB", "baseOnBalls"), ("K", "strikeOuts"), ("TB", "totalBases"))
+                                     if f in bat}
+            if pit:
+                groups["pitching"] = {k: str(pit[f]) for k, f in (("K", "strikeOuts"), ("H", "hits"), ("BB", "baseOnBalls"),
+                                      ("ER", "earnedRuns"), ("IP", "inningsPitched")) if f in pit}
+            if name:   # on the roster but no stats: didn't play (books void those bets)
+                team["players"][_norm(name)] = {"name": name, "dnp": not groups, "groups": groups}
+    return f"mlb:{pk}", {"final": final.get(pk, False), "teams": teams, "touchdowns": None}
+
+
+BOX_SOURCES = {"icehockey_nhl": [("NHL.com", _nhl_box)], "baseball_mlb": [("MLB.com", _mlb_box)]}
+
 _BOX_CACHE: dict[str, dict] = {}
 
 
-def game_box(sport_key: str, home: str, away: str, commence: str) -> tuple[dict | None, str]:
-    """(box score, "") once the game is final and the box passed its checks, else (None, why)."""
+def _espn_box(sport_key: str, home: str, away: str, commence: str) -> tuple[str | None, dict | None]:
+    """(game id, raw box) from ESPN, or (None, None) if the game isn't there."""
+    if sport_key not in ESPN_LEAGUES:
+        return None, None
     eid = espn_event_id(sport_key, home, away, commence)
     if not eid:
-        return None, "couldn't find the game on ESPN"
-    if eid in _BOX_CACHE:
-        return _BOX_CACHE[eid], ""
+        return None, None
     league, _ = ESPN_LEAGUES[sport_key]
-    box = parse_box(_espn(f"{league}/summary?event={eid}", ttl=300))
-    if not box["final"]:
-        return None, "not final yet"
-    if problems := box_checks(sport_key, box):
-        return None, "box score didn't check out: " + "; ".join(problems)
-    _BOX_CACHE[eid] = box
-    return box, ""
+    return f"espn:{eid}", parse_box(_espn(f"{league}/summary?event={eid}", ttl=300))
+
+
+def game_box(sport_key: str, home: str, away: str, commence: str) -> tuple[dict | None, str]:
+    """(box score, "") once the game is final and the box passed its checks, else (None, why).
+    Tries the league's own stats site first (NHL, MLB), then ESPN."""
+    why = []
+    for name, source in BOX_SOURCES.get(sport_key, []) + [("ESPN", _espn_box)]:
+        try:
+            gid, box = source(sport_key, home, away, commence)
+        except Exception as e:  # noqa: BLE001 - a source that's down or refuses: try the next one
+            why.append(f"{name}: {e!r:.80}")
+            continue
+        if gid is None:
+            why.append(f"{name}: game not found")
+            continue
+        if gid in _BOX_CACHE:
+            return _BOX_CACHE[gid], ""
+        if not box["final"]:
+            return None, "not final yet"
+        if problems := box_checks(sport_key, box):
+            why.append(f"{name}: box score didn't check out: " + "; ".join(problems))
+            continue
+        _BOX_CACHE[gid] = box
+        return box, ""
+    return None, " / ".join(why)
+
+
+NICKNAMES = {   # short form -> full first name (both directions are checked)
+    "mike": "michael", "mikey": "michael", "nick": "nicholas", "nic": "nicholas", "gabe": "gabriel",
+    "matt": "matthew", "matty": "matthew", "jake": "jacob", "dave": "david", "dan": "daniel", "danny": "daniel",
+    "tony": "anthony", "bill": "william", "will": "william", "billy": "william", "bob": "robert", "rob": "robert",
+    "bobby": "robert", "jim": "james", "jimmy": "james", "ken": "kenneth", "kenny": "kenneth", "joe": "joseph",
+    "joey": "joseph", "chris": "christopher", "steve": "steven", "tom": "thomas", "tommy": "thomas",
+    "zach": "zachary", "zack": "zachary", "josh": "joshua", "alex": "alexander", "sasha": "alexander",
+    "ben": "benjamin", "sam": "samuel", "ed": "edward", "eddie": "edward", "pat": "patrick", "andy": "andrew",
+    "drew": "andrew", "greg": "gregory", "jon": "jonathan", "johnny": "john", "fred": "frederick",
+    "freddie": "frederick", "vince": "vincent", "jeff": "jeffrey", "rick": "richard", "ricky": "richard",
+    "dick": "richard", "charlie": "charles", "chuck": "charles", "nate": "nathan", "max": "maxwell",
+    "cam": "cameron", "mitch": "mitchell", "tim": "timothy", "timmy": "timothy", "theo": "theodore",
+    "teddy": "theodore", "ted": "theodore", "liz": "elizabeth", "kate": "katherine",
+}
 
 
 def find_player(box: dict, name: str) -> dict | None:
@@ -2971,8 +3169,12 @@ def find_player(box: dict, name: str) -> dict | None:
         return None
 
     def same_person(w: list[str]) -> bool:
+        if w[1:] != want[1:]:
+            return False
         short, longer = sorted((w[0], want[0]), key=len)
-        return w[1:] == want[1:] and len(short) >= 3 and longer.startswith(short)
+        return ((len(short) >= 3 and longer.startswith(short))
+                or NICKNAMES.get(w[0]) == want[0] or NICKNAMES.get(want[0]) == w[0]
+                or (NICKNAMES.get(w[0]) is not None and NICKNAMES.get(w[0]) == NICKNAMES.get(want[0])))
 
     close = [p for _, p in every if len(w := _words(p["name"])) >= 2 and same_person(w)]
     return close[0] if len(close) == 1 else None
@@ -3004,15 +3206,14 @@ def grade_prop(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
         return None, f"{row['player']} isn't in the box score"
     if p["dnp"]:
         return ("push", 0.0), "DNP"   # didn't play: books void the bet
-    terms = BOX_STATS[(_family(row["sport_key"]), row["market"])]
-    value = _read(p, terms)
+    value = _read_stat(p, row["market"], row["sport_key"])
     if value is None:
         return None, f"no {MARKET_NAMES.get(row['market'], row['market'])} for {p['name']} in the box score"
     if row["market"] == "player_anytime_td" and value < 1:
         # "No TD" is only certain if every touchdown in the game is credited to someone in the box
         # (a fumble recovered in the end zone, say, has no column of its own).
-        credited = sum(_read(q, terms) or 0 for t in box["teams"].values() for q in t["players"].values()
-                       if not q["dnp"])
+        credited = sum(_read_stat(q, row["market"], row["sport_key"]) or 0
+                       for t in box["teams"].values() for q in t["players"].values() if not q["dnp"])
         if box.get("touchdowns") is None or credited < box["touchdowns"]:
             return None, "not every touchdown in this game is in the box score"
     return settle_prop(row, value), f"{value:g}"
@@ -3407,37 +3608,83 @@ class Results:
         return outcome
 
 
+def _list_games(source: str, sport: str, days: list) -> list[tuple[str, str, str, bool]]:
+    """(home, away, start, finished) for each game those days, from one source."""
+    out, errors = [], []
+    for d in days:
+        try:
+            out += _list_day(source, sport, d)
+        except Exception as e:  # noqa: BLE001 - one bad day shouldn't hide the other
+            errors.append(e)
+    if errors and len(errors) == len(days):
+        raise errors[0]
+    return out
+
+
+def _list_day(source: str, sport: str, d) -> list[tuple[str, str, str, bool]]:
+    out = []
+    if source == "NHL.com":
+        for g in _web(f"{NHL_API}/score/{d:%Y-%m-%d}").get("games", []):
+            name = lambda t: " ".join(x for x in (_txt(t.get("placeName")), _txt(t.get("commonName") or t.get("name"))) if x)
+            out.append((name(g.get("homeTeam", {})), name(g.get("awayTeam", {})), g.get("startTimeUTC", ""),
+                        g.get("gameState") in ("OFF", "FINAL")))
+    elif source == "MLB.com":
+        for day in _web(f"{MLB_API}/schedule?sportId=1&date={d:%Y-%m-%d}").get("dates", []):
+            for g in day.get("games", []):
+                out.append((g["teams"]["home"]["team"].get("name", ""), g["teams"]["away"]["team"].get("name", ""),
+                            g.get("gameDate", ""), g.get("status", {}).get("abstractGameState") == "Final"))
+    else:
+        league, extra = ESPN_LEAGUES[sport]
+        for ev in _espn(f"{league}/scoreboard?dates={d:%Y%m%d}" + (f"&{extra}" if extra else "")).get("events", []):
+            comp = (ev.get("competitions") or [{}])[0]
+            sides = {c.get("homeAway"): c.get("team", {}).get("displayName", "") for c in comp.get("competitors", [])}
+            status = (ev.get("status") or comp.get("status") or {}).get("type", {})
+            out.append((sides.get("home", ""), sides.get("away", ""), ev.get("date", ""), bool(status.get("completed"))))
+    return out
+
+
+def _recent_final(sport: str, days: list) -> tuple[str | None, dict | None, list[str]]:
+    """(source, box) for the latest finished game those days, trying the sources in grading order."""
+    tried = []
+    sources = BOX_SOURCES.get(sport, []) + ([("ESPN", _espn_box)] if sport in ESPN_LEAGUES else [])
+    for name, fetch in sources:
+        try:
+            done = [g for g in _list_games(name, sport, days) if g[3] and g[2]]
+            if not done:
+                tried.append(f"{name}: no finished games yesterday or today")
+                continue
+            home, away, start, _ = done[-1]
+            gid, box = fetch(sport, home, away, start)
+            if box is not None:
+                return name, box, tried
+            tried.append(f"{name}: couldn't open {away} @ {home}")
+        except Exception as e:  # noqa: BLE001
+            tried.append(f"{name}: couldn't reach it ({e!r:.100})")
+    return None, None, tried
+
+
 def check_props(cfg: Config, now: datetime | None = None) -> None:
     """Show what the bot reads from the latest finished game's box score in each prop sport, and
     what it would do with your ungraded prop bets. Uses no Odds API credits."""
     now = now or datetime.now(timezone.utc)
     today = now.astimezone(ZoneInfo("America/New_York")).date()
-    print("Checking player-prop grading against ESPN box scores...\n")
+    print("Checking player-prop grading against real box scores...\n")
     for sport in cfg.prop_sports:
-        if sport not in ESPN_LEAGUES:
+        if sport not in ESPN_LEAGUES and sport not in BOX_SOURCES:
             print(f"{short(sport)}: no box scores for this sport, so its props are checked by hand.\n")
             continue
-        league, extra = ESPN_LEAGUES[sport]
-        done = []
-        try:
-            for d in (today - timedelta(days=1), today):
-                sb = _espn(f"{league}/scoreboard?dates={d:%Y%m%d}" + (f"&{extra}" if extra else ""))
-                for ev in sb.get("events", []):
-                    status = (ev.get("status") or ev.get("competitions", [{}])[0].get("status") or {}).get("type", {})
-                    if status.get("completed"):
-                        done.append(ev)
-            if not done:
-                print(f"{short(sport)}: no finished games yesterday or today to check.\n")
-                continue
-            ev = done[-1]
-            box = parse_box(_espn(f"{league}/summary?event={ev['id']}", ttl=300))
-        except Exception as e:  # noqa: BLE001
-            print(f"{short(sport)}: couldn't reach ESPN ({e!r:.150})\n")
+        source, box, tried = _recent_final(sport, [today - timedelta(days=1), today])
+        if box is None:
+            hint = ("\n  ESPN refuses requests from this server, so these props stay a manual check for now."
+                    if any("ESPN" in t and "403" in t for t in tried) and sport not in BOX_SOURCES else "")
+            print(f"{short(sport)}: " + " / ".join(tried) + hint + "\n")
             continue
         problems = box_checks(sport, box)
         names = " vs ".join(f"{t['name']} {t['score']:g}" if t["score"] is not None else t["name"]
                             for t in box["teams"].values())
-        print(f"{short(sport)}: {names}")
+        print(f"{short(sport)} (from {source}): {names}")
+        for note in tried:
+            print(f"  ({note})")
         print("  ✅ box score checks out" if not problems else "  ⚠️ " + "; ".join(problems)
               + " (props in games like this are left for you to check)")
         for market in _csv(cfg.prop_markets.get(sport, "").replace("|", ",")):

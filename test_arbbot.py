@@ -21,7 +21,8 @@ def _no_network(path):
     raise OSError("tests don't use the network")
 
 
-_arbbot._espn_get = _no_network   # box-score tests install a fake ESPN
+_arbbot._espn_get = _no_network   # box-score tests install a fake ESPN / NHL / MLB
+_arbbot._get_json = _no_network
 
 NOW = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
 FRESH = NOW.isoformat().replace("+00:00", "Z")
@@ -2450,7 +2451,8 @@ class PropGrading(unittest.TestCase):
 
     def test_unsupported_props_stay_manual(self):
         from arbbot import gradable
-        self.assertFalse(gradable(self.row(market="batter_total_bases", sport="baseball_mlb")))
+        self.assertFalse(gradable(self.row(market="player_double_double", sport="basketball_nba")))
+        self.assertTrue(gradable(self.row(market="batter_total_bases", sport="baseball_mlb")))   # MLB's own box
         self.assertTrue(gradable(self.row()))
 
 
@@ -2724,6 +2726,198 @@ class StateUpgrades(unittest.TestCase):
         res.update_board(self.LATER)                                   # 429 x3: not counted as done
         res.update_board(self.LATER)                                   # so it's tried again
         self.assertEqual(calls, ["POST", "PATCH", "PATCH"])
+
+
+
+def league_fake(pages):
+    """A fake for the league stats sites: {url suffix: json}."""
+    def get(url):
+        for suffix, page in pages.items():
+            if url.endswith(suffix):
+                if isinstance(page, Exception):
+                    raise page
+                return page
+        raise urllib.error.HTTPError(url, 404, "not found", {}, None)
+    return get
+
+
+NHL_PAGES = {
+    "/score/2026-10-03": {"games": [{"id": 2025020055, "startTimeUTC": "2026-10-03T23:00:00Z", "gameState": "OFF",
+                                     "homeTeam": {"id": 29, "name": {"default": "Blue Jackets"}, "score": 3},
+                                     "awayTeam": {"id": 68, "name": {"default": "Mammoth"}, "score": 2}}]},
+    "/score/2026-10-04": {"games": []},
+    "/gamecenter/2025020055/boxscore": {
+        "gameState": "OFF",
+        "homeTeam": {"id": 29, "commonName": {"default": "Blue Jackets"}, "score": 3},
+        "awayTeam": {"id": 68, "commonName": {"default": "Mammoth"}, "score": 2},
+        "playerByGameStats": {
+            "homeTeam": {"forwards": [{"playerId": 1, "name": {"default": "K. Johnson"}, "goals": 1, "assists": 1, "sog": 4, "blockedShots": 0}],
+                         "defense": [{"playerId": 2, "name": {"default": "Z. Werenski"}, "goals": 2, "assists": 2, "sog": 5, "blockedShots": 1}],
+                         "goalies": [{"playerId": 3, "name": {"default": "E. Merzlikins"}, "saveShotsAgainst": "28/30", "goalsAgainst": 2}]},
+            "awayTeam": {"forwards": [{"playerId": 4, "name": {"default": "C. Keller"}, "goals": 2, "assists": 0, "sog": 6, "blockedShots": 0}],
+                         "defense": [], "goalies": [{"playerId": 5, "name": {"default": "K. Vejmelka"}, "saves": 31, "goalsAgainst": 3}]}}},
+    "/gamecenter/2025020055/play-by-play": {"rosterSpots": [
+        {"teamId": 29, "playerId": 1, "firstName": {"default": "Kent"}, "lastName": {"default": "Johnson"}},
+        {"teamId": 29, "playerId": 2, "firstName": {"default": "Zach"}, "lastName": {"default": "Werenski"}},
+        {"teamId": 29, "playerId": 3, "firstName": {"default": "Elvis"}, "lastName": {"default": "Merzlikins"}},
+        {"teamId": 68, "playerId": 4, "firstName": {"default": "Clayton"}, "lastName": {"default": "Keller"}},
+        {"teamId": 68, "playerId": 5, "firstName": {"default": "Karel"}, "lastName": {"default": "Vejmelka"}}]},
+}
+MLB_PAGES = {
+    "schedule?sportId=1&date=2026-10-03": {"dates": [{"games": [{
+        "gamePk": 776, "gameDate": "2026-10-03T23:05:00Z", "status": {"abstractGameState": "Final"},
+        "teams": {"home": {"team": {"id": 119, "name": "Los Angeles Dodgers", "teamName": "Dodgers"}, "score": 4},
+                  "away": {"team": {"id": 135, "name": "San Diego Padres", "teamName": "Padres"}, "score": 1}}}]}]},
+    "schedule?sportId=1&date=2026-10-04": {"dates": []},
+    "/game/776/boxscore": {"teams": {
+        "home": {"team": {"name": "Los Angeles Dodgers"}, "teamStats": {"batting": {"runs": 4}}, "players": {
+            "ID660271": {"person": {"fullName": "Shohei Ohtani"}, "stats": {"batting": {
+                "hits": 2, "runs": 4, "homeRuns": 2, "rbi": 3, "baseOnBalls": 0, "strikeOuts": 1, "totalBases": 8}, "pitching": {}}},
+            "ID808967": {"person": {"fullName": "Yoshinobu Yamamoto"}, "stats": {"batting": {}, "pitching": {
+                "strikeOuts": 9, "hits": 4, "baseOnBalls": 2, "earnedRuns": 1, "inningsPitched": "6.1"}}},
+            "ID1": {"person": {"fullName": "Bench Guy"}, "stats": {"batting": {}, "pitching": {}}}}},
+        "away": {"team": {"name": "San Diego Padres"}, "teamStats": {"batting": {"runs": 1}}, "players": {
+            "ID592450": {"person": {"fullName": "Manny Machado"}, "stats": {"batting": {"hits": 1, "runs": 1, "totalBases": 4}}}}}}},
+}
+
+
+class LeagueStatsSites(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        self.pages = {**NHL_PAGES, **MLB_PAGES}
+        mock.patch("arbbot._get_json", side_effect=lambda url: league_fake(self.pages)(url)).start()
+        self.espn = mock.patch("arbbot._espn_get", side_effect=OSError("ESPN refused (403)")).start()
+        self.addCleanup(mock.patch.stopall)
+        _arbbot._ESPN_CACHE.clear()
+        _arbbot._BOX_CACHE.clear()
+
+    def row(self, player, market, point, sport="icehockey_nhl", home="Columbus Blue Jackets", away="Utah Mammoth",
+            outcome="Over", start="2026-10-03T23:00:00Z"):
+        return {"sport_key": sport, "home_team": home, "away_team": away, "commence_time": start, "market": market,
+                "outcome": outcome, "point": point, "player": player, "stake": "10", "price": "2.0"}
+
+    def test_nhl_props_from_nhl_com(self):
+        from arbbot import grade_prop
+        self.assertEqual(grade_prop(self.row("Kent Johnson", "player_assists", "0.5")), (("win", 10.0), "1"))
+        self.assertEqual(grade_prop(self.row("Clayton Keller", "player_shots_on_goal", "5.5"))[1], "6")
+        self.assertEqual(grade_prop(self.row("Elvis Merzlikins", "player_total_saves", "27.5"))[1], "28")
+        self.assertEqual(grade_prop(self.row("Karel Vejmelka", "player_total_saves", "30.5"))[1], "31")
+        self.espn.assert_not_called()
+
+    def test_without_full_names_nobody_is_guessed(self):
+        from arbbot import grade_prop
+        self.pages["/gamecenter/2025020055/play-by-play"] = OSError("down")
+        res, why = grade_prop(self.row("Kent Johnson", "player_assists", "0.5"))
+        self.assertIsNone(res)                                           # "K. Johnson" isn't enough
+        self.assertIn("isn't in the box score", why)
+
+    def test_mlb_props_including_total_bases(self):
+        from arbbot import grade_prop
+        dodgers = dict(sport="baseball_mlb", home="Los Angeles Dodgers", away="San Diego Padres", start="2026-10-03T23:05:00Z")
+        self.assertEqual(grade_prop(self.row("Shohei Ohtani", "batter_total_bases", "2.5", **dodgers)), (("win", 10.0), "8"))
+        self.assertEqual(grade_prop(self.row("Yoshinobu Yamamoto", "pitcher_outs", "18.5", **dodgers))[1], "19")
+        self.assertEqual(grade_prop(self.row("Yoshinobu Yamamoto", "pitcher_strikeouts", "8.5", **dodgers))[1], "9")
+        self.assertEqual(grade_prop(self.row("Bench Guy", "batter_hits", "0.5", **dodgers)), (("push", 0.0), "DNP"))
+
+    def test_falls_back_to_espn_when_the_league_site_is_down(self):
+        from arbbot import grade_prop
+        self.pages["/score/2026-10-03"] = urllib.error.HTTPError("u", 503, "down", {}, None)
+        res, why = grade_prop(self.row("Kent Johnson", "player_assists", "0.5"))
+        self.assertIsNone(res)
+        self.assertIn("NHL.com", why)
+        self.assertIn("ESPN", why)
+        self.espn.assert_called()
+
+    def test_check_props_says_where_it_read_from(self):
+        import io, contextlib
+        from arbbot import check_props
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        cfg = Config(prop_sports=["icehockey_nhl", "baseball_mlb"], ev_log_file=str(d / "ev.csv"),
+                     outlier_log_file=str(d / "out.csv"), parlay_log_file=str(d / "par.csv"),
+                     ev_results_file=str(d / "res.csv"), closing_file=str(d / "close.csv"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            check_props(cfg, datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc))
+        text = out.getvalue()
+        self.assertIn("NHL (from NHL.com)", text)
+        self.assertIn("MLB (from MLB.com)", text)
+        self.assertEqual(text.count("✅ box score checks out"), 2)
+        self.assertIn("Shots on Goal: Clayton Keller 6", text)
+        self.assertIn("Total Bases: Shohei Ohtani 8", text)
+
+
+
+class OutlierHistoryRules(unittest.TestCase):
+    def test_two_small_steps_are_still_a_jump(self):
+        from arbbot import PriceHistory
+        h = PriceHistory()
+        cfg = Config(outlier_min_pct=10)
+        find_outliers([outlier_event(1.25, 4.00)], cfg, NOW, h)                          # in line
+        find_outliers([outlier_event(1.385, 3.40)], cfg, NOW + timedelta(seconds=60), h)  # +8%: under the bar
+        self.assertEqual(find_outliers([outlier_event(1.436, 3.20)], cfg, NOW + timedelta(seconds=120), h), [])  # +12%
+
+    def test_out_in_front_expires_if_the_market_never_follows(self):
+        from arbbot import PriceHistory
+        h = PriceHistory()
+        find_outliers([outlier_event(1.25, 4.00)], Config(), NOW, h)
+        t = NOW + timedelta(seconds=60)
+        self.assertEqual(find_outliers([outlier_event(1.85, 1.95)], Config(), t, h), [])
+        ev = lambda: outlier_event(1.85, 1.95)
+        later = t + timedelta(minutes=6)                                   # 6 minutes on, nobody followed:
+        def fresh(e, when):
+            ts = when.isoformat().replace("+00:00", "Z")
+            for bm in e["bookmakers"]:
+                bm["last_update"] = ts
+                for m in bm["markets"]:
+                    m["last_update"] = ts
+            return e
+        self.assertEqual([o.book for o in find_outliers([fresh(ev(), later)], Config(), later, h)], ["Stale"])
+        again = later + timedelta(seconds=60)                              # and it isn't flagged again
+        self.assertEqual([o.book for o in find_outliers([fresh(ev(), again)], Config(), again, h)], ["Stale"])
+
+    def test_pre_game_history_survives_long_gaps_and_has_no_stamp_shortcut(self):
+        from arbbot import PriceHistory
+        h = PriceHistory()
+        start = "2026-10-04T18:00:00Z"                                    # tomorrow: pre-game
+        before = outlier_event(1.85, 1.95, start=start)
+        for bm in before["bookmakers"]:
+            if bm["title"] != "Stale":
+                bm["markets"][0]["outcomes"] = [{"name": "Home", "price": 1.80}, {"name": "Away", "price": 2.05}]
+        find_outliers([before], Config(), NOW, h)
+        h.prune(NOW + timedelta(hours=4))                                 # checked again 4 hours later
+        later = outlier_event(1.85, 1.95, start=start)
+        old = (NOW - timedelta(hours=3)).isoformat().replace("+00:00", "Z")
+        for bm in later["bookmakers"]:                                    # Stale's own stamp is the newest
+            if bm["title"] != "Stale":
+                bm["last_update"] = old
+                for m in bm["markets"]:
+                    m["last_update"] = old
+        cfg = Config(pregame_max_age_seconds=10**6, far_max_age_seconds=10**6)
+        self.assertEqual([o.book for o in find_outliers([later], cfg, NOW + timedelta(hours=4), h)], ["Stale"])
+
+
+class PropMatchingMore(unittest.TestCase):
+    def test_common_nicknames(self):
+        from arbbot import find_player
+        box = PropGradingSafety.box(None, ["Michael Pittman", "Nicholas Paul", "Gabriel Landeskog", "Mike Evans"])
+        self.assertEqual(find_player(box, "Nick Paul")["name"], "Nicholas Paul")
+        self.assertEqual(find_player(box, "Gabe Landeskog")["name"], "Gabriel Landeskog")
+        self.assertEqual(find_player(box, "Michael Pittman Jr.")["name"], "Michael Pittman")
+        self.assertIsNone(find_player(box, "Mike Pittman Evans"))
+
+    def test_pick_six_counted_once(self):
+        from arbbot import grade_prop
+        from unittest import mock
+        db = {"name": "Trevon Diggs", "dnp": False, "groups": {"interceptions": {"TD": "1"}, "defensive": {"TD": "1"}}}
+        wr = {"name": "CeeDee Lamb", "dnp": False, "groups": {"receiving": {"TD": "0", "REC": "5"}}}
+        box = {"final": True, "touchdowns": 2, "teams": {"1": {"name": "Cowboys", "score": 14,
+                                                              "players": {"trevondiggs": db, "ceedeelamb": wr}}}}
+        row = {"sport_key": "americanfootball_nfl", "home_team": "Cowboys", "away_team": "X", "commence_time": "",
+               "market": "player_anytime_td", "outcome": "Yes", "point": "", "stake": "10", "price": "3.0"}
+        with mock.patch("arbbot.game_box", return_value=(box, "")):
+            self.assertEqual(grade_prop(dict(row, player="Trevon Diggs"))[1], "1")      # one TD, not two
+            self.assertIsNone(grade_prop(dict(row, player="CeeDee Lamb"))[0])         # 2 TDs, only 1 credited
 
 
 if __name__ == "__main__":
