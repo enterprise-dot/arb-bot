@@ -8721,5 +8721,71 @@ def tearDownModule():
                              + ", ".join(changed))
 
 
+
+class RemoteSettings(unittest.TestCase):
+    """remote.env: settings pushed through the automatic updates. They win over .env unless .env
+    says REMOTE_SETTINGS=off; real environment variables still win over both."""
+
+    KEYS = ("ARB_T_ONE", "ARB_T_TWO", "ARB_T_THREE", "REMOTE_SETTINGS")
+
+    def setUp(self):
+        import os
+        from unittest import mock
+        patch = mock.patch.dict(os.environ, {})
+        patch.start()
+        self.addCleanup(patch.stop)
+        for k in self.KEYS:
+            os.environ.pop(k, None)
+
+    def folder(self, local, remote):
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        (d / ".env").write_text(local)
+        (d / "remote.env").write_text(remote)
+        return d
+
+    def test_remote_wins_over_env_but_not_over_the_real_environment(self):
+        import os
+        from arbbot import load_settings
+        os.environ["ARB_T_THREE"] = "real"
+        d = self.folder("ARB_T_ONE=mine\nARB_T_TWO=mine\n", "# pushed\nARB_T_ONE=pushed\nARB_T_THREE=pushed\n")
+        used = load_settings(d)
+        self.assertEqual((os.environ["ARB_T_ONE"], os.environ["ARB_T_TWO"], os.environ["ARB_T_THREE"]),
+                         ("pushed", "mine", "real"))
+        self.assertEqual(used, {"ARB_T_ONE": "pushed"})
+
+    def test_remote_settings_off_in_env_ignores_it(self):
+        import os
+        from arbbot import load_settings
+        d = self.folder("REMOTE_SETTINGS=off\nARB_T_ONE=mine\n", "ARB_T_ONE=pushed\nARB_T_TWO=pushed\n")
+        self.assertEqual(load_settings(d), {})
+        self.assertEqual(os.environ["ARB_T_ONE"], "mine")
+        self.assertNotIn("ARB_T_TWO", os.environ)
+
+    def test_no_remote_file_is_just_env(self):
+        import os, tempfile
+        from arbbot import load_settings
+        d = Path(tempfile.mkdtemp())
+        (d / ".env").write_text("ARB_T_ONE=mine\n")
+        self.assertEqual(load_settings(d), {})
+        self.assertEqual(os.environ["ARB_T_ONE"], "mine")
+
+    def test_the_pushed_settings_load_and_pass_the_checks(self):
+        # A bad pushed setting would stop the bot after an update: make sure the file in the repo loads.
+        import os
+        from arbbot import read_env_file
+        pushed = read_env_file(Path(__file__).parent / "remote.env")
+        for k in pushed:
+            os.environ.pop(k, None)
+        os.environ.update(pushed)
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in pushed])
+        cfg = Config.from_env()
+        cfg.check()
+        cfg = cfg.with_mode()
+        for key, value in pushed.items():
+            self.assertTrue(key.isupper() and value != "", key)
+        if "ALERT_MODE" in pushed:
+            self.assertEqual(cfg.alert_mode, pushed["ALERT_MODE"])
+
 if __name__ == "__main__":
     unittest.main()

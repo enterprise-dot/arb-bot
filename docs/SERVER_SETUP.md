@@ -260,6 +260,7 @@ Open the console the same way (Droplet → Access → Launch Droplet Console), t
 | Where the credits go, and what each check really costs | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --plan` |
 | Get the latest code | Happens by itself every 10 minutes once automatic updates are on (step 6). By hand: `cd /opt/arb-bot && sudo -u arbbot git pull && systemctl restart arbbot` |
 | See what the updater did | `journalctl -u arbbot-update -n 30` |
+| Settings Claude pushed for you | They're in `/opt/arb-bot/remote.env` and win over `.env`. Use only your own: `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --set REMOTE_SETTINGS=off`, then `systemctl restart arbbot` |
 | Turn automatic updates off / on | `systemctl disable --now arbbot-update.timer` / `bash /opt/arb-bot/deploy/enable-auto-update.sh` |
 | See the arb log | `cat /opt/arb-bot/arbs.csv` |
 

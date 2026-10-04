@@ -223,10 +223,11 @@ def set_webhook(channel: str) -> None:
     print("Now restart the bot so it uses it:  systemctl restart arbbot")
 
 
-def load_dotenv(path: Path) -> None:
-    """Minimal .env loader: KEY=VALUE lines, no override of real env vars."""
+def read_env_file(path: Path) -> dict[str, str]:
+    """KEY=VALUE lines of a .env-style file ({} if it's missing)."""
+    out: dict[str, str] = {}
     if not path.exists():
-        return
+        return out
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -235,7 +236,37 @@ def load_dotenv(path: Path) -> None:
         key, value = key.strip(), value.strip().strip('"').strip("'")
         while value.startswith(key + "="):  # forgive "SPORTS=SPORTS=..." from pasting a whole line
             value = value[len(key) + 1:]
+        out[key] = value
+    return out
+
+
+def load_dotenv(path: Path) -> None:
+    """Minimal .env loader: KEY=VALUE lines, no override of real env vars."""
+    for key, value in read_env_file(path).items():
         os.environ.setdefault(key, value)
+
+
+# Settings Claude can push for you through the automatic updates (the bot can't be logged into
+# from outside). They win over .env; put REMOTE_SETTINGS=off in .env to ignore them.
+REMOTE_ENV = "remote.env"
+
+
+def load_settings(here: Path | None = None) -> dict[str, str]:
+    """Load remote.env (unless .env says REMOTE_SETTINGS=off), then .env. Real environment variables
+    still win over both. Returns the settings remote.env supplied."""
+    here = here or HERE
+    off = (os.environ.get("REMOTE_SETTINGS") or read_env_file(here / ".env").get("REMOTE_SETTINGS", ""))
+    used: dict[str, str] = {}
+    if off.strip().lower() not in ("off", "0", "false", "no"):
+        for key, value in read_env_file(here / REMOTE_ENV).items():
+            if key not in os.environ:
+                os.environ[key] = value
+                used[key] = value
+    load_dotenv(here / ".env")
+    return used
+
+
+REMOTE_USED: dict[str, str] = {}
 
 
 def _csv(s: str) -> list[str]:
@@ -8043,9 +8074,12 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     print(mode_line(cfg))
     if cfg.active_hours:
         print(f"Active hours: {cfg.active_hours} ({cfg.timezone})")
+    if REMOTE_USED:
+        print(f"Using settings pushed in {REMOTE_ENV}: " + ", ".join(f"{k}={v}" for k, v in REMOTE_USED.items()))
     if not args.once:
         status.send(f"🟢 Arb bot online: watching {', '.join(short(s) for s in cfg.sports)} "
-                    f"({cfg.markets}).")
+                    f"({cfg.markets})." + (f" Using {len(REMOTE_USED)} settings pushed for you ({REMOTE_ENV}); "
+                                          f"{mode_line(cfg)}" if REMOTE_USED else ""))
 
     tz = ZoneInfo(cfg.timezone)
     started_local = datetime.now(tz)
@@ -8203,7 +8237,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
 
 
 def main() -> None:
-    load_dotenv(HERE / ".env")
+    REMOTE_USED.update(load_settings())
     p = argparse.ArgumentParser(description="Find sports betting arbitrage and alert on Discord.")
     p.add_argument("--plan", action="store_true",
                    help="show the next 24h schedule and credit forecast (uses no credits)")
@@ -8253,6 +8287,9 @@ def main() -> None:
         for key, value in changes.items():
             set_env_value(HERE / ".env", key, value)
             print(f"Saved {key}={value}")
+            if key in REMOTE_USED:
+                print(f"Note: {REMOTE_ENV} (settings pushed for you) sets {key}={REMOTE_USED[key]}, and that wins "
+                      f"over .env. To use your own settings instead: --set REMOTE_SETTINGS=off")
         for ex in others:
             print(f"Note: another setting in .env needs fixing too: {ex}")
         print("Now restart the bot so it uses the new settings:  systemctl restart arbbot")

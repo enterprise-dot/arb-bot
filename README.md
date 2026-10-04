@@ -510,6 +510,7 @@ A wrong API key stops it instead of restart-looping, and you'll get a 🔴 messa
 | Watch live | `journalctl -u arbbot -f` |
 | Stop / start | `systemctl stop arbbot` / `systemctl start arbbot` |
 | Update to the latest code | Automatic every 10 minutes after `bash /opt/arb-bot/deploy/enable-auto-update.sh` (tested first, undone if it breaks, posted in Discord). By hand: `cd /opt/arb-bot && sudo -u arbbot git pull && systemctl restart arbbot` |
+| Settings pushed for you | `remote.env` in the code folder: settings Claude sends through the automatic updates (it can't log into your server). They win over `.env`; `--set REMOTE_SETTINGS=off` ignores them. The 🟢 online message says when any are in use. |
 | Download the arb log | `scp root@SERVER:/opt/arb-bot/arbs.csv .` |
 
 ## Before betting real money
