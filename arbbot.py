@@ -1732,6 +1732,25 @@ class SharpHistory:
         self.points = {k: v for k, v in self.points.items() if v and now - v[-1][0] <= self.window * 3}
 
 
+class PriceHistory:
+    """Each book's last price per line (and the other books' fair price then), across scans, to
+    tell a stale book (its price sits still while the market moves) from a fast one (it moves
+    away from a market that hasn't caught up yet: in a live game, after a goal)."""
+
+    def __init__(self, keep_minutes: int = 30):
+        self.keep = timedelta(minutes=keep_minutes)
+        self.seen: dict[tuple, tuple[datetime, float, float, bool]] = {}   # key -> (when, price, fair, leading)
+
+    def get(self, key: tuple):
+        return self.seen.get(key)
+
+    def put(self, key: tuple, now: datetime, price: float, fair: float, leading: bool) -> None:
+        self.seen[key] = (now, price, fair, leading)
+
+    def prune(self, now: datetime) -> None:
+        self.seen = {k: v for k, v in self.seen.items() if now - v[0] <= self.keep}
+
+
 def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
              history: SharpHistory | None = None) -> list[EVBet]:
     if not cfg.ev_enabled:
@@ -1967,7 +1986,8 @@ class EVAlerter(Alerter):
 
 # --------------------------------------------------------------------------- outliers
 
-def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) -> list[EVBet]:
+def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
+                  history: PriceHistory | None = None) -> list[EVBet]:
     """One book's price far above what every other book thinks (e.g. +400 where the rest
     are around -400). Usually a book that hasn't moved yet. Fair odds here are the median of
     all the OTHER books' no-vig prices, so it works even when Pinnacle is slow or missing."""
@@ -1994,6 +2014,8 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
                 if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue
                 stamp = mkt.get("last_update") or bm.get("last_update")
+                if len({_line_for(mkt["key"], oc, ev["home_team"]) for oc in mkt.get("outcomes", [])}) != 1:
+                    stamp = None   # one stamp for many lines (every player's prop): says nothing about this one
                 for oc in mkt.get("outcomes", []):
                     price = float(oc.get("price") or 0)
                     if price <= 1.0:
@@ -2014,8 +2036,6 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
             probs = {bk: dict(zip(o, devig(list(o.values()), cfg.devig_method))) for bk, o in full.items()}
             for name in names:
                 for bk, o in full.items():
-                    if bk in reference_only or not cfg.bettable(bk):
-                        continue
                     others = sorted(probs[ob][name] for ob in probs if ob != bk)
                     if len(others) < cfg.outlier_min_books:
                         continue
@@ -2023,14 +2043,17 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
                     fair_p = others[mid] if len(others) % 2 else (others[mid - 1] + others[mid]) / 2
                     price = o[name]
                     edge = (fair_p * price - 1) * 100
-                    if edge < cfg.outlier_min_pct:
-                        continue
-                    # A real outlier is a book that hasn't caught up. If this book moved its price
-                    # AFTER most of the others, it's probably the one that's right (in a live game it
-                    # reacted first) and the rest are behind: betting it is no edge at all.
-                    mine = stamps.get((k, bk))
-                    theirs = sorted(t for (kk, ob), t in stamps.items() if kk == k and ob != bk and ob in full)
-                    if mine and theirs and mine > theirs[len(theirs) // 2]:
+                    # A real outlier is a book that hasn't caught up. A book that just moved AWAY
+                    # from the others (in a live game: it reacted to a goal first) is probably the
+                    # right one, and the rest are behind: betting it is no edge at all.
+                    hkey = (ev["id"], k, bk, name)
+                    leading = _leading(history.get(hkey) if history else None, price, fair_p, edge, cfg,
+                                       stamps.get((k, bk)),
+                                       sorted(t for (kk, ob), t in stamps.items() if kk == k and ob != bk and ob in full),
+                                       is_live)
+                    if history:
+                        history.put(hkey, now, price, fair_p, leading)
+                    if bk in reference_only or not cfg.bettable(bk) or edge < cfg.outlier_min_pct or leading:
                         continue
                     # And when the sharp book prices this line, it has to agree the price is good.
                     sp = sharp.get(k, {}).get(name)
@@ -2078,6 +2101,28 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None) 
         else:
             best[k] = b
     return list(best.values())
+
+
+def _leading(prev, price: float, fair_p: float, edge: float, cfg: Config,
+             mine: datetime | None, theirs: list[datetime], is_live: bool) -> bool:
+    """Is this book out in front of the market (not a stale one worth betting)?
+
+    With a previous sighting: it moved its own price away from the others by a real amount while
+    they stayed put, or it was already out in front and the others still haven't caught up.
+    Without one (first look at this line): only if its quote is much newer than theirs."""
+    if prev is not None:
+        _, p_price, p_fair, p_leading = prev
+        if edge < cfg.outlier_min_pct:
+            return False   # back in line with the market
+        if p_leading:
+            return True    # still out in front, the others haven't caught up
+        moved = abs(1 / price - 1 / p_price)
+        p_edge = (p_fair * p_price - 1) * 100
+        return price != p_price and moved > abs(fair_p - p_fair) and edge - p_edge >= cfg.outlier_min_pct / 2
+    if mine and theirs:
+        gap = (mine - theirs[len(theirs) // 2]).total_seconds()
+        return gap >= (max(30, cfg.live_arb_max_skew) if is_live else 300)
+    return False
 
 
 def note_related(groups: list[tuple[list[EVBet], "Alerter", set[str]]], now: float | None = None) -> None:
@@ -2684,8 +2729,13 @@ BOX_STATS = {   # (sport family, prop market) -> columns added together
     ("americanfootball", "player_rush_attempts"): [_t(("CAR",), ("rushingAttempts",), ("rushing",))],
     ("americanfootball", "player_receptions"): [_t(("REC",), ("receptions",), ("receiving",))],
     ("americanfootball", "player_reception_yds"): [_t(("YDS",), ("receivingYards",), ("receiving",))],
-    ("americanfootball", "player_anytime_td"): [_t(("TD",), ("rushingTouchdowns",), ("rushing",), optional=True),
-                                                _t(("TD",), ("receivingTouchdowns",), ("receiving",), optional=True)],
+    ("americanfootball", "player_anytime_td"): [   # any TD a player scores counts, returns and defense too
+        _t(("TD",), ("rushingTouchdowns",), ("rushing",), optional=True),
+        _t(("TD",), ("receivingTouchdowns",), ("receiving",), optional=True),
+        _t(("TD",), ("kickReturnTouchdowns",), ("kickreturns",), optional=True),
+        _t(("TD",), ("puntReturnTouchdowns",), ("puntreturns",), optional=True),
+        _t(("TD",), ("interceptionTouchdowns",), ("interceptions",), optional=True),
+        _t(("TD",), ("defensiveTouchdowns",), ("defensive",), optional=True)],
     ("baseball", "batter_hits"): [_t(("H",), ("hits",), ("batting",))],
     ("baseball", "batter_home_runs"): [_t(("HR",), ("homeRuns",), ("batting",))],
     ("baseball", "batter_rbis"): [_t(("RBI",), ("RBIs", "rbis"), ("batting",))],
@@ -2828,7 +2878,12 @@ def parse_box(summary: dict) -> dict:
                             cols.setdefault(labels[i], raw)
                         if i < len(keys):
                             cols.setdefault(keys[i], raw)
-    return {"final": bool(status.get("completed")) or status.get("state") == "post", "teams": teams}
+    plays = summary.get("scoringPlays")
+    tds = None if plays is None else sum(
+        1 for sp in plays if "touchdown" in str((sp.get("scoringType") or {}).get("name", "")).lower()
+        or str((sp.get("scoringType") or {}).get("abbreviation", "")).upper() == "TD")
+    return {"final": bool(status.get("completed")) or status.get("state") == "post", "teams": teams,
+            "touchdowns": tds}
 
 
 def _read(player: dict, terms: list) -> float | None:
@@ -2904,7 +2959,9 @@ def game_box(sport_key: str, home: str, away: str, commence: str) -> tuple[dict 
 
 
 def find_player(box: dict, name: str) -> dict | None:
-    """Exact name, else a unique same-last-name-and-first-initial match ("Mitch"/"Mitchell")."""
+    """Exact name, else a short form of the same first name with the same rest ("Mitch Marner" =
+    "Mitchell Marner"). Never a different player: a scratched player isn't in the box score, and
+    grading his bet on someone else's stats would be wrong, so that stays a manual check."""
     every = [(k, p) for t in box["teams"].values() for k, p in t["players"].items()]
     exact = [p for k, p in every if k == _norm(name)]
     if len(exact) == 1:
@@ -2912,8 +2969,12 @@ def find_player(box: dict, name: str) -> dict | None:
     want = _words(name)
     if len(want) < 2 or exact:
         return None
-    close = [p for _, p in every if len(w := _words(p["name"])) >= 2
-             and w[-1] == want[-1] and w[0][0] == want[0][0]]
+
+    def same_person(w: list[str]) -> bool:
+        short, longer = sorted((w[0], want[0]), key=len)
+        return w[1:] == want[1:] and len(short) >= 3 and longer.startswith(short)
+
+    close = [p for _, p in every if len(w := _words(p["name"])) >= 2 and same_person(w)]
     return close[0] if len(close) == 1 else None
 
 
@@ -2943,9 +3004,17 @@ def grade_prop(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
         return None, f"{row['player']} isn't in the box score"
     if p["dnp"]:
         return ("push", 0.0), "DNP"   # didn't play: books void the bet
-    value = _read(p, BOX_STATS[(_family(row["sport_key"]), row["market"])])
+    terms = BOX_STATS[(_family(row["sport_key"]), row["market"])]
+    value = _read(p, terms)
     if value is None:
         return None, f"no {MARKET_NAMES.get(row['market'], row['market'])} for {p['name']} in the box score"
+    if row["market"] == "player_anytime_td" and value < 1:
+        # "No TD" is only certain if every touchdown in the game is credited to someone in the box
+        # (a fumble recovered in the end zone, say, has no column of its own).
+        credited = sum(_read(q, terms) or 0 for t in box["teams"].values() for q in t["players"].values()
+                       if not q["dnp"])
+        if box.get("touchdowns") is None or credited < box["touchdowns"]:
+            return None, "not every touchdown in this game is in the box score"
     return settle_prop(row, value), f"{value:g}"
 
 
@@ -3192,6 +3261,10 @@ class Results:
             data = json.loads(self.path.read_text())
         except (OSError, ValueError):
             return
+        if isinstance(data, dict) and not ({"posted", "recap_day", "recap_days", "board"} & data.keys()):
+            data = {"posted": data}   # the very first format: just the posted bets
+        if data.get("recap_day"):     # the previous format kept only the latest recapped day
+            data["recap_days"] = [*data.get("recap_days", []), data["recap_day"]]
         self.posted.update(data.get("posted", {}))
         self.recap_days = sorted(set(self.recap_days) | set(data.get("recap_days", [])))[-14:]
         if data.get("board", {}).get("id") and not self.board.get("id"):
@@ -3270,7 +3343,8 @@ class Results:
         try:
             if self.board.get("id"):
                 try:
-                    _webhook(self.url, payload, "PATCH", self.board["id"])
+                    if not _webhook(self.url, payload, "PATCH", self.board["id"]):
+                        return   # rate-limited every try: keep the old hash so the next pass retries
                 except urllib.error.HTTPError as e:
                     if e.code != 404:
                         raise
@@ -4094,6 +4168,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     prop_evs.on_log = prop_outs.on_log = tracker.add
     prop_cfg = cfg.for_props()
     sharp_history = SharpHistory(cfg.move_window_minutes)
+    price_history = PriceHistory()
     parlay_alerter = ParlayAlerter(cfg, dry_run=args.dry_run)
     ev_alerter.max_per_hour = cfg.max_ev_per_hour
     prop_evs.max_per_hour = cfg.max_prop_per_hour
@@ -4244,13 +4319,14 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             events = main_events
             arbs = find_arbs(events, cfg)
             sent = alerter.handle(arbs, checked_sports=checked_sports)
-            outs = find_outliers(events, cfg)
+            outs = find_outliers(events, cfg, history=price_history)
             evs = without_outliers(find_evs(events, cfg, history=sharp_history), outs)  # outliers cover those
             hand_over(evs, outs, ev_alerter, out_alerter)
             scope = set(checked_sports)
             note_related([(outs, out_alerter, scope), (evs, ev_alerter, scope),
                           ([], prop_outs, set()), ([], prop_evs, set())])
             sharp_history.prune(now)
+            price_history.prune(now)
             out_sent = out_alerter.handle(outs, checked_sports=checked_sports)
             ev_sent = ev_alerter.handle(evs, checked_sports=checked_sports)
             tracker.observe(events, now)
@@ -4287,7 +4363,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             t0 = time.time()
             prop_events = [ev for ev in fetched_props if _parse_time(ev["commence_time"]) > now]
             checked = fetched_gids
-            p_outs = find_outliers(prop_events, cfg)
+            p_outs = find_outliers(prop_events, cfg, history=price_history)
             p_evs = without_outliers(find_evs(prop_events, prop_cfg, history=sharp_history), p_outs)
             hand_over(p_evs, p_outs, prop_evs, prop_outs)
             note_related([(p_outs, prop_outs, checked), (p_evs, prop_evs, checked),

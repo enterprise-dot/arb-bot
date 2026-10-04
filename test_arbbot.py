@@ -2470,16 +2470,58 @@ class MyBooksAreTheLimit(unittest.TestCase):
 
 
 class OutlierGuards(unittest.TestCase):
-    def test_the_book_that_moved_last_is_not_an_outlier(self):
-        ev = outlier_event(1.85, 1.95)
-        self.assertEqual(len(find_outliers([ev], Config(), NOW)), 1)            # all quotes the same age
-        older = (NOW - timedelta(seconds=40)).isoformat().replace("+00:00", "Z")
+    def stamp(self, ev, title, age):
+        ts = (NOW - timedelta(seconds=age)).isoformat().replace("+00:00", "Z")
         for bm in ev["bookmakers"]:
-            if bm["title"] != "Stale":                                          # everyone else is 40s behind:
-                bm["last_update"] = older                                       # Stale just reacted to the play
+            if bm["title"] == title:
+                bm["last_update"] = ts
                 for m in bm["markets"]:
-                    m["last_update"] = older
-        self.assertEqual(find_outliers([ev], Config(), NOW), [])
+                    m["last_update"] = ts
+
+    def test_a_book_that_jumps_away_from_the_market_is_not_an_outlier(self):
+        from arbbot import PriceHistory
+        h = PriceHistory()
+        self.assertEqual(find_outliers([outlier_event(1.25, 4.00)], Config(), NOW, h), [])   # all in line
+        jumped = outlier_event(1.85, 1.95)               # Stale moved away (it saw the goal first)
+        self.assertEqual(find_outliers([jumped], Config(), NOW + timedelta(seconds=60), h), [])
+        self.assertEqual(find_outliers([jumped], Config(), NOW + timedelta(seconds=120), h), [])   # still ahead
+        # A book that stays put while the market moves IS stale: that's a real outlier.
+        h2 = PriceHistory()
+        before = outlier_event(1.85, 1.95)
+        for bm in before["bookmakers"]:
+            if bm["title"] != "Stale":
+                bm["markets"][0]["outcomes"] = [{"name": "Home", "price": 1.80}, {"name": "Away", "price": 2.05}]
+        find_outliers([before], Config(), NOW, h2)
+        now_out = find_outliers([outlier_event(1.85, 1.95)], Config(), NOW + timedelta(seconds=60), h2)
+        self.assertEqual([o.book for o in now_out], ["Stale"])
+        # ...and it stays an outlier when it re-quotes the same price (a newer stamp alone means nothing).
+        again = outlier_event(1.85, 1.95)
+        self.stamp(again, "Stale", 0)
+        for t in ("Pinnacle", "DK", "FD", "MGM"):
+            self.stamp(again, t, 30)
+        self.assertEqual([o.book for o in find_outliers([again], Config(), NOW, h2)], ["Stale"])
+
+    def test_first_look_uses_a_big_stamp_gap_only(self):
+        ev = outlier_event(1.85, 1.95)
+        for t in ("Pinnacle", "DK", "FD", "MGM"):
+            self.stamp(ev, t, 40)
+        self.assertEqual(len(find_outliers([ev], Config(), NOW)), 1)              # 40s: could be anything
+        for t in ("Pinnacle", "DK", "FD", "MGM"):
+            self.stamp(ev, t, 100)
+        self.assertEqual(find_outliers([ev], Config(alert_mode="balanced", max_age_seconds=300), NOW), [])
+
+    def test_prop_markets_share_one_stamp_so_it_isnt_used(self):
+        books = {"Pinnacle": (1.91, 1.91), "DK": (1.90, 1.92), "FD": (1.91, 1.91), "MGM": (1.92, 1.90),
+                 "Stale": (2.60, 1.45)}
+        ev = prop_event(books, start="2026-10-03T18:00:00Z")
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        for bm in ev["bookmakers"]:   # every book's market also holds another player's line
+            bm["markets"][0]["outcomes"] += [{"name": "Over", "description": "Anthony Davis", "price": 1.91, "point": 24.5},
+                                             {"name": "Under", "description": "Anthony Davis", "price": 1.91, "point": 24.5}]
+        self.stamp(ev, "Stale", 0)                       # Stale just moved... someone else's line
+        for t in ("Pinnacle", "DK", "FD", "MGM"):
+            self.stamp(ev, t, 600)
+        self.assertEqual([o.book for o in find_outliers([ev], Config(), NOW)], ["Stale"])
 
     def test_the_sharp_book_has_to_agree(self):
         books = {"Pinnacle": [("h2h", [("Home", 1.80, None), ("Away", 2.10, None)])],   # sharp: Home ~54%
@@ -2610,6 +2652,78 @@ class RecapRetries(unittest.TestCase):
         legs = [l.book for l in find_arbs([a], Config(min_profit_pct=0), NOW)[0].legs]
         a["bookmakers"] = a["bookmakers"][::-1]
         self.assertEqual([l.book for l in find_arbs([a], Config(min_profit_pct=0), NOW)[0].legs], legs)
+
+
+
+class PropGradingSafety(unittest.TestCase):
+    """Wrong grades are worse than no grade."""
+
+    def box(self, names):
+        return {"teams": {"1": {"name": "A", "score": 0, "players": {
+            _arbbot._norm(n): {"name": n, "dnp": False, "groups": {}} for n in names}}}}
+
+    def test_never_grades_someone_elses_stats(self):
+        from arbbot import find_player
+        box = self.box(["Amon-Ra St. Brown", "William Contreras", "Jaylin Williams", "Mitchell Marner", "Cameron Thomas"])
+        for scratched in ("A.J. Brown", "Willson Contreras", "Jalen Williams"):
+            self.assertIsNone(find_player(box, scratched), scratched)
+        self.assertEqual(find_player(box, "Mitch Marner")["name"], "Mitchell Marner")
+        self.assertEqual(find_player(box, "Cam Thomas")["name"], "Cameron Thomas")
+        self.assertEqual(find_player(self.box(["AJ Brown"]), "A.J. Brown")["name"], "AJ Brown")
+
+    def test_anytime_td_counts_returns_and_only_trusts_a_complete_zero(self):
+        from arbbot import grade_prop
+        from unittest import mock
+        groups = {"rushing": {}, "receiving": {"TD": "0", "REC": "3"}, "puntreturns": {"TD": "1"}}
+        turpin = {"name": "KaVontae Turpin", "dnp": False, "groups": groups}
+        quiet = {"name": "Jake Ferguson", "dnp": False, "groups": {"receiving": {"TD": "0", "REC": "4"}}}
+        box = {"final": True, "touchdowns": 1, "teams": {"1": {"name": "Dallas Cowboys", "score": 7, "players": {
+            "kavontaeturpin": turpin, "jakeferguson": quiet}}}}
+        row = {"sport_key": "americanfootball_nfl", "home_team": "Dallas Cowboys", "away_team": "X", "commence_time": "",
+               "market": "player_anytime_td", "outcome": "Yes", "point": "", "stake": "20", "price": "4.5"}
+        with mock.patch("arbbot.game_box", return_value=(box, "")):
+            self.assertEqual(grade_prop(dict(row, player="KaVontae Turpin"))[0], ("win", 70.0))   # punt-return TD
+            self.assertEqual(grade_prop(dict(row, player="Jake Ferguson"))[0], ("loss", -20.0))   # all TDs credited
+            box["touchdowns"] = 2                                       # a TD nobody in the box is credited with
+            self.assertIsNone(grade_prop(dict(row, player="Jake Ferguson"))[0])
+
+
+class StateUpgrades(unittest.TestCase):
+    START, LATER = BetResults.START, BetResults.LATER
+    setUp, tearDown, scores = BetResults.setUp, BetResults.tearDown, BetResults.scores
+    log_ev = BetResults.log_ev
+
+    def test_older_state_files_keep_their_recap_and_posted_marks(self):
+        import json
+        from arbbot import Results
+        from datetime import date
+        path = Path(self.cfg.state_dir) / "results_posted.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"posted": {"x": "2026-10-03T18:00:00Z"}, "recap_day": "2026-10-02"}))
+        res = Results(self.cfg, dry_run=False)
+        self.assertFalse(res.recap_due(date(2026, 10, 2)))             # already recapped before the upgrade
+        res._save(self.LATER)
+        self.assertIn("2026-10-02", json.loads(path.read_text())["recap_days"])
+        path.write_text(json.dumps({"g1|h2h|Home|": "2026-10-03T18:00:00Z"}))   # the first format
+        self.assertIn("g1|h2h|Home|", Results(self.cfg, dry_run=False).posted)
+
+    def test_rate_limited_scoreboard_edit_is_retried(self):
+        from arbbot import Results
+        from unittest import mock
+        self.log_ev("g1")
+        replies = [{"id": "b1"}, None, {"id": "b1"}]                   # post, then a rate-limited edit
+        calls = []
+        def fake(url, payload, method="POST", message_id=None):
+            calls.append(method)
+            return replies.pop(0)
+        mock.patch("arbbot._webhook", side_effect=fake).start()
+        self.addCleanup(mock.patch.stopall)
+        res = Results(self.cfg, dry_run=False)
+        res.update_board(self.LATER)
+        settle_pending(self.cfg, self.scores({"g1": (4, 2)}), self.LATER)
+        res.update_board(self.LATER)                                   # 429 x3: not counted as done
+        res.update_board(self.LATER)                                   # so it's tried again
+        self.assertEqual(calls, ["POST", "PATCH", "PATCH"])
 
 
 if __name__ == "__main__":
