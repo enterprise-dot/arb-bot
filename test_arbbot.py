@@ -903,7 +903,7 @@ class Props(unittest.TestCase):
                          "E": (2.20, 1.68)})
         [b] = find_evs([ev], Config().for_props(), NOW)
         self.assertEqual((b.book, b.outcome), ("E", "Over"))
-        self.assertTrue(b.sharp_book.startswith("consensus of 5 books"))
+        self.assertEqual(b.sharp_book, "consensus of A, B, C, D")   # E is left out of its own median
         self.assertEqual(find_evs([ev], Config(), NOW), [])   # main-line settings: no consensus
         few = prop_event({"A": (1.91, 1.91), "E": (2.20, 1.68)})
         self.assertEqual(find_evs([few], Config().for_props(), NOW), [])   # needs 4+ books
@@ -4418,6 +4418,18 @@ class FewerLiveAlerts(MixFiles):
         self.assertEqual(len(cap.times), 1)
         self.assertEqual(outs.handle([live_out], now=1000 + 3601), 1)           # a new hour
 
+    def test_live_alerts_the_live_cap_holds_dont_use_up_the_arb_cap(self):
+        a = Alerter(self.cfg(MIX), dry_run=True)
+        a.max_per_hour, a.live_cap = 1, _arbbot.HourlyCap(1)
+        a.live_cap.times.append(1000.0)                                          # the hour's live alert went out
+        [live] = find_arbs([mix_event(2.25, 1.98, ev_id="live", start=STARTED)], MIX, NOW)
+        [pre] = find_arbs([mix_event(2.25, 1.98, ev_id="pre")], MIX, NOW)
+        for now in (1060, 1120):
+            self.assertEqual(a.handle([live], now=now), 0)
+        self.assertEqual((a.held_counts, a.posted_at), ({"live cap": 2}, []))    # no arb slot taken
+        self.assertEqual(a.handle([live, pre], now=1180), 1)                     # so a pre-game arb still goes out
+        self.assertEqual(list(a.open), [pre.key])
+
     def test_caps_send_games_that_havent_started_first(self):
         cfg = self.cfg(MIX)
         a = Alerter(cfg, dry_run=True)
@@ -4921,6 +4933,50 @@ class LiveAlertsAlreadyUp(MixFiles):
         self.arb_check(pre, 0, 2.25, {"A": 10, "B": 10}, start="2026-10-03T18:00:00Z")
         self.assertEqual(self.arb_check(pre, 60, 2.60, {"A": 600}, start="2026-10-03T18:00:00Z").sent, 1)
         self.assertEqual(len(self.posts(sent, "arbs")), 2)
+
+    def test_a_better_price_counts_only_checks_in_a_row(self):
+        fresh, old = {"A": 5, "B": 5}, {"A": 100, "B": 50}
+        for why, steps, sends in (
+                ("not better in between", [(2.60, fresh), (2.25, fresh), (2.60, fresh)], [0, 0, 0]),
+                ("an old price in between", [(2.60, fresh), (2.60, old), (2.60, fresh)], [0, 0, 0]),
+                ("after a re-ping it counts from zero", [(2.40, fresh), (2.40, fresh), (2.55, fresh)], [0, 1, 0])):
+            t, sent = self.trackers(outliers_enabled=False)
+            for secs in (0, 60):
+                self.arb_check(t, secs, 2.25, {"A": 10, "B": 10})                 # alerted at 5.32%
+            got = [self.arb_check(t, 120 + 60 * i, home, ages).sent for i, (home, ages) in enumerate(steps)]
+            self.assertEqual(got, sends, why)                                     # each last one: seen once in a row
+
+    def test_a_live_alert_whose_post_failed_is_sent_again_only_with_a_fresh_price(self):
+        def make(state):
+            cfg = self.cfg(MIX, live_max_age_alert=60, webhook_url="https://x", discord_mention="@arb")
+            a, sent = Alerter(replace(cfg, state_dir=str(self.d / state)), dry_run=False), []
+
+            def fake(payload, message_id=None, url=""):                           # Discord refuses the first post
+                sent.append((message_id or "POST", payload["embeds"][0]["description"], payload.get("content", "")))
+                a.send_retryable = len(sent) == 1
+                return message_id or (None if len(sent) == 1 else "m1")
+            a._discord = fake
+            return a, sent
+
+        def check(a, now, age, start=STARTED):
+            ev = age_book(age_book(mix_event(2.25, 1.98, start=start), "A", age), "B", age)
+            return a.handle(find_arbs([ev], MIX, NOW), ["basketball_nba"], now=now)
+        a, sent = make("live")
+        check(a, 1000, 15)
+        [op] = a.open.values()
+        self.assertTrue(op.retry)
+        check(a, 1060, 75)                                                        # a check later: 75s old
+        self.assertEqual((len(sent), op.retry), (1, True))                        # too old for a live alert: it waits
+        check(a, 1120, 20)                                                        # fresh again: sent, with the ping
+        self.assertEqual([(m, c) for m, _, c in sent], [("POST", "@arb"), ("POST", "@arb")])
+        self.assertIn("⏱ prices were up to 20s old when sent", sent[-1][1])        # its age now, not at the failed post
+        self.assertEqual((op.retry, op.arb.age), (False, 20))
+        # Before the game the age rule doesn't apply: sent again at once, showing the price's age then.
+        a, sent = make("pre")
+        check(a, 1000, 15, start="2026-10-03T18:00:00Z")
+        check(a, 1060, 600, start="2026-10-03T18:00:00Z")
+        self.assertEqual([m for m, *_ in sent], ["POST", "POST"])
+        self.assertIn("⏱ prices were up to 10 min old when sent", sent[-1][1])
 
     def test_a_full_live_cap_holds_the_better_price_ping(self):
         t, sent = self.trackers(outliers_enabled=False, live_per_hour=1)
@@ -5445,6 +5501,17 @@ class ScanWiring(MixFiles):
         prop_id = next(k for k in t.closing.tracked if k.startswith("p1"))
         self.assertIn(prop_id, t.closing.latest)
 
+    def test_main_line_closing_lines_are_saved_without_a_prop_check(self):
+        t = self.trackers(kalshi_check=False, outliers_enabled=False)
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        ev["sport_key"] = "basketball_nba"
+        self.main(t, [ev], 0)
+        self.main(t, [ev], 60)                                                     # logged and followed
+        self.main(t, [ev], 6 * 3600 + 60)                                          # started; no prop check ran
+        self.assertEqual([(r["bet_id"], float(r["closing_fair_prob"])) for r in _read(self.files["closing_file"])],
+                         [("e1|h2h|Home|", 0.5)])
+        self.assertEqual(t.closing.tracked, {})
+
     def test_prop_check_uses_prop_settings_and_only_closes_its_own_games(self):
         t = self.trackers(kalshi_check=False)
 
@@ -5460,6 +5527,587 @@ class ScanWiring(MixFiles):
     def test_every_cap_comes_from_the_settings(self):
         t = _arbbot.Trackers(self.cfg(max_ev_per_hour=5, max_prop_per_hour=4, max_parlay_per_hour=3), self.args())
         self.assertEqual((t.evs.max_per_hour, t.prop_evs.max_per_hour, t.parlays.max_per_hour), (5, 4, 3))
+
+
+# --------------------------------------------------------------------------- locks for props Pinnacle doesn't price
+
+BROTHERS_BOOKS = "fanduel,draftkings,betmgm,williamhill_us,kalshi"   # MY_BOOKS in New York
+PROP_KEYS = {"FanDuel": "fanduel", "DraftKings": "draftkings", "BetMGM": "betmgm", "Caesars": "williamhill_us",
+             "ESPN BET": "espnbet", "BetRivers": "betrivers", "Fanatics": "fanatics", "Kalshi": "kalshi",
+             "Novig": "novig", "BetOnline.ag": "betonlineag", "LowVig.ag": "lowvig", "Pinnacle": "pinnacle"}
+# FanDuel's Over is off (+120); the other five sportsbooks agree it's a coin flip.
+LOCK_SIX = {"FanDuel": (2.20, 1.68), "DraftKings": (1.91, 1.91), "BetMGM": (1.93, 1.89), "Caesars": (1.90, 1.92),
+            "ESPN BET": (1.92, 1.90), "BetRivers": (1.89, 1.93)}
+LEBRON = ("player_points", ("LeBron James", 25.5))
+CONSENSUS_SIX = "consensus of DraftKings, BetMGM, Caesars, ESPN BET, BetRivers"
+AGES = dict(pregame_max_age_seconds=10**6, far_max_age_seconds=10**6)   # the same quotes, looked at for hours
+
+
+def keyed_prop(books, **kw):
+    """prop_event with the real Odds API book keys (sister books, exchanges and MY_BOOKS go by key)."""
+    ev = prop_event(books, **kw)
+    for bm in ev["bookmakers"]:
+        bm["key"] = PROP_KEYS.get(bm["title"], bm["key"])
+    return ev
+
+
+def pinnacle_lines(ev, lines, player="LeBron James", market="player_points"):
+    """Pinnacle prices `player`'s `market` at each (point, over, under) in lines."""
+    outs = [o for q, ov, un in lines for o in ({"name": "Over", "description": player, "price": ov, "point": q},
+                                               {"name": "Under", "description": player, "price": un, "point": q})]
+    ev["bookmakers"].append({"key": "pinnacle", "title": "Pinnacle", "last_update": FRESH,
+                             "markets": [{"key": market, "last_update": FRESH, "outcomes": outs}]})
+    return ev
+
+
+def pinnacle_at(ev, point, over, under):
+    """Pinnacle prices the same player and stat, at another point."""
+    return pinnacle_lines(ev, [(point, over, under)])
+
+
+class PropsInLocks(MixFiles):
+    """A prop Pinnacle doesn't price is judged against the other books' median, and can be a lock."""
+
+    def locks(self, **kw):
+        return self.cfg(Config(my_books=BROTHERS_BOOKS, round_stakes=0), **kw).with_mode().for_props()
+
+    def looks(self, books_by_look, cfg=None, h=None, keep=frozenset(), start=0, every=31, events=None, kickoff=None):
+        """find_evs on each look, `every` minutes apart (one price history); the last look's bets."""
+        cfg, h = cfg or self.locks(**AGES), h if h is not None else _arbbot.PriceHistory()
+        game = {"start": kickoff} if kickoff else {}
+        out = []
+        for i, books in enumerate(books_by_look):
+            out = find_evs(events or [keyed_prop(books, **game)], cfg, at(60 * (start + every * i)), prices=h, keep=keep)
+        return out
+
+    def wired(self, sent, **kw):
+        """Locks Trackers whose prop alerters post to a fake Discord (with @here pings), into sent."""
+        cfg = self.cfg(Config(my_books=BROTHERS_BOOKS, round_stakes=0, webhook_url="https://x", ev_mention="@here",
+                              outlier_mention="@here", **AGES), **kw).with_mode()
+        t = _arbbot.Trackers(cfg, self.args(dry_run=False))
+        for a in (t.prop_evs, t.prop_outs):
+            def fake(payload, message_id=None, url=""):
+                sent.append(("PATCH" if message_id else "POST", payload["embeds"][0]["title"],
+                             payload.get("content", "")))
+                return message_id or f"m{len(sent)}"
+            a._discord = fake
+        return t
+
+    def alerter(self, sent, cfg=None):
+        a = EVAlerter(replace(cfg or self.locks(), webhook_url="https://x"), dry_run=False, noun="+EV props")
+
+        def fake(payload, message_id=None, url=""):
+            sent.append(("PATCH" if message_id else "POST", payload["embeds"][0]["title"], payload.get("content", "")))
+            return message_id or f"m{len(sent)}"
+        a._discord = fake
+        return a
+
+    # ---- what a lock looks like, and that every point is needed
+    def test_six_sportsbooks_with_fanduel_off_is_a_lock(self):
+        [b] = find_evs([keyed_prop(LOCK_SIX)], self.locks(), NOW)
+        self.assertEqual((b.book, b.outcome, b.confidence), ("FanDuel", "Over", "high"))
+        self.assertAlmostEqual(b.fair_prob, 0.5, places=6)            # the other five's median, FanDuel left out
+        self.assertAlmostEqual(b.ev_pct, 10.0, places=4)
+        self.assertEqual(b.sharp_book, CONSENSUS_SIX)                  # names the books it's from
+        self.assertEqual(b.confidence_notes, ["other books agree (within 1.1% win chance)",
+                                              "6 sportsbooks price it (2 you can't bet at)",
+                                              "no Pinnacle price: stake 30% smaller"])
+        card = ev_payload(b)["embeds"][0]
+        self.assertIn("Confidence: **🟢 High** · other books agree (within 1.1% win chance), 6 sportsbooks price it "
+                      "(2 you can't bet at), no Pinnacle price: stake 30% smaller", card["description"])
+        self.assertIn(f"({CONSENSUS_SIX})", card["footer"]["text"])
+        self.assertEqual(b.stake, kelly_stake(0.5, 2.20, self.locks(), 0.7))   # 30% smaller, high = full
+        self.assertIn("When Pinnacle doesn't price a prop, its true odds come from the other books: the card names "
+                      "them, and the stake is 30% smaller.", _arbbot.GUIDE)
+        # ...and only a lock when every point is there.
+        five = {k: v for k, v in LOCK_SIX.items() if k != "BetRivers"}             # 5 sportsbooks
+        apart = dict(LOCK_SIX, BetMGM=(1.944, 1.869), **{"ESPN BET": (1.944, 1.869)}, Caesars=(1.869, 1.944),
+                     BetRivers=(1.869, 1.944))                                    # 2.1% win chance apart
+        big = dict(LOCK_SIX, FanDuel=(2.30, 1.62))                                 # 15%: over 12%, an outlier's job
+        small = dict(LOCK_SIX, FanDuel=(2.12, 1.73))                               # 6%: under the 8% prop bar
+        for books in (five, apart, big, small):
+            self.assertEqual(find_evs([keyed_prop(books)], self.locks(), NOW), [], books)
+        early = keyed_prop(LOCK_SIX, start="2026-10-04T06:00:00Z")                 # 18 hours out: props need 12
+        self.assertEqual(find_evs([early], self.locks(far_max_age_seconds=10**6, confident_hours=24), NOW), [])
+
+    def test_consensus_confidence_points(self):
+        from arbbot import Agreement, rate_confidence
+        self.assertEqual(rate_confidence(None, None, 3, 10, True, consensus=Agreement(1.5, 1.5, 6))[0], "high")
+        missed = []
+        lvl, notes = rate_confidence(None, None, 3, 10, True, consensus=Agreement(3.0, 3.0, 6), missed=missed)
+        self.assertEqual((lvl, notes[0], missed), ("medium", "other books roughly agree (within 3.0% win chance)",
+                                                  ["books disagree"]))
+        missed = []
+        lvl, notes = rate_confidence(None, None, 3, 10, True, consensus=Agreement(1.5, 1.5, 5), missed=missed)
+        self.assertEqual((lvl, notes[1], missed), ("medium", "only 5 sportsbooks price it", ["under 6 sportsbooks"]))
+        missed = []
+        self.assertEqual(rate_confidence(None, None, 13, 13, True, consensus=Agreement(1.5, 1.5, 6), missed=missed)[0],
+                         "medium")
+        self.assertEqual(missed, ["over 12 hours out", "edge over 12%"])
+        lvl, notes = rate_confidence(None, None, 3, 10, True, consensus=Agreement(5.0, 6.2, 4, 1))
+        self.assertEqual((lvl, notes), ("low", ["other books disagree (6% win chance apart)",
+                                                "only 4 sportsbooks price it (1 you can't bet at)"]))
+        lvl, notes = rate_confidence(None, None, 3, 10, True, consensus=Agreement(1.4, 2.5, 6))
+        self.assertEqual((lvl, notes[0]), ("high", "other books agree (all but one within 1.4% win chance)"))
+        self.assertEqual(rate_confidence(None, None, 3, 10, True)[0], "medium")   # no sharp, no consensus: as before
+
+    def test_one_odd_book_cant_swing_the_agreement(self):
+        odd = dict(LOCK_SIX, **{"ESPN BET": (1.80, 2.04)})                         # one book 3+ points out
+        c = consensus_fair(keyed_prop(odd), Config().for_props(), NOW, False, {"pinnacle"}, leave_out="fanduel")[LEBRON]
+        self.assertGreater(c.full_spread["Over"], 3.5)
+        self.assertLess(c.spread["Over"], 1.2)                                     # the other four are close
+        [b] = find_evs([keyed_prop(odd)], self.locks(), NOW)
+        self.assertEqual(b.confidence, "high")
+        self.assertIn("other books agree (all but one within 1.1% win chance)", b.confidence_notes)
+        few = consensus_fair(keyed_prop({k: odd[k] for k in ("DraftKings", "BetMGM", "ESPN BET")}),
+                             replace(Config().for_props(), consensus_min_books=3), NOW, False, set())[LEBRON]
+        self.assertEqual(few.spread, few.full_spread)                              # 3 votes: nothing left out
+
+    def test_only_sportsbooks_count_toward_the_six(self):
+        swap = {**{k: v for k, v in LOCK_SIX.items() if k != "BetRivers"}, "Kalshi": (1.89, 1.93)}
+        self.assertEqual(find_evs([keyed_prop(swap)], self.locks(), NOW), [])   # 5 sportsbooks + an exchange
+        [b] = find_evs([keyed_prop(dict(swap, Fanatics=(1.90, 1.92)))], self.locks(), NOW)
+        self.assertEqual(b.confidence, "high")                                     # a 6th sportsbook
+        self.assertIn("6 sportsbooks price it (2 you can't bet at)", b.confidence_notes)   # ESPN BET, Fanatics
+        self.assertEqual(b.sources_used, 6)                                        # the exchange is in the median
+
+    def test_a_prop_alerted_at_an_exchange_doesnt_count_it_toward_the_six(self):
+        others = {k: v for k, v in LOCK_SIX.items() if k != "FanDuel"}            # 5 sportsbooks
+        [b] = find_evs([keyed_prop({"Kalshi": (2.20, 1.68), **others})], replace(self.locks(), min_confidence="low"), NOW)
+        self.assertEqual((b.book, b.confidence), ("Kalshi", "medium"))
+        self.assertIn("only 5 sportsbooks price it (2 you can't bet at)", b.confidence_notes)
+
+    def test_you_cant_bet_at_counts_new_yorks_college_rule(self):
+        books = {("Kalshi" if t == "FanDuel" else t): v for t, v in LOCK_SIX.items()}
+        ev = keyed_prop(books)
+        ev.update(sport_key="americanfootball_ncaaf", sport_title="NCAAF", home_team="Syracuse Orange",
+                  away_team="Clemson Tigers")                                     # NY books can't take it
+        [b] = find_evs([ev], replace(self.locks(), ny_rules=True, min_confidence="low"), NOW)
+        self.assertEqual(b.book, "Kalshi")
+        self.assertIn("only 5 sportsbooks price it (5 you can't bet at)", b.confidence_notes)
+
+    # ---- a fair fair price
+    def test_the_judged_book_is_left_out_of_its_own_median(self):
+        cfg, ev = Config().for_props(), keyed_prop(LOCK_SIX)
+        c = consensus_fair(ev, cfg, NOW, False, {"pinnacle"}, leave_out="fanduel")[LEBRON]
+        self.assertEqual(c.votes, 5)
+        self.assertAlmostEqual(c.probs["Over"], 0.5, places=6)
+        self.assertAlmostEqual(c.full_spread["Over"], 1.12, places=2)
+        everyone = consensus_fair(ev, cfg, NOW, False, {"pinnacle"})[LEBRON]
+        self.assertEqual(everyone.votes, 6)
+        self.assertLess(everyone.probs["Over"], 0.499)                             # FanDuel would drag it down
+
+    def test_sister_books_are_one_vote(self):
+        cfg = Config().for_props()
+        books = {"DraftKings": (1.95, 1.87), "BetMGM": (1.93, 1.89), "Caesars": (1.91, 1.91),
+                 "BetOnline.ag": (1.80, 2.04), "LowVig.ag": (1.80, 2.04)}
+        c = consensus_fair(keyed_prop(books), cfg, NOW, False, {"pinnacle"})[LEBRON]
+        self.assertEqual((c.votes, c.books[-1]), (4, ("betonlineag", "lowvig")))
+        xs = sorted(devig(list(p), "power")[0] for p in ((1.95, 1.87), (1.93, 1.89), (1.91, 1.91), (1.80, 2.04)))
+        self.assertAlmostEqual(c.probs["Over"], (xs[1] + xs[2]) / 2, places=6)
+        # Leaving one out leaves its sister out too: 3 votes is under PROP_MIN_BOOKS (4).
+        self.assertEqual(consensus_fair(keyed_prop(books), cfg, NOW, False, {"pinnacle"}, leave_out="lowvig"), {})
+        few = keyed_prop({"FanDuel": (2.20, 1.68), "DraftKings": (1.91, 1.91), "BetMGM": (1.93, 1.89),
+                          "BetOnline.ag": (1.90, 1.92), "LowVig.ag": (1.90, 1.92)})
+        self.assertEqual(find_evs([few], Config(min_confidence="low").for_props(), NOW), [])   # 3 other votes
+        # The main-line check of Pinnacle against the market still counts them as two books.
+        main = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                        {"B": [("Home", 2.20, None)], "BetOnline.ag": [("Home", 1.90, None), ("Away", 1.92, None)],
+                         "LowVig.ag": [("Home", 1.90, None), ("Away", 1.92, None)],
+                         "C": [("Home", 1.92, None), ("Away", 1.90, None)]})
+        for bm in main["bookmakers"]:
+            bm["key"] = PROP_KEYS.get(bm["title"], bm["key"])
+        [b] = find_evs([main], Config(min_ev_pct=3, round_stakes=0), NOW)
+        self.assertIn("other books agree", b.confidence_notes)
+
+    def test_sister_books_average_their_prices(self):
+        books = {"DraftKings": (2.05, 1.80), "BetMGM": (1.95, 1.87), "Caesars": (1.80, 2.04),
+                 "BetOnline.ag": (1.80, 2.04), "LowVig.ag": (2.10, 1.75)}
+        c = consensus_fair(keyed_prop(books), Config().for_props(), NOW, False, {"pinnacle"})[LEBRON]
+        sisters = (devig([1.80, 2.04], "power")[0] + devig([2.10, 1.75], "power")[0]) / 2
+        xs = sorted([devig(list(books[t]), "power")[0] for t in ("DraftKings", "BetMGM", "Caesars")] + [sisters])
+        self.assertAlmostEqual(c.probs["Over"], (xs[1] + xs[2]) / 2, places=6)
+
+    # ---- the fast-book guard
+    def test_a_book_that_moves_first_is_held_back(self):
+        h = _arbbot.PriceHistory()
+        cfg = self.locks(**AGES)
+        self.assertEqual(find_evs([keyed_prop(dict(LOCK_SIX, FanDuel=(1.91, 1.91)))], cfg, at(-1800), prices=h), [])
+        # FanDuel jumps away from five books that haven't moved: it probably saw the news first.
+        self.assertEqual(find_evs([keyed_prop(LOCK_SIX)], cfg, NOW, prices=h), [])
+        self.assertEqual(h.held, {"moved first": 1})
+        # 31 minutes on and nobody followed: it's FanDuel that's off after all.
+        self.assertEqual([b.book for b in find_evs([keyed_prop(LOCK_SIX)], cfg, at(1860), prices=h)], ["FanDuel"])
+
+    def test_a_jump_after_a_first_look_already_off_the_market_is_held_too(self):
+        # First seen at +5% (over half the 8% bar, so not "in line"), then +10% while the others sit still.
+        self.assertEqual(self.looks([dict(LOCK_SIX, FanDuel=(2.10, 1.75)), LOCK_SIX]), [])
+        # The same +5% price unchanged on the next look still alerts.
+        five_pct = self.locks(alert_mode="balanced", prop_min_ev_pct=4, **AGES)
+        self.assertEqual([b.book for b in self.looks([dict(LOCK_SIX, FanDuel=(2.10, 1.75))] * 2, five_pct)],
+                         ["FanDuel"])
+
+    def test_a_book_that_moves_again_is_held_again(self):
+        # 1.91 (in line), 2.10 (+5%: a move, under the bar), then 2.20 (+10%) while the others sit still.
+        steps = [dict(LOCK_SIX, FanDuel=(1.91, 1.91)), dict(LOCK_SIX, FanDuel=(2.10, 1.75)), LOCK_SIX]
+        far = "2026-10-04T03:00:00Z"                                               # 15 hours out: checks 4 hours apart
+        for every, kickoff in ((31, None), (240, far)):
+            h = _arbbot.PriceHistory()
+            self.assertEqual(self.looks(steps, h=h, every=every, kickoff=kickoff), [], every)
+            self.assertEqual(h.held, {"moved first": 1}, every)                   # the jump since the last look
+            # Nobody followed that move either: it's FanDuel that's off after all.
+            self.assertEqual([b.book for b in self.looks(steps + [LOCK_SIX], every=every, kickoff=kickoff)], ["FanDuel"])
+
+    def test_a_jump_is_measured_against_the_prop_bar_not_the_outlier_bar(self):
+        # +3% -> +9%: a 6-point jump. Under half the outlier bar (7.5), over half the prop bar (4).
+        self.assertEqual(self.looks([dict(LOCK_SIX, FanDuel=(2.06, 1.79)), dict(LOCK_SIX, FanDuel=(2.18, 1.70))]), [])
+
+    def test_a_book_that_sits_still_while_the_others_move_alerts(self):
+        everyone_high = {t: (2.20, 1.68) for t in LOCK_SIX}
+        [b] = self.looks([everyone_high, LOCK_SIX])                                # the others moved; FanDuel didn't
+        self.assertEqual(b.book, "FanDuel")
+
+    def test_a_line_never_seen_before_waits_one_check(self):
+        h = _arbbot.PriceHistory()
+        self.assertEqual(find_evs([keyed_prop(LOCK_SIX)], self.locks(), at(-1800), prices=h), [])
+        self.assertEqual(h.held, {"first look": 1})                                # one price that would have alerted
+        self.assertEqual([b.book for b in find_evs([keyed_prop(LOCK_SIX)], self.locks(), NOW, prices=h)],
+                         ["FanDuel"])
+
+    # ---- an open lock has room to breathe
+    def test_an_open_lock_stays_up_while_its_at_least_medium(self):
+        sent, h = [], _arbbot.PriceHistory()
+        cfg = self.locks(**AGES)
+        a = self.alerter(sent, cfg)
+
+        def look(books, i):
+            bets = find_evs([keyed_prop(books)], cfg, at(1860 * i), prices=h, keep=set(a.open) | set(a.restored))
+            a.handle(bets, checked_events={"p1"}, now=NOW.timestamp() + 1860 * i)
+            return bets
+        look(LOCK_SIX, 0)                                                          # first look: waits
+        [b] = look(LOCK_SIX, 1)
+        self.assertEqual([m for m, *_ in sent], ["POST"])
+        five = {k: v for k, v in LOCK_SIX.items() if k != "BetRivers"}
+        apart = dict(LOCK_SIX, BetMGM=(1.944, 1.869), **{"ESPN BET": (1.944, 1.869)}, Caesars=(1.869, 1.944),
+                     BetRivers=(1.869, 1.944))
+        better = dict(LOCK_SIX, FanDuel=(2.252, 1.66))                            # +12.6%: past 12%, and 2.6 better
+        self.assertEqual(find_evs([keyed_prop(five)], cfg, at(1860 * 2)), [])    # (as a new alert: not a lock)
+        for i, books in enumerate((five, LOCK_SIX, apart, LOCK_SIX, better), start=2):
+            del sent[:]
+            [b] = look(books, i)
+            self.assertEqual(b.key, next(iter(a.open)))
+            self.assertFalse([t for m, t, _ in sent if m == "POST" or t.startswith("❌")], (i, sent))
+            self.assertEqual(b.kept, b.confidence == "medium")
+        self.assertEqual((b.confidence, b.kept), ("medium", True))                 # 🟡, no "better price" ping
+        self.assertIn("Confidence: **🟡 Medium**", ev_payload(b)["embeds"][0]["description"])
+        self.assertEqual(len(_read(cfg.ev_log_file)), 1)                           # one bet, logged once
+        # Under medium it does go: 5 sportsbooks that disagree.
+        del sent[:]
+        split = {"FanDuel": (2.20, 1.68), "DraftKings": (1.91, 1.91), "BetMGM": (2.10, 1.75), "Caesars": (1.75, 2.10),
+                 "ESPN BET": (1.91, 1.91)}
+        self.assertEqual(look(split, 7), [])
+        self.assertEqual([t[:6] for _, t, _ in sent], ["❌ GONE"])
+
+    def test_a_pinnacle_priced_card_gets_no_room_to_breathe(self):
+        ev = keyed_prop({"Pinnacle": (1.91, 1.91), "FanDuel": (2.25, 1.66), "DraftKings": (1.91, 1.91),
+                         "BetMGM": (1.93, 1.89), "Caesars": (1.90, 1.92)}, start="2026-10-04T08:00:00Z")
+        cfg = self.locks(far_max_age_seconds=10**6)                                # 20 hours out, +12.5%: medium
+        [b] = find_evs([ev], replace(cfg, min_confidence="low"), NOW)
+        self.assertEqual((b.sharp_book, b.confidence), ("Pinnacle", "medium"))
+        self.assertEqual(find_evs([ev], cfg, NOW, keep={b.key}), [])              # the room is for the consensus only
+
+    def test_a_restored_lock_is_picked_back_up_after_a_restart(self):
+        sent, h = [], _arbbot.PriceHistory()
+        cfg = self.locks(**AGES)
+        a = self.alerter(sent, cfg)
+        for i in range(2):
+            a.handle(find_evs([keyed_prop(LOCK_SIX)], cfg, at(1860 * i), prices=h), checked_events={"p1"},
+                     now=NOW.timestamp() + 1860 * i)
+        self.assertEqual([m for m, *_ in sent], ["POST"])
+        del sent[:]
+        again = self.alerter(sent, cfg)                                            # restart: a fresh price history
+        self.assertEqual(len(again.restored), 1)
+        bets = find_evs([keyed_prop(LOCK_SIX)], cfg, at(1860 * 2), prices=_arbbot.PriceHistory(),
+                        keep=set(again.open) | set(again.restored))
+        self.assertEqual(again.handle(bets, checked_events={"p1"}, now=NOW.timestamp() + 1860 * 2), 0)
+        self.assertEqual(sent, [])                                                 # no GONE, no new post
+        self.assertEqual(list(again.open), [b.key for b in bets])
+
+    # ---- Pinnacle has an opinion after all
+    def test_pinnacle_pricing_the_player_at_another_point_caps_it_at_medium(self):
+        ev = pinnacle_at(keyed_prop(LOCK_SIX), 24.5, 1.91, 1.91)                  # Pinnacle: 24.5, a coin flip
+        self.assertEqual(find_evs([ev], self.locks(), NOW), [])                   # not a lock
+        h = _arbbot.PriceHistory()
+        [b] = self.looks([None, None], self.locks(alert_mode="balanced", **AGES), h, events=[ev])
+        self.assertEqual(b.confidence, "medium")
+        self.assertIn("Pinnacle has a different line (24.5)", b.confidence_notes)
+        self.assertEqual(h.missed, [["Pinnacle has another line"]])               # for the console
+        # Pinnacle says Over 24.5 is only 45%, so Over 25.5 is at most that: no edge at +120.
+        low = pinnacle_at(keyed_prop(LOCK_SIX), 24.5, 2.10, 1.75)
+        self.assertEqual(find_evs([low], self.locks(alert_mode="balanced"), NOW), [])
+        h, cfg = _arbbot.PriceHistory(), self.locks(alert_mode="balanced", **AGES)
+        for secs in (-1860, 0):                                                    # (the first look waits)
+            find_evs([low], cfg, at(secs), prices=h)
+        self.assertEqual(h.missed, [["Pinnacle's other line says no edge"]])
+
+    def test_only_the_same_player_and_stat_cast_doubt(self):
+        for player, market in (("Anthony Davis", "player_points"), ("LeBron James", "player_rebounds")):
+            ev = pinnacle_lines(keyed_prop(LOCK_SIX), [(22.5, 1.80, 2.04)], player, market)
+            [b] = find_evs([ev], self.locks(), NOW)
+            self.assertEqual(b.confidence, "high", (player, market))               # still a lock
+
+    def test_an_under_is_capped_by_pinnacles_under_at_a_higher_point(self):
+        under = {t: (u, o) for t, (o, u) in LOCK_SIX.items()}                      # FanDuel's Under is +120
+        low = replace(self.locks(), min_confidence="low")
+        # Pinnacle's Under 24.5 caps nothing: Under 25.5 is likelier than that.
+        [b] = find_evs([pinnacle_at(keyed_prop(under), 24.5, 1.75, 2.10)], low, NOW)
+        self.assertEqual((b.outcome, b.confidence), ("Under", "medium"))
+        # Pinnacle's Under 26.5 at 45%: Under 25.5 is at most that, so +120 has no edge.
+        self.assertEqual(find_evs([pinnacle_at(keyed_prop(under), 26.5, 1.75, 2.10)], low, NOW), [])
+
+    def test_the_tightest_of_pinnacles_lines_caps_it(self):
+        # Over 23.5 at 58% would leave room at +120; Over 24.5 at 45% doesn't.
+        ev = pinnacle_lines(keyed_prop(LOCK_SIX), [(23.5, 1.70, 2.20), (24.5, 2.10, 1.75)])
+        self.assertEqual(find_evs([ev], replace(self.locks(), min_confidence="low"), NOW), [])
+
+    def test_a_line_pinnacle_took_down_keeps_its_last_word_until_kickoff(self):
+        # Prop checks are 4 hours apart from 12 hours out, then 30 minutes: Pinnacle's last price on
+        # this exact line is kept until kickoff, however long ago it took the line down.
+        cfg = self.locks(**AGES)
+        h, far = _arbbot.PriceHistory(), "2026-10-04T03:00:00Z"                     # 15 hours out
+        no_edge = dict(LOCK_SIX, Pinnacle=(2.05, 1.80))                            # Over 47%: +120 is only +3%
+        got = [find_evs([keyed_prop(books, start=far)], replace(cfg, min_confidence="low"), at(240 * 60 * i), prices=h)
+               for i, books in enumerate((LOCK_SIX, no_edge, LOCK_SIX, LOCK_SIX))]   # 15, 11, 7, 3 hours out
+        self.assertEqual(got, [[]] * 4)                                            # taken down: its last price stands
+        self.assertEqual(h.missed, [["Pinnacle's last price says no edge"]] * 2)
+        # 31 minutes apart: first seen with Pinnacle on it (a lock), then taken down, then back.
+        h, with_pin = _arbbot.PriceHistory(), dict(LOCK_SIX, Pinnacle=(1.91, 1.91))
+        got = [find_evs([keyed_prop(books)], cfg, at(60 * (180 + 31 * i)), prices=h)
+               for i, books in enumerate((with_pin, LOCK_SIX, LOCK_SIX, LOCK_SIX, LOCK_SIX, with_pin))]
+        self.assertEqual([[b.sharp_book for b in bets] for bets in got], [["Pinnacle"], [], [], [], [], ["Pinnacle"]])
+        self.assertEqual(h.held, {"first look": 1})                                # then never a lock while it's down
+        self.assertEqual(h.missed, [["Pinnacle took this line down"]] * 3)
+        # An alert that's up stays up, as a quiet 🟡 card.
+        h = _arbbot.PriceHistory()
+        [b] = find_evs([keyed_prop(with_pin)], cfg, at(0), prices=h)
+        [b] = find_evs([keyed_prop(LOCK_SIX)], cfg, at(4 * 3600), prices=h, keep={b.key})
+        self.assertEqual((b.confidence, b.kept, b.confidence_notes[-2]), ("medium", True, "Pinnacle took this line down"))
+        h.prune(at(6 * 3600 - 60))
+        self.assertEqual(len(h.sharp), 2)                                          # kept until kickoff (both sides)...
+        h.prune(at(6 * 3600))
+        self.assertEqual(h.sharp, {})                                              # ...not after
+
+    # ---- the same yardstick everywhere: closing lines and markouts
+    def test_prop_closing_lines_leave_the_alerted_book_out(self):
+        tr = ClosingTracker(self.cfg())
+        row = {"event_id": "p1", "market": "player_points", "outcome": "Over", "point": "25.5",
+               "player": "LeBron James", "home_team": "Lakers", "book": "FanDuel",
+               "first_seen": "2026-10-03T11:00:00+00:00", "commence_time": "2026-10-03T18:00:00Z"}
+        tr.add(row)
+        close = {"FanDuel": (2.40, 1.57), "DraftKings": (1.95, 1.87), "BetMGM": (1.93, 1.89),
+                 "Caesars": (1.89, 1.93), "ESPN BET": (1.87, 1.95)}                # FanDuel never moved back
+        tr.observe([keyed_prop(close)], NOW)
+        [(p, _)] = tr.latest.values()
+        xs = sorted(devig(list(close[t]), "power")[0] for t in ("DraftKings", "BetMGM", "Caesars", "ESPN BET"))
+        self.assertAlmostEqual(p, (xs[1] + xs[2]) / 2, places=6)
+        # 3 other books: too few for a +EV prop's close, enough for an outlier's (OUTLIER_MIN_BOOKS=3).
+        three = keyed_prop({k: close[k] for k in ("FanDuel", "DraftKings", "BetMGM", "Caesars")})
+        for kind, closes in (("ev", False), ("outlier", True)):
+            tr = ClosingTracker(self.cfg())
+            tr.add(row, kind)
+            tr.observe([three], NOW)
+            self.assertEqual(bool(tr.latest), closes, kind)
+        # The alerted book isn't in the feed any more: its sister book is still left out.
+        tr = ClosingTracker(self.cfg())
+        tr.add(dict(row, book="BetOnline.ag"))
+        sisters = keyed_prop({"LowVig.ag": (2.40, 1.57), **{k: close[k] for k in close if k != "FanDuel"}})
+        tr.observe([sisters], NOW)
+        self.assertAlmostEqual(tr.latest[_arbbot._bet_id(row)][0], (xs[1] + xs[2]) / 2, places=6)
+        t = _arbbot.Trackers(self.cfg(), self.args())                              # outlier logs say so
+        t.prop_outs.on_log(row)
+        self.assertEqual(t.closing.tracked["p1|player_points|LeBron James|Over|25.5"]["kind"], "outlier")
+
+    def test_ev_and_outlier_closes_count_sister_books_differently(self):
+        row = {"event_id": "p1", "market": "player_points", "outcome": "Over", "point": "25.5",
+               "player": "LeBron James", "home_team": "Lakers", "book": "FanDuel",
+               "first_seen": "2026-10-03T11:00:00+00:00", "commence_time": "2026-10-03T18:00:00Z"}
+        close = {"FanDuel": (2.40, 1.57), "DraftKings": (1.95, 1.87), "BetMGM": (1.93, 1.89),
+                 "Caesars": (1.89, 1.93), "BetOnline.ag": (1.80, 2.04), "LowVig.ag": (1.80, 2.04)}
+        p = {t: devig(list(close[t]), "power")[0] for t in close}
+        got = {}
+        for kind in ("ev", "outlier"):
+            tr = ClosingTracker(self.cfg())
+            tr.add(row, kind)
+            tr.observe([keyed_prop(close)], NOW)
+            [(got[kind], _)] = tr.latest.values()
+        ev_xs = sorted([p["DraftKings"], p["BetMGM"], p["Caesars"], p["BetOnline.ag"]])   # +EV: sisters are one vote
+        self.assertAlmostEqual(got["ev"], (ev_xs[1] + ev_xs[2]) / 2, places=6)
+        out_xs = sorted(p[t] for t in close if t != "FanDuel")                            # outlier: 5 books
+        self.assertAlmostEqual(got["outlier"], out_xs[2], places=6)
+
+    def test_markouts_judge_a_consensus_prop_by_the_cards_fair_price(self):
+        books = dict(LOCK_SIX, **{"BetOnline.ag": (1.80, 2.04), "LowVig.ag": (1.80, 2.04)})
+        ev = keyed_prop(books)
+        [b] = find_evs([ev], self.locks(alert_mode="balanced"), NOW)
+        tr = _arbbot.MarkoutTracker(self.cfg())
+        tr.add(b, NOW.timestamp(), "ev")
+        [m] = tr.pending
+        self.assertEqual(m.ref, "consensus")
+        self.assertAlmostEqual(_arbbot._markout_fair(m, ev, self.cfg(), NOW, False, {}), b.fair_prob, places=12)
+        ev["bookmakers"] = [bm for bm in ev["bookmakers"] if bm["title"] in ("FanDuel", "DraftKings", "BetMGM",
+                                                                             "BetOnline.ag", "LowVig.ag")]
+        self.assertIsNone(_arbbot._markout_fair(m, ev, self.cfg(), NOW, False, {}))   # 3 other votes: can't say
+
+    def test_the_bet_log_says_where_the_fair_price_came_from(self):
+        a = EVAlerter(self.cfg(), dry_run=True)
+        [cons] = find_evs([keyed_prop(LOCK_SIX)], self.locks(), NOW)
+        sharp = find_evs([ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})],
+                         Config(min_ev_pct=3), NOW)
+        a.handle([cons] + sharp, now=1000)
+        self.assertEqual(sorted(r["fair_from"] for r in _read(self.files["ev_log_file"])), ["Pinnacle", CONSENSUS_SIX])
+        group = _arbbot.CLV_GROUPS["Fair price from"]
+        self.assertEqual([group(r) for r in ({"kind": "ev", "fair_from": "Pinnacle"},
+                                             {"kind": "ev", "fair_from": CONSENSUS_SIX},
+                                             {"kind": "outlier", "fair_from": "median of 4 other books"},
+                                             {"kind": "ev"})],
+                         ["Pinnacle", "Other books", "Outlier median", "Unknown"])
+
+    # ---- the prop check (what run() calls)
+    def trackers(self, **kw):
+        return _arbbot.Trackers(self.cfg(Config(my_books=BROTHERS_BOOKS, round_stakes=0, **AGES), **kw).with_mode(),
+                                self.args())
+
+    def test_the_prop_check_holds_first_looks_and_says_so(self):
+        t = self.trackers()
+        first = _arbbot.scan_props(t, [keyed_prop(LOCK_SIX)], {"p1"}, at(0))
+        self.assertEqual((first.n_ev, first.prices_held), (0, {"first look": 1}))
+        self.assertEqual(_arbbot.prop_guard_text(first.prices_held, first.missed),
+                         " | 1 prop price held (1 first look / 0 moved first)")
+        self.assertEqual(_arbbot.scan_props(t, [keyed_prop(LOCK_SIX)], {"p1"}, at(1860)).n_ev, 1)
+        self.assertTrue(t.prop_prices.seen)
+        _arbbot.scan_props(t, [], set(), at(27 * 3600))
+        self.assertEqual(t.prop_prices.seen, {})                                   # kept a day, like outliers'
+        t = self.trackers()
+        five = {k: v for k, v in LOCK_SIX.items() if k != "BetRivers"}
+        p2 = keyed_prop(five)
+        p2["id"] = "p2"
+        _arbbot.scan_props(t, [p2], {"p2"}, at(1900))
+        near = _arbbot.scan_props(t, [p2], {"p2"}, at(3800))
+        self.assertEqual((near.n_ev, near.missed, near.prices_held), (0, [["under 6 sportsbooks"]], {}))   # this check
+        two = near.missed + [["books disagree", "under 6 sportsbooks"]]
+        self.assertEqual(_arbbot.prop_guard_text(near.prices_held, two),
+                         " | 2 no-Pinnacle props missed high (2 under 6 sportsbooks, 1 books disagree)")
+
+    def test_the_prop_check_keeps_cards_that_are_up_and_respects_the_cap(self):
+        t = self.trackers(max_prop_per_hour=1)
+        p2 = keyed_prop(LOCK_SIX, player="Anthony Davis")
+        p2["id"] = "p2"
+        for i in range(2):
+            res = _arbbot.scan_props(t, [keyed_prop(LOCK_SIX), p2], {"p1", "p2"}, at(1860 * i))
+        self.assertEqual((res.n_ev, res.held), (1, {"capped": 1}))                 # 6 an hour in locks; 1 here
+        [key] = t.prop_evs.open
+        five = {k: v for k, v in LOCK_SIX.items() if k != "BetRivers"}
+        drop = keyed_prop(five, player="Anthony Davis" if "Anthony" in key else "LeBron James")
+        drop["id"] = "p2" if "Anthony" in key else "p1"
+        res = _arbbot.scan_props(t, [drop], {drop["id"]}, at(1860 * 2))
+        self.assertEqual((list(t.prop_evs.open), res.n_ev, res.held), ([key], 0, {}))   # kept at medium, no slot
+        op = t.prop_evs.open.pop(key)                                             # as after a restart:
+        t.prop_evs.restored = {key: {"message_id": "m1", "first_seen": op.first_seen, "label": "LeBron",
+                                     "sport_key": "basketball_nba", "event_id": drop["id"],
+                                     "commence_time": drop["commence_time"]}}    # its card saved,
+        t.prop_prices = _arbbot.PriceHistory()                                    # its price history gone
+        _arbbot.scan_props(t, [drop], {drop["id"]}, at(1860 * 3))
+        self.assertEqual(list(t.prop_evs.open), [key])                             # picked back up, not dropped
+
+    def test_an_open_lock_whose_book_moves_further_stays_up_quietly(self):
+        sent = []
+        t = self.wired(sent)
+
+        def check(i, books):
+            return _arbbot.scan_props(t, [keyed_prop(books)], {"p1"}, at(1860 * i))
+        check(0, LOCK_SIX)                                                         # first look
+        check(1, LOCK_SIX)
+        self.assertEqual([(m, c) for m, _, c in sent], [("POST", "@here")])        # the lock
+        further = dict(LOCK_SIX, FanDuel=(2.29, 1.62))                             # +14.5%: FanDuel moved, alone
+        res = check(2, further)
+        [op] = t.prop_evs.open.values()
+        self.assertEqual((op.arb.confidence, op.arb.kept), ("medium", True))       # 🟡 while the others can follow
+        self.assertIn("FanDuel just moved its price away from the other books", op.arb.confidence_notes)
+        self.assertEqual(res.missed, [["edge over 12%", "book moved first"]])
+        for i, books in ((3, further), (4, LOCK_SIX)):                             # nobody followed; then back
+            check(i, books)
+        self.assertEqual([m for m, *_ in sent], ["POST"] + ["PATCH"] * 3)          # edited: no GONE, no new ping
+        self.assertFalse([title for _, title, _ in sent if title.startswith("❌")])
+        self.assertEqual((op.arb.confidence, op.arb.kept), ("high", False))
+        self.assertEqual(len(_read(self.files["ev_log_file"])), 1)                 # one bet, logged once
+        # With your own bars (7%) medium alerts too. A card whose book just moved, +7.5% to +11.5%, is
+        # still never a lock then, and no new alert (no "better price" ping).
+        steps = [dict(LOCK_SIX, FanDuel=(2.15, 1.75)), dict(LOCK_SIX, FanDuel=(2.23, 1.70))]
+        [b] = self.looks(steps, self.locks(alert_mode="balanced", **AGES), keep={op.arb.key})
+        self.assertEqual((round(b.ev_pct, 1), b.confidence, b.kept), (11.5, "medium", True))
+
+    def test_a_bet_kept_up_under_high_isnt_a_leg_of_a_new_parlay(self):
+        cfg = self.locks()
+        [lebron] = find_evs([keyed_prop(LOCK_SIX)], cfg, NOW)
+        game2 = keyed_prop(LOCK_SIX, player="Jayson Tatum")
+        game2["id"] = "p2"
+        [tatum] = find_evs([game2], cfg, NOW)
+        [p] = find_parlays([lebron, tatum], cfg)                                    # two locks at FanDuel: a parlay
+        five = {k: v for k, v in LOCK_SIX.items() if k != "BetRivers"}
+        [kept] = find_evs([keyed_prop(five)], cfg, NOW, keep={lebron.key})        # its card is up: 🟡, kept
+        self.assertEqual((kept.confidence, kept.kept), ("medium", True))
+        self.assertEqual(find_parlays([kept, tatum], cfg), [])                     # not in a new parlay...
+        self.assertEqual([q.key for q in find_parlays([kept, tatum], cfg, keep={p.key})], [p.key])   # ...one up stays
+        self.assertEqual(find_parlays([replace(lebron, confidence="medium"), tatum], cfg), [])   # under MIN_CONFIDENCE
+        medium_ok = replace(cfg, min_confidence="medium")
+        self.assertEqual(len(find_parlays([replace(lebron, confidence="medium"), tatum], medium_ok)), 1)
+        self.assertEqual(find_parlays([replace(lebron, confidence="medium", kept=True), tatum], medium_ok), [])
+        self.assertEqual(len(find_parlays([replace(lebron, confidence=""), tatum], cfg)), 1)    # (outliers aren't rated)
+
+    def test_run_once_says_a_new_prop_line_waits(self):
+        import argparse, contextlib, io
+        from unittest import mock
+        pre_start = (datetime.now(timezone.utc) + timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        class Api:
+            remaining, used = 50000.0, None
+
+            def __init__(self, cfg):
+                pass
+
+            def events(self, sport, horizon_hours=26):
+                return [{"id": "p1", "commence_time": pre_start}]
+
+            def odds(self, sport, until):
+                return []
+
+            def event_odds(self, sport, gid, markets):   # a lock-quality prop Pinnacle doesn't price
+                secs = (datetime.now(timezone.utc) - NOW).total_seconds()
+                return stamped(keyed_prop(LOCK_SIX, start=pre_start), secs)
+
+        cfg = self.cfg(Config(my_books=BROTHERS_BOOKS, round_stakes=0).with_mode(), sports=["basketball_nba"],
+                       prop_sports=["basketball_nba"], kalshi_check=False)
+        args = argparse.Namespace(once=True, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        with mock.patch("arbbot.OddsAPI", Api), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        self.assertIn("0 new +EV, 0 new outliers | 1 prop price held (1 first look / 0 moved first) | credits left",
+                      out.getvalue())                                             # one look can't send it
+
+    def test_an_outlier_that_shrinks_to_a_medium_edge_becomes_a_quiet_ev_card(self):
+        sent = []
+        t = self.wired(sent)
+        outlier = keyed_prop(dict(LOCK_SIX, FanDuel=(2.32, 1.61)))                 # 16%
+        self.assertEqual(_arbbot.scan_props(t, [outlier], {"p1"}, at(0)).n_out, 1)
+        del sent[:]
+        res = _arbbot.scan_props(t, [keyed_prop(dict(LOCK_SIX, FanDuel=(2.26, 1.66)))], {"p1"}, at(1860))   # 13%
+        self.assertEqual((res.n_out, list(t.prop_outs.open), len(t.prop_evs.open)), (0, [], 1))
+        [(m1, t1, _), (m2, t2, c2)] = sent
+        self.assertEqual((m1, m2), ("PATCH", "POST"))
+        self.assertTrue(t1.startswith("↘️ Back to a normal +EV edge"))
+        self.assertTrue(t2.startswith("📈 +EV 13.0%"))
+        self.assertNotIn("@here", c2)                                              # medium in locks: no ping
 
 
 if __name__ == "__main__":

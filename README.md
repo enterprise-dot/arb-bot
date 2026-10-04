@@ -84,9 +84,10 @@ outliers and parlays) to another channel; `DISCORD_OUTLIER_WEBHOOK_URL`,
 Passing/rushing/receiving yards and receptions (NFL), points/rebounds/assists/threes (NBA), and
 points/shots/assists (NHL). Props are priced per game, so they're checked every 30 minutes in the
 3 hours before kickoff, and the budget autopilot counts them. Fair odds come from Pinnacle when it
-prices the prop, otherwise from the median of at least 4 books, and the minimum edge is 7%. Props
-appear as +EV, arb and outlier alerts. They're tracked for CLV but not graded win/loss (that needs
-player stats).
+prices the prop, otherwise from the median of at least 4 other books (the book being judged doesn't
+count, and BetOnline.ag and LowVig.ag count as one, since they share an owner), and the minimum
+edge is 7%. Props appear as +EV, arb and outlier alerts. They're tracked for CLV and graded from box
+scores (see "Is it working?" below).
 
 ## 📦 Parlays
 
@@ -119,6 +120,31 @@ when live**), and 2-leg parlays at **15%+**. At most 4 arb, 6 +EV, 6 prop, 6 out
 alerts go out an hour, and **3 live alerts an hour in all**. Your own stricter settings in `.env`
 still win. Set `ALERT_MODE=balanced` to use your own thresholds instead (that's also the way to
 loosen any of these).
+
+**Props Pinnacle doesn't price can be locks too.** Their fair odds are the median of the other
+books, so the bot checks how much those books agree instead of Pinnacle's margin. A lock needs all
+of these: the other books within 2% win chance of each other (one odd book is ignored), at least 6
+sportsbooks on that exact line (exchanges like Kalshi count in the median but not toward the 6),
+kickoff within 12 hours, and an 8-12% edge (bigger gaps go out as outliers). It bets 30% less
+(`CONSENSUS_STAKE`). The card names the books the fair price comes from, e.g. "consensus of
+DraftKings, BetMGM, Caesars, ESPN BET, BetRivers", and says how many of them you can't bet at.
+
+- **Two looks first.** A prop line the bot hasn't seen before waits one prop check (30 minutes near
+  kickoff), so `--once` never sends one. If the book with the good price just moved away from the
+  others (it may have seen injury or lineup news first), the bot waits a prop check for the others
+  to catch up before alerting, and waits again each time that book moves further.
+- **Pinnacle still has a say.** If Pinnacle prices the same player at another point (24.5 instead
+  of 25.5), or has taken this exact line down, the prop is never a lock (until Pinnacle prices the
+  line again). If Pinnacle's other line, or its last price on this line before it came down, shows
+  there's no edge at all (Over 25.5 can't be likelier than Pinnacle's Over 24.5), it isn't alerted.
+- **An alert that's up stays up** while it's still at least medium confidence (one book pulling its
+  line, the books drifting a little apart, the edge growing past 12%, or its book moving further
+  away from the others). The card turns 🟡 instead of a false "GONE", and it doesn't ping again.
+  Restarts don't change that.
+
+The props console line says how many prices were held back and which lines missed "high" and why,
+e.g. `2 prop prices held (1 first look / 1 moved first) | 3 no-Pinnacle props missed high (2 under 6
+sportsbooks, 1 books disagree)`.
 
 ## Alert mix: fewer live alerts, more for later today and tomorrow
 
@@ -159,14 +185,17 @@ The console line after each check says what was held back and why, e.g.
 - **Confidence on every +EV bet** (🟢 High / 🟡 Medium / 🟠 Low), from how tight Pinnacle's own
   market is, whether the other books agree with Pinnacle, whether the game starts within 24 hours
   (`CONFIDENT_HOURS`; props 12), and whether the edge is believable. Stakes scale 100% / 75% / 50%.
-  `MIN_CONFIDENCE=medium` drops the low ones.
+  `MIN_CONFIDENCE=medium` drops the low ones. For a prop Pinnacle doesn't price, the first two
+  checks become how closely the other books agree and whether 6+ sportsbooks price it.
 - **Shaky prices are skipped**: a wide Pinnacle market (over 8% margin, 12% for props), or Pinnacle
   and the rest of the market 10+ points apart (one of them is stale).
 - **Live arbs need both prices fresh**: priced within 60 seconds of each other, or it's usually
   just one book lagging. In locks mode every live alert also needs two checks in a row and a price
   under 60 seconds old (see "Alert mix" above).
 - **CLV tracking** shows whether the bets beat the closing line, broken down by bet type, market,
-  book, sport and confidence (`--results`, and the daily summary card).
+  book, sport, confidence and where the fair price came from (`--results`, and the daily summary
+  card). `ev_bets.csv` and `outliers.csv` say whose fair odds each bet used (`fair_from`). A prop's
+  closing line follows the same rules as its alert, with the alerted book left out.
 - **Restarts don't repeat alerts**: open alerts are remembered, so an update edits the existing
   cards instead of posting them again.
 
@@ -201,8 +230,9 @@ to see stakes in units too.
 `pinnacle,betfair_ex_eu`) and the bot blends their fair odds. Each alert shows how many sources
 priced it ("Sources 2/2"). If the sharps disagree by more than `SHARP_DISAGREE_PCT`, the line is
 skipped. If only one of them priced it, the stake is halved (`SINGLE_SOURCE_STAKE`).
-A prop Pinnacle doesn't price uses the median of at least 4 other books instead, with a 30%
-smaller stake (`CONSENSUS_STAKE=0.7`).
+A prop Pinnacle doesn't price uses the median of at least 4 other books instead (not counting the
+book being judged; BetOnline.ag and LowVig.ag count as one), with a 30% smaller stake
+(`CONSENSUS_STAKE=0.7`).
 
 **Kalshi second opinion (free).** Before a game starts, the bot also reads Kalshi's own exchange
 prices for game winners straight from Kalshi (no key, no Odds API credits). Kalshi's prices are

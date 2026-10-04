@@ -44,6 +44,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 API_BASE = os.environ.get("ODDS_API_BASE", "https://api.the-odds-api.com/v4")
@@ -65,6 +66,13 @@ DEFAULT_GAME_MINUTES = [
 FALLBACK_GAME_MINUTES = 180
 
 CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+# Books with the same owner, which share most of their lines: one vote in a market consensus.
+SISTER_BOOKS = ({"betonlineag", "lowvig"},)
+# Exchanges: anyone can post a price there, so a thin or forgotten order can sit on a prop line. Their
+# prices count in a consensus like any book's, but not toward its "6 sportsbooks price it" point.
+EXCHANGES = {"kalshi", "novig", "prophetx", "polymarket", "betfair_ex_eu", "betfair_ex_uk", "betfair_ex_au",
+             "matchbook", "smarkets"}
 
 # ALERT_MODE=locks floors: only alerts worth acting on.
 LOCKS = {
@@ -1639,7 +1647,9 @@ class Alerter:
                 op = OpenArb(arb, first, now, self.value(arb), alerted_pct=self.value(arb),
                              url=self.webhook_for(arb), checks=found[1] if found else 1,
                              spotted=found[0] if found else first)
-                op.message_id = self._discord(self.payload(arb, self.mention(), first_seen=first), url=op.url)
+                # (A bet kept up under MIN_CONFIDENCE, handed over from its other card, doesn't ping.)
+                mention = "" if getattr(arb, "kept", False) else self.mention()
+                op.message_id = self._discord(self.payload(arb, mention, first_seen=first), url=op.url)
                 op.card, op.retry = self.card_hash(arb, first), op.message_id is None and self.send_retryable
                 self.open[arb.key] = op
                 if self.log_on_open and handed is None:   # a handed-over bet was logged already
@@ -1657,7 +1667,9 @@ class Alerter:
                 cur.arb, cur.last_seen = arb, now
                 cur.checks += 1
                 cur.best_pct = max(cur.best_pct, self.value(arb))
-                better = self.value(arb) >= cur.alerted_pct + self.cfg.realert_jump_pct
+                # (Not for a bet kept up under MIN_CONFIDENCE: it wouldn't be alerted new, so no new ping.)
+                better = (self.value(arb) >= cur.alerted_pct + self.cfg.realert_jump_pct
+                          and not getattr(arb, "kept", False))
                 if not better:
                     cur.better = 0
                 wait = self.reping_waits(arb, cur, fresh_age, now) if better else ""
@@ -1689,9 +1701,16 @@ class Alerter:
                     elif cur.retry:
                         # The first post never reached Discord (refused, rate limited): send it
                         # again, with the ping, and keep its id so edits and the GONE mark reach it.
-                        cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=cur.first_seen),
-                                                       url=cur.url)
-                        cur.retry = cur.message_id is None and self.send_retryable
+                        # A live one only while its price is still fresh enough for a new live alert
+                        # (LIVE_MAX_AGE_ALERT); until then it waits (it's still open, so it's logged).
+                        limit = self.cfg.live_max_age_alert
+                        if not (getattr(arb, "is_live", False) and limit and (fresh_age is None or fresh_age > limit)):
+                            if hasattr(arb, "age"):
+                                arb.age = fresh_age   # how old the price is now, when it really goes out
+                                card = self.card_hash(arb, cur.first_seen)
+                            cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=cur.first_seen),
+                                                           url=cur.url)
+                            cur.retry = cur.message_id is None and self.send_retryable
                     cur.card = card
 
         checked = set(checked_sports) if checked_sports is not None else None
@@ -1793,6 +1812,11 @@ class Status:
 
 # --------------------------------------------------------------------------- +EV bets
 
+def ev_key(event_id: str, market: str, line, outcome: str) -> str:
+    """The alert key of a +EV or outlier bet (EVBet.key)."""
+    return f"ev|{event_id}|{market}|{line}|{outcome}"
+
+
 @dataclass
 class EVBet:
     """One side priced better than the sharp book's no-vig ("fair") odds."""
@@ -1811,7 +1835,7 @@ class EVBet:
     book: str
     price: float
     fair_prob: float
-    sharp_book: str           # e.g. "Pinnacle" or "Pinnacle + Betfair"
+    sharp_book: str           # whose fair odds: "Pinnacle", "Pinnacle + Betfair", "consensus of DraftKings, ..."
     n_outcomes: int
     link: str = ""
     also: list[tuple[str, float]] = field(default_factory=list)  # other +EV books
@@ -1833,6 +1857,8 @@ class EVBet:
     kalshi: tuple[float, float, float] | None = None   # Kalshi's (win chance, bid, ask) for this side
     age: float | None = None         # seconds since the book updated this price, when first sent
     found: tuple = ()                # live, once the live checks confirm it: (first check that found it, checks in a row)
+    kept: bool = False               # shown only because its card is up (under MIN_CONFIDENCE, or its book
+                                     # just moved away from the others): no new ping, not a new parlay's leg
 
     def worst_ok_price(self, min_edge_pct: float = OK_EDGE_PCT) -> float:
         """Lowest price that still leaves min_edge_pct of edge against the fair price."""
@@ -1857,7 +1883,7 @@ class EVBet:
 
     @property
     def key(self) -> str:
-        return f"ev|{self.event_id}|{self.market}|{self.line}|{self.outcome}"
+        return ev_key(self.event_id, self.market, self.line, self.outcome)
 
     @property
     def fingerprint(self) -> str:
@@ -1976,12 +2002,41 @@ def sharp_fair(ev: dict, cfg: Config, now: datetime, is_live: bool):
     return fair, sharp_name, n_used, raw_src, titles
 
 
-def consensus_fair(ev: dict, cfg: Config, now: datetime, is_live: bool, skip: set[str]) -> dict:
-    """Median no-vig probability per line across books (when no sharp prices the line).
-    Returns {(market, line): ({outcome: prob}, n_books)} for lines with enough books."""
+@functools.lru_cache(maxsize=1 << 16)
+def _novig(prices: tuple[float, ...], method: str) -> tuple[float, ...]:
+    """devig, remembered: a prop check works out one consensus per book being judged, from the same prices."""
+    return tuple(devig(list(prices), method))
+
+
+def _vote(book: str) -> str:
+    """The vote a book's prices count toward in a consensus (sister books share one)."""
+    return next((min(g) for g in SISTER_BOOKS if book in g), book)
+
+
+class Consensus(NamedTuple):
+    """The market's fair price for one line, from consensus_fair."""
+    probs: dict[str, float]              # outcome -> the median no-vig win chance
+    books: tuple[tuple[str, ...], ...]   # each vote's books (keys): sister books share one vote
+    spread: dict[str, float]             # outcome -> how far apart the votes are (win-% points), not
+                                         # counting the one farthest from the median (with 4+ votes)
+    full_spread: dict[str, float]        # ...counting every vote
+
+    @property
+    def votes(self) -> int:
+        return len(self.books)
+
+
+def consensus_fair(ev: dict, cfg: Config, now: datetime, is_live: bool, skip: set[str],
+                   leave_out: str = "", sisters: bool = True) -> dict[tuple, Consensus]:
+    """Median no-vig probability per line across books (when no sharp prices the line), for lines
+    at least CONSENSUS_MIN_BOOKS votes price.
+    leave_out: the book being judged, kept out of its own median (and so are its sister books).
+    sisters: sister books (SISTER_BOOKS) are one vote, the average of their prices. Off for the
+      main-line check of the sharp against the rest of the market."""
+    out_vote = _vote(leave_out) if leave_out else None
     lines: dict[tuple, dict[str, dict[str, float]]] = {}
     for bm in ev.get("bookmakers", []):
-        if bm["key"] in skip:
+        if bm["key"] in skip or (out_vote is not None and _vote(bm["key"]) == out_vote):
             continue
         for mkt in bm.get("markets", []):
             if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
@@ -1994,35 +2049,66 @@ def consensus_fair(ev: dict, cfg: Config, now: datetime, is_live: bool, skip: se
     out = {}
     for k, books in lines.items():
         n_out = max(len(o) for o in books.values())
-        full = [o for o in books.values() if len(o) == n_out >= 2]
-        names = set(full[0]) if full else set()
-        full = [o for o in full if set(o) == names]
-        if len(full) < cfg.consensus_min_books:
+        full = {bk: o for bk, o in books.items() if len(o) == n_out >= 2}
+        names = set(next(iter(full.values()))) if full else set()
+        groups: dict[str, list[str]] = {}
+        for bk, o in full.items():
+            if set(o) == names:
+                groups.setdefault(_vote(bk) if sisters else bk, []).append(bk)
+        if not groups or len(groups) < cfg.consensus_min_books:
             continue
-        probs = [dict(zip(o, devig(list(o.values()), cfg.devig_method))) for o in full]
-        med = {}
+        probs = []
+        for bks in groups.values():
+            each = [dict(zip(full[bk], _novig(tuple(full[bk].values()), cfg.devig_method))) for bk in bks]
+            probs.append({n: sum(p[n] for p in each) / len(each) for n in names})
+        med, spread, full_spread = {}, {}, {}
         for n in names:
             xs = sorted(pr[n] for pr in probs)
             m = len(xs) // 2
             med[n] = xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
+            full_spread[n] = round((xs[-1] - xs[0]) * 100, 6)
+            if len(xs) >= 4:   # one odd book (a thin exchange quote) can't swing it on its own
+                xs.remove(max(xs, key=lambda x: abs(x - med[n])))
+            spread[n] = round((xs[-1] - xs[0]) * 100, 6)
         total = sum(med.values())
-        out[k] = ({n: v / total for n, v in med.items()}, len(full))
+        out[k] = Consensus({n: v / total for n, v in med.items()}, tuple(tuple(b) for b in groups.values()),
+                           spread, full_spread)
     return out
 
 
 CONFIDENCE_BADGE = {"high": "🟢 High", "medium": "🟡 Medium", "low": "🟠 Low"}
 PROP_CONFIDENT_HOURS = 12   # prop lines mature later: only this close to kickoff do they get the point
+# A line no sharp prices is judged on how closely the other books agree (win-% points apart, not
+# counting the one farthest out) and how many sportsbooks price it.
+CONSENSUS_AGREE = 2.0       # this close: 2 points
+CONSENSUS_ROUGHLY = 4.0     # this close: 1 point
+CONSENSUS_SPORTSBOOKS = 6   # this many sportsbooks on the line (the one being judged too): 1 point
+
+
+class Agreement(NamedTuple):
+    """How much the market agrees on a line no sharp prices (rate_confidence's `consensus`)."""
+    spread: float          # win-% points between the other books, not counting the one farthest out
+    full_spread: float     # ...counting every one
+    sportsbooks: int       # sportsbooks pricing the line, this one included (exchanges don't count)
+    cant_bet: int = 0      # of those, ones you can't bet at (not in MY_BOOKS)
 
 
 def rate_confidence(hold: float | None, gap: float | None, hours_to_start: float, ev_pct: float,
                     prop: bool, move: float | None = None, kalshi_gap: float | None = None,
-                    confident_hours: float = 24) -> tuple[str, list[str]]:
+                    confident_hours: float = 24, consensus: Agreement | None = None,
+                    missed: list[str] | None = None) -> tuple[str, list[str]]:
     """How much to trust a +EV price. Points for: a tight sharp market, the other books agreeing
     with the sharp, a game close enough that the sharp line has matured (main lines: within
     CONFIDENT_HOURS, so tonight's and tomorrow's games can be high confidence; props: 12 hours),
     a believable edge, and the sharp line moving toward this side (sharp money agrees; moving away
-    costs a point)."""
+    costs a point).
+    consensus: when no sharp prices the line, fair value is the other books' median, so the points
+    for the sharp's margin and agreement go to how closely those books agree (2) and whether 6+
+    sportsbooks price it (1). At most 5, just the "high" bar.
+    missed: when given, a short reason for each of those points (and the hours and edge points)
+    it didn't get is added, for the console."""
     pts, notes = 0, []
+    miss = missed.append if missed is not None else (lambda _: None)
     if move is not None and abs(move) >= 1.5:
         if move > 0:
             pts += 1
@@ -2031,31 +2117,58 @@ def rate_confidence(hold: float | None, gap: float | None, hours_to_start: float
             pts -= 1
             notes.append(f"sharp line moving against it ({move:.1f} pts)")
     tight, ok = (6.5, 9.0) if prop else (3.5, 6.0)
-    if hold is None:
-        pts += 1
-    elif hold <= tight:
-        pts += 2
-        notes.append(f"tight sharp market ({hold:.1f}% margin)")
-    elif hold <= ok:
+    if consensus is not None:
+        a = consensus
+
+        def within(limit: float) -> str:   # said honestly when the farthest book was left out
+            return (f"within {a.full_spread:.1f}% win chance" if a.full_spread <= limit
+                    else f"all but one within {a.spread:.1f}% win chance")
+        if a.spread <= CONSENSUS_AGREE:
+            pts += 2
+            notes.append(f"other books agree ({within(CONSENSUS_AGREE)})")
+        else:
+            miss("books disagree")
+            if a.spread <= CONSENSUS_ROUGHLY:
+                pts += 1
+                notes.append(f"other books roughly agree ({within(CONSENSUS_ROUGHLY)})")
+            else:
+                notes.append(f"other books disagree ({a.full_spread:.0f}% win chance apart)")
+        cant = f" ({a.cant_bet} you can't bet at)" if a.cant_bet else ""
+        if a.sportsbooks >= CONSENSUS_SPORTSBOOKS:
+            pts += 1
+            notes.append(f"{a.sportsbooks} sportsbooks price it{cant}")
+        else:
+            miss(f"under {CONSENSUS_SPORTSBOOKS} sportsbooks")
+            notes.append(f"only {a.sportsbooks} sportsbook{'' if a.sportsbooks == 1 else 's'} price it{cant}")
+    else:
+        if hold is None:
+            pts += 1
+        elif hold <= tight:
+            pts += 2
+            notes.append(f"tight sharp market ({hold:.1f}% margin)")
+        elif hold <= ok:
+            pts += 1
+        else:
+            notes.append(f"wide sharp market ({hold:.1f}% margin)")
+        if gap is None:
+            pts += 1
+        elif gap <= 3:
+            pts += 2
+            notes.append("other books agree")
+        elif gap <= 6:
+            pts += 1
+        else:
+            notes.append(f"other books disagree by {gap:.0f} pts")
+    hours = PROP_CONFIDENT_HOURS if prop else confident_hours
+    if hours_to_start <= hours:
         pts += 1
     else:
-        notes.append(f"wide sharp market ({hold:.1f}% margin)")
-    if gap is None:
-        pts += 1
-    elif gap <= 3:
-        pts += 2
-        notes.append("other books agree")
-    elif gap <= 6:
-        pts += 1
-    else:
-        notes.append(f"other books disagree by {gap:.0f} pts")
-    if hours_to_start <= (PROP_CONFIDENT_HOURS if prop else confident_hours):
-        pts += 1
-    else:
+        miss(f"over {hours:g} hours out")
         notes.append("early line (less tested)")
     if ev_pct <= 12:
         pts += 1
     else:
+        miss("edge over 12%")
         notes.append("unusually big edge, double-check it")
     if kalshi_gap is not None and kalshi_gap <= 2:
         pts += 1
@@ -2092,24 +2205,48 @@ class PriceHistory:
 
     def __init__(self, keep_minutes: int = 26 * 60):
         self.keep = timedelta(minutes=keep_minutes)
-        self.seen: dict[tuple, tuple[datetime, datetime | None, tuple | None]] = {}   # key -> (when, leading since, anchor)
+        # key -> (when, leading since, anchor, (price, fair) at that look: +EV props only)
+        self.seen: dict[tuple, tuple[datetime, datetime | None, tuple | None, tuple | None]] = {}
+        # +EV props: the sharp's last no-vig win chance on each prop line side it priced, and the game's
+        # kickoff. Kept until kickoff: a line the sharp took down still has its last word.
+        self.sharp: dict[tuple, tuple[float, datetime]] = {}
+        # For the console, filled by find_evs (props no sharp prices) and emptied by scan_props:
+        self.held: dict[str, int] = {}      # prices that would have alerted, held back: "first look" / "moved first"
+        self.missed: list[list[str]] = []   # lines that cleared the edge but weren't high confidence: why not
 
     def get(self, key: tuple):
         return self.seen.get(key)
 
-    def put(self, key: tuple, now: datetime, since: datetime | None, anchor: tuple | None) -> None:
-        self.seen[key] = (now, since, anchor)
+    def put(self, key: tuple, now: datetime, since: datetime | None, anchor: tuple | None,
+            last: tuple | None = None) -> None:
+        self.seen[key] = (now, since, anchor, last)
 
     def prune(self, now: datetime) -> None:
         self.seen = {k: v for k, v in self.seen.items() if now - v[0] <= self.keep}
+        self.sharp = {k: v for k, v in self.sharp.items() if v[1] > now}
 
 
 def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
-             history: SharpHistory | None = None, kalshi: dict | None = None) -> list[EVBet]:
+             history: SharpHistory | None = None, kalshi: dict | None = None,
+             prices: PriceHistory | None = None, keep: set[str] | frozenset = frozenset()) -> list[EVBet]:
+    """+EV prices vs the sharp book's fair odds. With CONSENSUS_MIN_BOOKS (props), a line no sharp
+    prices is judged against the median of the OTHER books instead (the book being judged, and its
+    sister books, never count toward its own fair price), and rated on how much they agree.
+    prices: those lines' price history across checks. A book that just moved away from the others
+      (it may have seen injury or lineup news first) is held back, the same test outliers use, and
+      so is a line never seen before: it waits one check. It also keeps the sharp's last price on
+      each prop line until kickoff: a line the sharp took down is skipped when that price says
+      there's no edge, and is never a lock until the sharp prices it again.
+    keep: keys of bets with a card up (open or restored). They skip the "never seen before" wait (a
+      restart forgets the history), and on a line no sharp prices they stay while they're at least
+      medium confidence (a new one still needs MIN_CONFIDENCE): there are no points to spare there,
+      so one book pulling its line mustn't post a false GONE and then a new alert. Nor must their
+      book moving further away from the others: such a bet stays up as a quiet 🟡 card instead."""
     if not cfg.ev_enabled:
         return []
     now = now or datetime.now(timezone.utc)
     sharp = _csv(cfg.sharp_books)
+    sharp_title = sharp[0].title() if sharp else "Sharp"
     allowed = cfg.ev_allowed()
     out: list[EVBet] = []
 
@@ -2122,27 +2259,32 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
         fair, sharp_name, n_used, raw_src, titles = sharp_fair(ev, cfg, now, is_live)
         n_total = {k: len(sharp) for k in fair}
         # The rest of the market, as a sanity check on the sharp's price.
-        market = consensus_fair(ev, replace(cfg, consensus_min_books=3), now, is_live, set(sharp))
+        market = consensus_fair(ev, replace(cfg, consensus_min_books=3), now, is_live, set(sharp), sisters=False)
         if history:
             for k, probs in fair.items():
-                if not sharp_name.get(k, "").startswith("consensus"):
+                for name, prob in probs.items():
+                    history.record((ev["id"], k[0], k[1], name), now, prob)
+        if prices is not None:
+            kickoff = _parse_time(ev["commence_time"])
+            for k, probs in fair.items():
+                if is_prop(k[1]):
                     for name, prob in probs.items():
-                        history.record((ev["id"], k[0], k[1], name), now, prob)
+                        prices.sharp[(ev["id"], k[0], k[1], name)] = (prob, kickoff)
         holds = {}
         for k, srcs in raw_src.items():
             first = next(iter(srcs.values()))
             holds[k] = (sum(1 / x for x in first.values()) - 1) * 100
-        if cfg.consensus_min_books:
-            for k, (probs, n) in consensus_fair(ev, cfg, now, is_live, set(sharp)).items():
-                if k not in fair:
-                    fair[k], sharp_name[k], n_used[k], n_total[k] = probs, f"consensus of {n} books", n, n
+        min_ev = max(cfg.min_ev_pct, cfg.sport_min_ev.get(ev.get("sport_key", ""), 0))
+        own: dict[str, dict[tuple, Consensus]] = {}   # book -> the other books' consensus (it's left out)
 
         # Every soft-book price that beats fair by enough (and every price, for the board).
-        offers: dict[tuple, list[tuple[float, str, str, float | None, str, str | None]]] = {}
+        offers: dict[tuple, list[tuple]] = {}
         boards: dict[tuple, list[tuple[str, float, float, str, bool]]] = {}
         for key, bm in books.items():
             if key in sharp or (allowed and key not in allowed) or not cfg.bettable(key, ev):
                 continue
+            if cfg.consensus_min_books:
+                own[key] = consensus_fair(ev, cfg, now, is_live, set(sharp), leave_out=key)
             for mkt in bm.get("markets", []):
                 if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue
@@ -2150,20 +2292,41 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 stamp = (mkt.get("last_update") or bm.get("last_update")) if _one_line(mkt, ev["home_team"]) else None
                 for oc in mkt.get("outcomes", []):
                     k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
-                    p = fair.get(k, {}).get(oc["name"])
                     price = float(oc.get("price") or 0)
+                    cons = None if k in fair else own.get(key, {}).get(k)   # no sharp price: the other books
+                    p = fair[k].get(oc["name"]) if k in fair else cons.probs.get(oc["name"]) if cons else None
                     if p is None or price <= 1.0:
                         continue
                     ev_pct = (p * price - 1) * 100
                     link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
                     ok = price <= cfg.ev_max_odds and ev_pct <= cfg.max_ev_pct
+                    waiting = False
+                    if cons and prices is not None:
+                        # A book that just moved away from the others makes ITS price look +EV against a
+                        # median that hasn't caught up: the outliers' test, at the +EV bar. mine/theirs
+                        # are unknown (a prop's stamp covers every player), so it works from anchors kept
+                        # across checks; the first look anchors too, so a jump after it is measured, and
+                        # so does each look's price, so a book that moves again is held again.
+                        hkey = (ev["id"], k, key, oc["name"])
+                        prev = prices.get(hkey)
+                        since, anchor = _leading(prev, now, price, p, ev_pct, cfg, None, [], is_live, bar=min_ev)
+                        prices.put(hkey, now, since, anchor or (price, p), (price, p))
+                        carded = ev_key(ev["id"], k[0], k[1], oc["name"]) in keep
+                        held = "moved first" if since is not None else "first look" if prev is None and not carded else ""
+                        if held == "moved first" and carded:
+                            # Its card is up: dropping it would post a false GONE, then a new alert once
+                            # the hold is over. It stays, as a quiet 🟡 card, while the others can follow.
+                            waiting = True
+                        elif held:
+                            if ok and ev_pct >= min_ev:
+                                prices.held[held] = prices.held.get(held, 0) + 1
+                            ok = False
                     boards.setdefault((k, oc["name"]), []).append((bm.get("title", key), price, ev_pct, link, ok))
-                    if price > cfg.ev_max_odds:
+                    if price > cfg.ev_max_odds or not ok:
                         continue
-                    if max(cfg.min_ev_pct, cfg.sport_min_ev.get(ev.get("sport_key", ""), 0)) <= ev_pct <= cfg.max_ev_pct:
-                        link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
+                    if min_ev <= ev_pct <= cfg.max_ev_pct:
                         offers.setdefault((k, oc["name"]), []).append(
-                            (price, bm.get("title", key), link, oc.get("point"), key, stamp))
+                            (price, bm.get("title", key), link, oc.get("point"), key, stamp, p, cons, waiting))
 
         for (k, name), lst in offers.items():
             lst.sort(key=lambda o: (-o[0], o[1]))   # best price; ties by book name, so it's stable
@@ -2172,7 +2335,14 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 lst = [o for o in lst if o[4] != "kalshi" or kalshi_still_there(kq, o[0], cfg)]
                 if not lst:
                     continue
-            price, book, link, point, book_key, stamp = lst[0]
+            price, book, link, point, book_key, stamp, p, cons, waiting = lst[0]
+            from_sharp = cons is None
+            if from_sharp:
+                fair_k, src, n_src, n_all = fair[k], sharp_name[k], n_used[k], n_total[k]
+            else:   # the median of the OTHER books (this one left out), named on the card
+                fair_k, n_src = cons.probs, cons.votes
+                src, n_all = "consensus of " + ", ".join(
+                    "/".join(books[b].get("title", b) for b in vote) for vote in cons.books), n_src
             bet = EVBet(
                 event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
                 sport_key=ev.get("sport_key", ""), matchup=f"{ev['away_team']} @ {ev['home_team']}",
@@ -2180,20 +2350,19 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 commence_time=ev["commence_time"], is_live=is_live,
                 market=k[0], line=k[1], outcome=name, point=point,
                 book=book, price=price, link=link,
-                fair_prob=fair[k][name], sharp_book=sharp_name[k], n_outcomes=len(fair[k]),
+                fair_prob=p, sharp_book=src, n_outcomes=len(fair_k),
                 also=[(b, pr) for pr, b, *_ in lst[1:]],
-                sources_used=n_used[k], sources_total=n_total[k], unit_size=cfg.unit_size,
+                sources_used=n_src, sources_total=n_all, unit_size=cfg.unit_size,
                 sharp_quotes=[(titles[sk], [outs[name]] + [pr for n, pr in outs.items() if n != name])
                               for sk, outs in raw_src.get(k, {}).items() if name in outs],
                 board=sorted(boards.get((k, name), []), key=lambda r: (-r[1], r[0])),
                 age=max(0.0, (now - _parse_time(stamp)).total_seconds()) if stamp else None,
             )
             # Quality checks: skip prices whose fair value is shaky, rate the rest.
-            from_sharp = not sharp_name[k].startswith("consensus")
             hold = holds.get(k) if from_sharp else None
             gap = None
-            if from_sharp and k in market and name in market[k][0]:
-                gap = abs(market[k][0][name] - bet.fair_prob) * 100
+            if from_sharp and k in market and name in market[k].probs:
+                gap = abs(market[k].probs[name] - bet.fair_prob) * 100
             if hold is not None and hold > cfg.max_sharp_hold_pct:
                 continue
             if gap is not None and gap > cfg.sharp_consensus_max_gap:
@@ -2210,18 +2379,56 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                         continue
                     if bet.kalshi[0] * price < 1:
                         continue
+            agree, missed, doubt = None, None, ""
+            if not from_sharp:
+                missed = []
+                sportsbooks = [v for v in cons.books if any(b not in EXCHANGES for b in v)]
+                agree = Agreement(cons.spread[name], cons.full_spread[name],
+                                  len(sportsbooks) + (book_key not in EXCHANGES),
+                                  sum(not any(cfg.bettable(b, ev) for b in v) for v in sportsbooks))
+                # No sharp price on this exact line doesn't mean the sharp has no opinion: it may price
+                # the same player at another point (US books often hang a different line), or have
+                # taken this one down (news). Either way the other books may be behind.
+                doubt, cap = _sharp_doubt(fair, k, name, sharp_title)
+                if cap is not None and (cap * price - 1) * 100 < min_ev:
+                    if prices is not None:
+                        prices.missed.append([f"{sharp_title}'s other line says no edge"])
+                    continue   # Over a higher point can't be likelier than the sharp's Over a lower one
+                why = f"{sharp_title} has another line"
+                # Its last price on this exact line, until kickoff (prop checks can be hours apart).
+                last = prices.sharp.get((ev["id"], k[0], k[1], name)) if prices is not None else None
+                if last is not None:
+                    if (last[0] * price - 1) * 100 < min_ev:
+                        prices.missed.append([f"{sharp_title}'s last price says no edge"])
+                        continue
+                    if not doubt:   # never a lock until the sharp prices the line again
+                        doubt = why = f"{sharp_title} took this line down"
             move = history.record((ev["id"], k[0], k[1], name), now, bet.fair_prob) if history and from_sharp else None
             bet.confidence, bet.confidence_notes = rate_confidence(hold, gap, hours, bet.ev_pct, is_prop(k[1]), move,
-                                                                   kgap, cfg.confident_hours)
-            if CONFIDENCE_ORDER[bet.confidence] < CONFIDENCE_ORDER.get(cfg.min_confidence, 0):
+                                                                   kgap, cfg.confident_hours, agree, missed)
+            if doubt:   # at most medium: never a lock
+                bet.confidence = "medium" if bet.confidence == "high" else bet.confidence
+                bet.confidence_notes.append(doubt)
+                missed.append(why)
+            if waiting:   # its book just moved away from the others: up only because its card is
+                bet.confidence = "medium" if bet.confidence == "high" else bet.confidence
+                bet.confidence_notes.append(f"{book} just moved its price away from the other books")
+                missed.append("book moved first")
+            if missed and prices is not None:
+                prices.missed.append(missed)   # cleared the edge, not high: why (for tuning the bars)
+            floor = CONFIDENCE_ORDER.get(cfg.min_confidence, 0)
+            if not from_sharp and bet.key in keep and (waiting or CONFIDENCE_ORDER[bet.confidence] < floor):
+                # Its card is up: it stays at medium, shown as 🟡 (no GONE), and pings nothing new.
+                floor, bet.kept = min(floor, CONFIDENCE_ORDER["medium"]), True
+            if CONFIDENCE_ORDER[bet.confidence] < floor:
                 continue
             # Less certainty -> smaller bet (the edge itself isn't changed).
-            mult = cfg.single_source_stake if n_total[k] > 1 and n_used[k] == 1 else 1.0
+            mult = cfg.single_source_stake if n_all > 1 and n_src == 1 else 1.0
             if not from_sharp and cfg.consensus_stake < 1:
                 # No sharp price (usually a prop Pinnacle doesn't offer): the fair price is the
                 # median of other books, which is less certain, so the stake is smaller.
                 mult *= cfg.consensus_stake
-                bet.confidence_notes.append(f"no {_csv(cfg.sharp_books)[0].title()} price: stake "
+                bet.confidence_notes.append(f"no {sharp_title} price: stake "
                                             f"{round((1 - cfg.consensus_stake) * 100)}% smaller")
             stakes = [float(x) for x in _csv(cfg.confidence_stakes)] or [1, 1, 1]
             mult *= dict(zip(("high", "medium", "low"), stakes + [1] * 3)).get(bet.confidence, 1)
@@ -2229,6 +2436,25 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
             out.append(bet)
 
     return sorted(out, key=lambda b: b.ev_pct, reverse=True)
+
+
+def _sharp_doubt(fair: dict, k: tuple, name: str, sharp_title: str) -> tuple[str, float | None]:
+    """For a prop line the sharp doesn't price: does it price the same player and stat at another
+    point? Returns (a note for the card, or "", and the most this side can be worth by the sharp's
+    other lines, or None). An Over can't be likelier than the sharp's Over at a lower point, nor an
+    Under than its Under at a higher one."""
+    if not is_prop(k[1]):
+        return "", None
+    player, point = k[1]
+    others = sorted(((kk[1][1], probs) for kk, probs in fair.items()
+                     if kk[0] == k[0] and is_prop(kk[1]) and kk[1][0] == player and kk != k and kk[1][1] is not None),
+                    key=lambda x: x[0])
+    if not others:
+        return "", None
+    caps = [probs[name] for q, probs in others if point is not None and name in probs
+            and ((name == "Over" and q < point) or (name == "Under" and q > point))]
+    return (f"{sharp_title} has a different line ({', '.join(f'{q:g}' for q, _ in others)})",
+            min(caps) if caps else None)
 
 
 def _quotes(quotes: list[tuple[str, list[float]]]) -> str:
@@ -2316,7 +2542,8 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
 
 EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
                  "home_team", "away_team", "commence_time", "live", "market", "outcome", "point",
-                 "n_outcomes", "book", "price", "fair_odds", "best_ev_pct", "stake", "player", "confidence"]
+                 "n_outcomes", "book", "price", "fair_odds", "best_ev_pct", "stake", "player", "confidence",
+                 "fair_from"]   # whose fair odds: "Pinnacle", "consensus of DraftKings, ...", "median of 4 other books"
 
 
 class EVAlerter(Alerter):
@@ -2370,7 +2597,7 @@ class EVAlerter(Alerter):
             "point": "" if b.point is None else b.point, "n_outcomes": b.n_outcomes,
             "book": b.book, "price": b.price, "fair_odds": round(b.fair_odds, 3),
             "best_ev_pct": round(b.ev_pct, 2), "stake": b.stake, "player": b.player,
-            "confidence": b.confidence,
+            "confidence": b.confidence, "fair_from": b.sharp_book,
         }
 
 
@@ -2968,28 +3195,34 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
 
 
 def _leading(prev, now: datetime, price: float, fair_p: float, edge: float, cfg: Config,
-             mine: datetime | None, theirs: list[datetime], is_live: bool) -> tuple[datetime | None, tuple | None]:
+             mine: datetime | None, theirs: list[datetime], is_live: bool,
+             bar: float | None = None) -> tuple[datetime | None, tuple | None]:
     """Is this book out in front of the market (not a stale one worth betting)? Returns (out in
     front since, anchor) for the history; since is None when it isn't.
 
     - In line with the market (edge under half the outlier bar): remember this price as the
       anchor; not out in front.
     - Out in front already: stays so for up to 5 minutes live (30 pre-game) for the others to
-      catch up. If they never do, it's this book that's off after all.
+      catch up. If they never do, it's this book that's off after all: it's re-anchored at its price
+      at the last look (+EV props keep it; otherwise this one), so only a new move counts.
     - Otherwise: out in front if, since its anchor, it moved its own price away from the market
       by a real amount (in one step or several) while the market moved less.
-    - No anchor yet (first look at a live line): only if its quote is much newer than theirs."""
-    _, since, anchor = prev if prev is not None else (None, None, None)
-    if edge < cfg.outlier_min_pct / 2:
+    - No anchor yet (first look at a live line): only if its quote is much newer than theirs.
+    bar: the edge that counts as off the market (OUTLIER_MIN_PCT unless given; +EV props: their bar)."""
+    bar = cfg.outlier_min_pct if bar is None else bar
+    _, since, anchor, last = prev if prev is not None else (None, None, None, None)
+    if edge < bar / 2:
         return None, (price, fair_p)
     if since is not None:
         if (now - since).total_seconds() <= (300 if is_live else 1800):
             return since, anchor
-        return None, (price, fair_p)   # the market never followed: re-anchor so it isn't flagged again
+        # The market never followed: re-anchor so it isn't flagged again for that move. If the book
+        # moved again since the last look, that new move is measured below (and held again).
+        since, anchor = None, last or (price, fair_p)
     if anchor is not None:
         a_price, a_fair = anchor
         moved, market = abs(1 / price - 1 / a_price), abs(fair_p - a_fair)
-        if price != a_price and moved > market and edge - (a_fair * a_price - 1) * 100 >= cfg.outlier_min_pct / 2:
+        if price != a_price and moved > market and edge - (a_fair * a_price - 1) * 100 >= bar / 2:
             return now, anchor
         return None, anchor
     if is_live and mine and theirs:
@@ -3215,7 +3448,12 @@ def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = froze
 
     by_key = {b.key: b for b in bets}
     per_book: dict[str, list[tuple["EVBet", float, str]]] = {}
+    floor = CONFIDENCE_ORDER.get(cfg.min_confidence, 0)
     for b in by_key.values():
+        # A new parlay is a new alert, so a leg needs MIN_CONFIDENCE too: not a bet that's only up
+        # because its card is (kept). (Outliers aren't rated. Parlays already up are re-scored below.)
+        if b.kept or (b.confidence and CONFIDENCE_ORDER.get(b.confidence, 0) < floor):
+            continue
         for bk, price, link in leg_row(b):
             per_book.setdefault(bk, []).append((b, price, link))
     found: dict[str, Parlay] = {}
@@ -4642,6 +4880,14 @@ def clv_pct(price: float, closing_fair_prob: float) -> float:
     return (price * closing_fair_prob - 1) * 100
 
 
+def _book_key(ev: dict, title: str) -> str:
+    """The Odds API key of a book named by its title (logs and cards name books by title)."""
+    for bm in ev.get("bookmakers", []):
+        if bm.get("title", bm["key"]) == title:
+            return bm["key"]
+    return next((k for k, t in BOOK_TITLES.items() if t == title), title.lower())
+
+
 class ClosingTracker:
     """Keeps the latest sharp fair price for every logged pre-game bet until kickoff, then
     saves it as the closing line. Restarts are fine: pending bets reload from the logs."""
@@ -4652,18 +4898,19 @@ class ClosingTracker:
         self.written = {r["bet_id"] for r in _read_csv(cfg.closing_file)}
         self.tracked: dict[str, dict] = {}
         now = datetime.now(timezone.utc)
-        for name in (cfg.ev_log_file, cfg.outlier_log_file):
+        for kind, name in (("ev", cfg.ev_log_file), ("outlier", cfg.outlier_log_file)):
             for r in _read_csv(name) if name else []:
                 if _parse_time(r["commence_time"]) > now:
-                    self.add(r)
+                    self.add(r, kind)
 
-    def add(self, row: dict) -> None:
+    def add(self, row: dict, kind: str = "ev") -> None:
+        """Follow a logged bet to kickoff. kind: "ev" or "outlier" (its alert's yardstick)."""
         bid = _bet_id(row)
         if bid in self.written or bid in self.tracked:
             return
         if _parse_time(row["first_seen"]) >= _parse_time(row["commence_time"]):
             return  # live bet: there's no closing line to beat
-        self.tracked[bid] = row
+        self.tracked[bid] = {**row, "kind": kind}
 
     def needs_close(self) -> set[str]:
         """Event ids with a main-line bet that still needs a last look before kickoff."""
@@ -4681,19 +4928,26 @@ class ClosingTracker:
             if ev["id"] not in wanted or _parse_time(ev["commence_time"]) <= now:
                 continue
             fair = sharp_fair(ev, self.cfg, now, False)[0]
-            market = None
+            market: dict[tuple, dict[tuple, Consensus]] = {}   # (outlier?, alerted book) -> the other books
             for bid, r in self.tracked.items():
                 if r["event_id"] != ev["id"]:
                     continue
                 k = (r["market"], _row_line(r))
                 p = fair.get(k, {}).get(r["outcome"])
                 if p is None and r.get("player"):
-                    # No sharp price on this prop: use the market consensus, the same fallback
-                    # (and minimum number of books) a prop alert uses. Main lines only ever use
-                    # the sharp price, so for those the last sharp reading stands.
-                    if market is None:
-                        market = consensus_fair(ev, self.cfg.for_props(), now, False, set(_csv(self.cfg.sharp_books)))
-                    p = market.get(k, ({}, 0))[0].get(r["outcome"])
+                    # No sharp price on this prop: the median of the other books (the alerted one left
+                    # out) by the rules its alert used: a +EV prop's consensus (PROP_MIN_BOOKS votes,
+                    # sister books as one), or an outlier's median (OUTLIER_MIN_BOOKS books). Main lines
+                    # only ever use the sharp price, so for those the last sharp reading stands.
+                    outlier, bk = r.get("kind") == "outlier", _book_key(ev, r.get("book", ""))
+                    if (outlier, bk) not in market:
+                        cfg = self.cfg.for_props()
+                        if outlier:
+                            cfg = replace(cfg, consensus_min_books=self.cfg.outlier_min_books)
+                        market[(outlier, bk)] = consensus_fair(ev, cfg, now, False, set(_csv(self.cfg.sharp_books)),
+                                                               leave_out=bk, sisters=not outlier)
+                    c = market[(outlier, bk)].get(k)
+                    p = c.probs.get(r["outcome"]) if c else None
                 if p:
                     self.latest[bid] = (p, now)
 
@@ -4741,17 +4995,30 @@ def _market_group(row: dict) -> str:
     return {"h2h": "Moneylines", "spreads": "Spreads", "totals": "Totals"}.get(row["market"], row["market"])
 
 
+def _fair_group(row: dict) -> str:
+    """Where a logged bet's fair price came from (fair_from): the sharp book, the other books' median
+    (+EV props it doesn't price), or the outlier median. Bets logged before fair_from: "Unknown"."""
+    src = row.get("fair_from") or ""
+    if row.get("kind") == "outlier" or src.startswith("median"):
+        return "Outlier median"
+    if src.startswith("consensus"):
+        return "Other books"
+    return src or "Unknown"
+
+
 CLV_GROUPS = {
     "Bet type": lambda r: {"ev": "+EV", "outlier": "Outliers"}.get(r["kind"], r["kind"]),
     "Market": _market_group,
     "Book": lambda r: r.get("book") or "?",
     "Sport": lambda r: r.get("sport") or "?",
     "Confidence": lambda r: (r.get("confidence") or "not rated").capitalize(),
+    "Fair price from": _fair_group,
 }
 
 
 def clv_breakdown(cfg: Config, days: int | None = None, min_bets: int = 1) -> dict[str, list[tuple]]:
-    """CLV by bet type, market, book, sport and confidence: {group: [(name, n, avg_clv, beat_pct)]}."""
+    """CLV by bet type, market, book, sport, confidence and where the fair price came from:
+    {group: [(name, n, avg_clv, beat_pct)]}."""
     rows = clv_rows(cfg, days)
     out: dict[str, list[tuple]] = {}
     for group, key in CLV_GROUPS.items():
@@ -4881,18 +5148,22 @@ def _book_probs(ev: dict, cfg: Config, now: datetime, is_live: bool) -> dict[tup
 
 def _markout_fair(m: Markout, ev: dict, cfg: Config, now: datetime, is_live: bool, cache: dict) -> float | None:
     """The fair win chance now, by the same yardstick the alert's card used, so "later" compares
-    straight with the edge on the card: Pinnacle's no-vig price (+EV), the median of 4+ books (a
-    +EV prop Pinnacle doesn't price), or the median of the other books, never the alerted one
-    (outliers). None when that yardstick can't price it now (the source is never swapped)."""
+    straight with the edge on the card: Pinnacle's no-vig price (+EV), the consensus of 4+ other
+    books with sister books as one vote (a +EV prop Pinnacle doesn't price), or the median of the
+    other books (outliers). The alerted book never counts. None when that yardstick can't price it
+    now (the source is never swapped)."""
     k = (m.market, m.line)
     if m.ref == "sharp":
         if "sharp" not in cache:
             cache["sharp"] = sharp_fair(ev, cfg, now, is_live)[0]
         return cache["sharp"].get(k, {}).get(m.outcome)
     if m.ref == "consensus":
-        if "consensus" not in cache:
-            cache["consensus"] = consensus_fair(ev, cfg.for_props(), now, is_live, set(_csv(cfg.sharp_books)))
-        return cache["consensus"].get(k, ({}, 0))[0].get(m.outcome)
+        bk = _book_key(ev, m.book)
+        if ("consensus", bk) not in cache:   # the card's own: the prop settings, the alerted book left out
+            cache[("consensus", bk)] = consensus_fair(ev, cfg.for_props(), now, is_live, set(_csv(cfg.sharp_books)),
+                                                      leave_out=bk)
+        c = cache[("consensus", bk)].get(k)
+        return c.probs.get(m.outcome) if c else None
     if m.ref == "median":
         if "books" not in cache:
             cache["books"] = _book_probs(ev, cfg, now, is_live)
@@ -5739,7 +6010,7 @@ One ticket with 2-3 +EV bets from different games, all at the same book. Every l
 
 ⏱ **Price age** on a card: how long the book had shown that price when the alert went out. A live alert only goes out once two checks in a row (about a minute apart) find it and the price is under a minute old, so it's less likely to be gone when you tap. Before a game, a price can sit unchanged for hours: that's normal. Player props don't show one: the book doesn't say when each player's line last moved.
 
-🎯 **Player props** show up as normal +EV, arb or outlier alerts, e.g. "LeBron James Over 25.5 Points".
+🎯 **Player props** show up as normal +EV, arb or outlier alerts, e.g. "LeBron James Over 25.5 Points". When Pinnacle doesn't price a prop, its true odds come from the other books: the card names them, and the stake is 30% smaller. If its card turns 🟡 later, the edge is still there, just less certain.
 
 ❌ **GONE** (grey)
 The chance is over. Ignore it.
@@ -5960,14 +6231,19 @@ class Trackers:
         self.prop_outs = OutlierAlerter(cfg, dry_run=dry, noun="prop outliers")
         self.parlays = ParlayAlerter(cfg, dry_run=dry)
         self.closing = ClosingTracker(cfg)
-        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs):
+        for a in (self.evs, self.prop_evs):
             a.on_log = self.closing.add
+        for a in (self.outs, self.prop_outs):
+            a.on_log = functools.partial(self.closing.add, kind="outlier")
         # Every new alert's price is checked again on the next checks (markouts; not for --once,
         # --demo or --dry-run).
         self.markouts = make_markouts(cfg, args, [self.arbs, self.evs, self.outs,
                                                   self.prop_arbs, self.prop_evs, self.prop_outs])
         self.sharp_history = SharpHistory(cfg.move_window_minutes)
         self.price_history = PriceHistory()
+        # +EV props no sharp prices: spots a book that moved first on news. Its own memory: outliers
+        # store the same keys against a different bar and fair price.
+        self.prop_prices = PriceHistory()
         self.evs.max_per_hour = cfg.max_ev_per_hour
         self.prop_evs.max_per_hour = cfg.max_prop_per_hour
         self.parlays.max_per_hour = cfg.max_parlay_per_hour
@@ -6061,13 +6337,19 @@ def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: d
 
 
 def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: datetime | None = None) -> SimpleNamespace:
-    """One prop check (games before kickoff only, so nothing here is live)."""
+    """One prop check (games before kickoff only, so nothing here is live: the live rules and the
+    live cap never apply; the hourly caps do). A +EV prop no sharp prices goes through the price
+    guard (t.prop_prices), and one with a card up stays while it's at least medium (see find_evs)."""
     cfg = t.cfg
     at = now or datetime.now(timezone.utc)
     ts = at.timestamp()
     take_held(t.prop_arbs, t.prop_outs, t.prop_evs)
+    t.prop_prices.held, t.prop_prices.missed = {}, []
+    carded = {k for a in (t.prop_evs, t.prop_outs) for k in (*a.open, *a.restored)}
     p_outs = find_outliers(prop_events, cfg, at, history=t.price_history)
-    p_evs = without_outliers(find_evs(prop_events, t.prop_cfg, at, history=t.sharp_history), p_outs)
+    p_evs = without_outliers(find_evs(prop_events, t.prop_cfg, at, history=t.sharp_history, prices=t.prop_prices,
+                                      keep=carded), p_outs)
+    t.prop_prices.prune(at)
     hand_over(p_evs, p_outs, t.prop_evs, t.prop_outs, ts)
     note_related([(p_outs, t.prop_outs, checked), (p_evs, t.prop_evs, checked),
                   ([], t.outs, set()), ([], t.evs, set())], ts)
@@ -6076,7 +6358,25 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
     n_ev = t.prop_evs.handle(p_evs, checked_events=checked, now=ts)
     t.closing.observe(prop_events, at)
     t.closing.finalize(at)
-    return SimpleNamespace(n_arb=n_arb, n_out=n_out, n_ev=n_ev, held=take_held(t.prop_arbs, t.prop_outs, t.prop_evs))
+    return SimpleNamespace(n_arb=n_arb, n_out=n_out, n_ev=n_ev, held=take_held(t.prop_arbs, t.prop_outs, t.prop_evs),
+                           prices_held=dict(t.prop_prices.held), missed=list(t.prop_prices.missed))
+
+
+def prop_guard_text(prices_held: dict[str, int], missed: list[list[str]], sharp: str = "Pinnacle") -> str:
+    """The props console line's part on +EV props no sharp prices: prices the guard held back, and
+    lines that cleared the edge but weren't high confidence, with why (to tune the bars from)."""
+    out = ""
+    if n := sum(prices_held.values()):
+        out += (f" | {n} prop price{'' if n == 1 else 's'} held ({prices_held.get('first look', 0)} first look / "
+                f"{prices_held.get('moved first', 0)} moved first)")
+    if missed:
+        why: dict[str, int] = {}
+        for reasons in missed:
+            for r in reasons:
+                why[r] = why.get(r, 0) + 1
+        out += (f" | {len(missed)} no-{sharp} prop{'' if len(missed) == 1 else 's'} missed high ("
+                + ", ".join(f"{c} {r}" for r, c in sorted(why.items(), key=lambda x: (-x[1], x[0]))) + ")")
+    return out
 
 
 def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
@@ -6279,7 +6579,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             p = scan_props(t, prop_events, fetched_gids)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             print(f"[{datetime.now():%H:%M:%S}] props: {len(prop_games)} games ({time.time() - t0:.1f}s) | "
-                  f"{p.n_arb} new arbs, {p.n_ev} new +EV, {p.n_out} new outliers{held_text(p.held)} | "
+                  f"{p.n_arb} new arbs, {p.n_ev} new +EV, {p.n_out} new outliers{held_text(p.held)}"
+                  f"{prop_guard_text(p.prices_held, p.missed, (_csv(cfg.sharp_books) or ['sharp'])[0].title())} | "
                   f"credits left {left}", flush=True)
 
         markouts.update(main_events, prop_events, now)   # after every alert of this pass went out
