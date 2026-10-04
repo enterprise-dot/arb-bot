@@ -258,6 +258,15 @@ record so far. Every morning it posts the whole previous day. Parlays are graded
 pushed leg drops out, like at the books). Grading main lines costs 2 credits per sport with a
 finished bet, at most every `RESULTS_MINUTES` (30).
 
+**ESPN's free scoreboard is checked next to the paid scores** (`FREE_SCORES=shadow`). It doesn't grade
+anything yet: `score_checks.csv` notes, once per game, whether ESPN's final agreed with the Odds API's,
+so it can take over (and save those credits) once it has proven itself. It only counts a final when
+everything checks out: a final status, the teams the right way round, the periods adding up, no tied
+hockey, basketball or baseball final, and in hockey ESPN's winner flag. `--results` prints how often
+it agreed. **Rain-shortened MLB games:** when a game ends before the 9th inning, run lines and totals
+on it show once on the results card as 🌧️ "game ended early (rain): check your book" (books usually
+void them), and they don't count in the record. The moneyline is still graded.
+
 **Player props are graded from ESPN box scores** (free, no credits): points, rebounds, assists,
 threes (NBA), goals, assists, points, shots on goal (NHL), passing/rushing/receiving yards and
 receptions (NFL, college), hits and pitcher strikeouts (MLB). Before trusting a box score the bot
@@ -339,33 +348,72 @@ Needs Python 3.10+. No packages to install.
 | **Out-of-season sports cost nothing.** | List every sport you care about. They only cost credits once games are on. |
 | **Stops checking a game once books pull it** (the game ended). | It doesn't keep paying for a game that's over. |
 | **Budget autopilot.** Every few minutes it compares the next 24h of games with the credits you have left and the days until reset. | Checks every 60s when you can afford it. On a packed day it slows down *just enough* to make the credits last. It never runs dry mid-month. |
+| **Optional: live checks ask for moneylines only** (`LIVE_MARKETS=h2h`, off by default). | A live check costs 1 credit instead of 3, and it brings every upcoming game's moneyline in that sport along. Spreads and totals of upcoming games get their own pre-game check (2 credits) with every live check (`PREGAME_WITH_LIVE_EVERY=1`), so at full speed a sport with a live game costs 3 credits a minute, as before. The saving comes on a tight day (next row) and once no later game is waiting. Live spreads and totals aren't checked, so those live alerts stop. |
+| **With that on, on a tight day the live check slows down first** (up to every 3 minutes, `LIVE_MAX_STRETCH`). | The spreads and totals of later games keep their every-minute check, and the other pre-game checks keep their pace. Upcoming games' moneylines come with the live check, so they slow down with it. If that isn't enough, upcoming-game checks slow down, then early props and games 1-2 days out slow down further, and only then the rest. The log says once a day when live checks have stayed at their slowest for half an hour. |
+| **Spare credits buy faster pre-game checks, never faster live ones.** | Near kickoff first (down to every 3 min), then later today (every 15 min), early props (hourly), props near kickoff (every 15 min), and 1-2 days out last. What's left over carries over to the coming days. |
+| **It learns what each check really costs.** The API says after every call what it charged. | Player props cost only what books have posted (an empty answer is free), so early prop checks usually cost less than the formula. `--plan` shows the measured costs, and the daily summary says where the credits went. |
 | **Pre-game checks are slower** (every 15 min, only in the 2h before kickoff). | Pre-game gaps last longer, so they don't need minute-by-minute checks. These checks also feed the +EV alerts. |
 | **Checks all due sports at once, in parallel.** | An alert goes out within seconds of the check. |
 | **Bookmaker trick** (on by default) | Up to 10 named books cost the same as one region, so adding Pinnacle (EU) to your US books costs nothing. |
 
-Each check of a sport costs **(# bet types) × (# regions)** credits, which is **3** with the defaults.
+Each check of a sport costs **(# bet types) × (# regions)** credits: **3** with the defaults. With
+`LIVE_MARKETS=h2h`: **1** for a live check (moneylines only) and **2** for the pre-game check of a
+sport that also has a live game (with every live check).
+**Why it's off by default:** in a full-month simulation it checked tonight's and tomorrow's
+spreads/totals more often, but the moneylines of later games in a sport with a live game 30-55% less
+often (they ride on the live check, which slows first). Turn it on if you'd rather have fewer live
+checks and more spreads/totals: `--set LIVE_MARKETS=h2h`.
+
+**Testing a cheaper live check:** one combined call might cover every sport's live games at once.
+Before the bot uses it, check it a few times on a busy night (2+ sports live):
+`python arbbot.py --check-upcoming`. It costs about 1 credit plus 1 per sport with a live game, changes
+nothing, and says whether the combined call had every live game and book the sports' own calls have.
 
 ## Upcoming games, not just live ones
 
 | Game starts | Main lines | Player props |
 |---|---|---|
-| Live | every 60s | none |
-| Within 2h (props: 3h) | every 15 min | every 30 min |
-| Within 24h | every hour | every 4 hours |
-| Within 48h | every 3 hours | none |
+| Live | moneylines every 60s (locks mode; other modes: every bet type) | none |
+| Within 2h (props: 3h) | every 15 min, down to every 3 min with spare credits | every 30 min, down to 15 |
+| Within 24h | every hour, down to every 15 min | every 4 hours, down to 1 hour |
+| Within 48h | every 3 hours, down to every hour | none |
 
-One main-line check covers every game in a sport, so watching tomorrow's games costs almost
-nothing. Early lines are often the softest, so +EV, outlier and parlay alerts for later games show
-up well before kickoff (cards show the day: "Starts Sun 1:00 PM"). When credits are tight, the
-upcoming-game checks slow down first; live and near-kickoff checks keep at least half the budget.
+While a game in a sport is live, the live check also brings every upcoming game's moneyline in that
+sport every 60 seconds, for the same credit, and their spreads and totals come every 60 seconds too,
+in their own check (`PREGAME_WITH_LIVE_EVERY`). One check covers every game in a sport, so watching
+tomorrow's games costs almost nothing. Early lines are often the softest, so +EV, outlier and parlay
+alerts for later games show up well before kickoff (cards show the day: "Starts Sun 1:00 PM").
+
+When credits are tight, live checks slow down first (locks mode: up to every 3 minutes, and the
+moneylines of upcoming games with them), then the upcoming-game checks (early props and games 1-2
+days out most); the spreads and totals of later games and near-kickoff checks slow down last, and
+keep at least half the budget. On a day with credits to spare, the faster pre-game pace above uses
+them (at most 85% of the day's share, `SPARE_USE_PCT`).
+`--plan` and the log's "Budget:" line say which checks were slowed down or sped up.
 
 ## What the $59 plan gets you
 
-With 4 sports and all 3 bet types, a typical day has around 12–16 hours of live games
-added up across sports. At one check a minute that's about 2,200–2,900 credits a day,
-and the plan allows about 3,300 a day. So most days run at **full speed (every 60s)**. On the
-busiest days the autopilot stretches checks to 70–90 seconds. Run `--plan` any time to see
-the actual numbers for today.
+With 4 sports, a typical day has around 12–16 hours of live games added up across sports. At full
+speed a sport with a live game costs 3 credits a minute: 1 for the live check (moneylines of every
+game) and 2 for the spreads and totals of its later games, both every minute. The plan allows about
+3,300 a day, so on busy days the live check slows down first (up to every 3 minutes) and the credits
+go to games that haven't started. A simulated October (88K credits left on Oct 4, reset Nov 4; NFL,
+college football, MLB playoffs, NHL, NBA, props on), old setup → now, average checks per game:
+
+| Sport | Spreads & totals, last 2h | Spreads & totals, 2–24h out | Moneyline, last 2h | Moneyline, 2–24h out | Live check, typical gap |
+|---|---|---|---|---|---|
+| NFL | 68 → **74** | 133 → **154** | 68 → 49 | 133 → 99 | 64s → 70s |
+| College football | 67 → **83** | 392 → **511** | 67 → 43 | 392 → 203 | 77s → 156s |
+| MLB | 24 → **33** | 191 → **241** | 24 → 15 | 191 → 128 | 81s → 178s |
+| NHL | 41 → **52** | 243 → **315** | 41 → 27 | 243 → 135 | 79s → 180s |
+| NBA | 42 → **51** | 175 → **223** | 42 → 25 | 175 → 92 | 86s → 180s |
+
+Spreads and totals of games that haven't started are checked 10–35% more often in every sport, and
+the night's first games get a few more checks near kickoff than before. Moneylines of later games
+come with the live check, so on a tight day they slow down with it: they're checked about a third to
+half less often than before. Live spreads and totals aren't checked at all. The credits lasted the
+month in every run, also with real costs 30% above the formula. Run `--plan` any time to see the
+actual numbers for today.
 
 ## Run it 24/7 on a server (~$5/month)
 

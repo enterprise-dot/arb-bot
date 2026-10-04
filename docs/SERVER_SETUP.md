@@ -198,7 +198,8 @@ Run these one at a time and read what each prints.
    You should see a small grid of sports and hours, then a line about credits.
    *If it says the key was rejected (401), the Odds API key in `.env` is wrong.*
 
-3. **Check the book names** (one real check, costs about 3 credits):
+3. **Check the book names** (one real check, costs a few credits: 3 per sport, or 1 + 2 for a sport
+   with a live game):
    ```bash
    sudo -u arbbot python3 /opt/arb-bot/arbbot.py --once --dry-run
    ```
@@ -254,6 +255,9 @@ Open the console the same way (Droplet → Access → Launch Droplet Console), t
 | Post today's results to Discord | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --post-results` |
 | Check prop grading works | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --check-props` |
 | Check the Kalshi second opinion | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --check-kalshi` |
+| Test the cheaper combined live check (on a night with 2+ sports live; about 1 credit + 1 per live sport) | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --check-upcoming` |
+| See whether ESPN's free scores agreed with the paid ones | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --results` (last lines), or `cat /opt/arb-bot/score_checks.csv` |
+| Where the credits go, and what each check really costs | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --plan` |
 | Get the latest code | Happens by itself every 10 minutes once automatic updates are on (step 6). By hand: `cd /opt/arb-bot && sudo -u arbbot git pull && systemctl restart arbbot` |
 | See what the updater did | `journalctl -u arbbot-update -n 30` |
 | Turn automatic updates off / on | `systemctl disable --now arbbot-update.timer` / `bash /opt/arb-bot/deploy/enable-auto-update.sh` |

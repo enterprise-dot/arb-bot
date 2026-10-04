@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-from arbbot import (LIVE, PREGAME, EARLY, FAR, Alerter, Config, EVAlerter, OutlierAlerter, Scheduler,
+from arbbot import (LIVE, PREGAME, EARLY, FAR, PRE_LIVE, Alerter, Config, EVAlerter, OutlierAlerter, Scheduler,
                     demo_events, devig, find_outliers, outlier_payload, without_outliers,
                     discord_payload, ev_payload, ev_record, find_arbs, find_evs, kelly_stake,
                     next_reset, seconds_until_active, settle, settle_pending,
@@ -4324,6 +4324,22 @@ def mix_event(home, away, sharp=(1.91, 1.91), ev_id="e1", start="2026-10-03T18:0
     return ev
 
 
+def asked(events, markets=None, since=None):
+    """What a fake /odds call answers for these arguments: only the bet types asked for, and with
+    `since` only games starting after it (LIVE_MARKETS: the live and the pre-game checks)."""
+    import copy
+    keep = set(markets.split(",")) if markets else None
+    out = []
+    for ev in events:
+        if since is not None and _parse(ev["commence_time"]) <= since:
+            continue
+        ev = copy.deepcopy(ev)
+        for bm in ev["bookmakers"] if keep is not None else []:
+            bm["markets"] = [m for m in bm["markets"] if m["key"] in keep]
+        out.append(ev)
+    return out
+
+
 def age_book(ev, title, secs, when=NOW):
     """That book's prices were last updated secs before `when`."""
     bm = next(b for b in ev["bookmakers"] if b["title"] == title)
@@ -4345,7 +4361,8 @@ class MixFiles(unittest.TestCase):
         self.files = dict(log_file=str(d / "arbs.csv"), ev_log_file=str(d / "ev.csv"),
                           outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"),
                           markout_file=str(d / "mk.csv"), ev_results_file=str(d / "res.csv"),
-                          parlay_log_file=str(d / "par.csv"), state_dir=str(d / "state"))
+                          parlay_log_file=str(d / "par.csv"), state_dir=str(d / "state"),
+                          score_check_file=str(d / "sc.csv"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -4809,12 +4826,12 @@ class LiveAlertsHoldUp(MixFiles):
             def events(self, sport, horizon_hours=26):
                 return [{"id": "live1", "commence_time": live_start}, {"id": "pre1", "commence_time": pre_start}]
 
-            def odds(self, sport, until):
+            def odds(self, sport, until, markets=None, since=None, kind="odds"):   # (locks: LIVE_MARKETS=h2h)
                 secs = (datetime.now(timezone.utc) - NOW).total_seconds()
                 live = outlier_event(1.85, 1.95, start=live_start)
                 live.update(id="live1", sport_key="basketball_nba")
                 pre = mix_event(2.25, 1.98, ev_id="pre1", start=pre_start)
-                return [stamped(live, secs), stamped(pre, secs)]
+                return asked([stamped(live, secs), stamped(pre, secs)], markets, since)
 
             def event_odds(self, sport, gid, markets):   # a prop arb in the same game
                 prop = priced_prop({"Pinnacle": (2.0, 2.0), "DK": (2.20, 1.80), "FD": (1.80, 2.05)}, start=pre_start)
@@ -6108,6 +6125,1411 @@ class PropsInLocks(MixFiles):
         self.assertTrue(t1.startswith("↘️ Back to a normal +EV edge"))
         self.assertTrue(t2.startswith("📈 +EV 13.0%"))
         self.assertNotIn("@here", c2)                                              # medium in locks: no ping
+
+
+# --------------------------------------------------------------------------- credits: real costs, live checks
+# on moneylines, spare credits to pre-game, free ESPN finals (shadow), the "upcoming" probe
+
+def three_markets(gid, start, sport="basketball_nba", home=(2.0, 1.85, 1.9), away=(1.85, 2.0, 1.9)):
+    """A game with moneylines, spreads and totals at books A and B (no arb unless the prices make one)."""
+    iso = start if isinstance(start, str) else start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ev = event({"A": [("h2h", [("Home", home[0], None), ("Away", away[0], None)]),
+                      ("spreads", [("Home", home[1], -3.5), ("Away", away[1], 3.5)]),
+                      ("totals", [("Over", home[2], 220.5), ("Under", away[2], 220.5)])],
+                "B": [("h2h", [("Home", away[0], None), ("Away", home[0], None)]),
+                      ("spreads", [("Home", away[1], -3.5), ("Away", home[1], 3.5)]),
+                      ("totals", [("Over", away[2], 220.5), ("Under", home[2], 220.5)])]}, start=iso)
+    ev.update(id=gid, sport_key=sport)
+    return ev
+
+
+class CallCosts(unittest.TestCase):
+    """The budget runs on what calls really cost (x-requests-last), not markets x regions."""
+
+    def test_costbook_moves_from_the_formula_to_measured_costs(self):
+        b = _arbbot.CostBook()
+        k = "props:basketball_nba:12h"
+        self.assertEqual(b.estimate(k, 4), 4)                      # no calls yet: the formula
+        for _ in range(3):
+            b.add(k, 0, 4)                                         # empty answers are free
+        self.assertAlmostEqual(b.estimate(k, 4), 2.0)              # 3 calls weigh as much as the formula
+        for _ in range(40):
+            b.add(k, 1, 4)
+        self.assertLess(b.estimate(k, 4), 1.3)                     # the formula fades as calls come in
+        for bad in (None, -1, 500, float("nan")):
+            b.add("odds:live", bad, 1)                             # no header or nonsense: ignored
+        self.assertEqual(b.calls("odds:live", 1), 0)
+        self.assertEqual(b.estimate(k, 3), 3)                      # new PROP_MARKETS: starts again
+        self.assertEqual(b.take_today(), {k: 40.0})
+        self.assertEqual(b.today, {})
+
+    def test_costs_survive_a_restart_and_show_in_the_plan(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "state" / "call_costs.json"
+            b = _arbbot.CostBook(path)
+            for _ in range(3):
+                b.add("odds:live", 1, 1)
+            b.save()
+            again = _arbbot.CostBook(path)
+            self.assertEqual((again.calls("odds:live", 1), again.estimate("odds:live", 1)), (3, 1.0))
+            path.write_text("not json")
+            self.assertEqual(_arbbot.CostBook(path).stats, {})     # unreadable: back to the formula
+        cfg = Config(sports=["basketball_nba"], live_markets="h2h", prop_sports=["basketball_nba", "icehockey_nhl"])
+        s = sched_with({"basketball_nba": []}, cfg)
+        s.api.costs = again
+        for _ in range(3):
+            again.add("odds:pre", 1, 2)                                # an answer can cost less than the formula
+            again.add("props:basketball_nba:12h", 0, 4)
+        lines = _arbbot.cost_lines(cfg, s)
+        self.assertIn("1.0 (measured over 3 calls; formula 1) for the live check", lines[0])
+        self.assertIn("1.5 (measured over 3 calls; formula 2) for the pre-game check (spreads,totals", lines[0])
+        self.assertIn("2.0 (measured over 3 calls; formula 4) up to 12h out", lines[2])
+        self.assertEqual(lines[3], "NHL props per game: 3 (formula; measured once props are checked)")
+
+    def test_each_call_records_its_own_cost(self):
+        import io, json
+        from unittest import mock
+        from urllib.parse import parse_qs, urlparse
+
+        class Resp:
+            def __init__(self, body, cost):
+                self.body, self.headers = body, {"x-requests-last": str(cost), "x-requests-remaining": "900"}
+            def read(self):
+                return json.dumps(self.body).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        api = _arbbot.OddsAPI(Config(api_key="k", state_dir=""))
+        now = datetime.now(timezone.utc)
+        iso = lambda h: (now + timedelta(hours=h)).isoformat()
+        replies = [Resp([], 3), Resp([], 1), Resp([], 2), Resp({"commence_time": iso(1), "bookmakers": [1]}, 4),
+                   Resp({"commence_time": iso(5), "bookmakers": [1]}, 1),
+                   Resp({"commence_time": iso(20), "bookmakers": []}, 0), Resp([], 2)]
+        urls = []
+
+        def urlopen(req, timeout=None):
+            urls.append(parse_qs(urlparse(req.full_url).query))
+            return replies.pop(0)
+        props = "player_points,player_rebounds,player_assists,player_threes"
+        with mock.patch("urllib.request.urlopen", urlopen):
+            api.odds("basketball_nba", now)
+            api.odds("basketball_nba", now, markets="h2h", kind="odds:live")
+            api.odds("basketball_nba", now, markets="spreads,totals", since=now, kind="odds:pre")
+            for gid in ("g1", "g2", "g3"):
+                api.event_odds("basketball_nba", gid, props)
+            api.scores("basketball_nba")
+        self.assertEqual(api.costs.today, {"odds": 3, "odds:live": 1, "odds:pre": 2, "props:basketball_nba:near": 4,
+                                           "props:basketball_nba:6h": 1, "props:basketball_nba:24h": 0, "scores": 2})
+        self.assertEqual((api.costs.calls("odds:live", 1), api.costs.calls("odds:pre", 2)), (1, 1))
+        self.assertEqual([u["markets"][0] for u in urls[:3]], ["h2h,spreads,totals", "h2h", "spreads,totals"])
+        self.assertEqual(["commenceTimeFrom" in u for u in urls[:3]], [False, False, True])
+
+    def test_budget_uses_measured_prop_costs_by_hours_to_start(self):
+        cfg = Config(sports=["basketball_nba"], prop_sports=["basketball_nba"], spare_use_pct=0)
+        tomorrow = {"basketball_nba": [(f"g{i}", NOW + timedelta(hours=20)) for i in range(5)]}   # 4am ET Sunday
+        s = sched_with(tomorrow, cfg, remaining=60_000)
+        s.update_budget(NOW)
+        formula = s.demand[_arbbot.PROP_EARLY]
+        s.api.costs = _arbbot.CostBook()
+        for bucket in ("6h", "12h", "24h"):
+            for _ in range(20):
+                s.api.costs.add(f"props:basketball_nba:{bucket}", 0.2, 4)   # few props posted this early
+        s.update_budget(NOW)
+        self.assertLess(s.demand[_arbbot.PROP_EARLY], formula * 0.3)
+        # Today's games: never below the near-kickoff cost (books post the day's props by morning).
+        self.assertLess(s.prop_cost("basketball_nba", 10, today=False), 1)
+        self.assertEqual(s.prop_cost("basketball_nba", 10, today=True), 4)
+        for _ in range(20):
+            s.api.costs.add("props:basketball_nba:near", 2.0, 4)
+        self.assertAlmostEqual(s.prop_cost("basketball_nba", 10, today=True), s.prop_cost("basketball_nba", 1), 6)
+
+    def test_the_bots_daily_summary_says_where_credits_went(self):
+        import argparse, contextlib, io
+        from unittest import mock
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+        clock = {"started": False}
+
+        class Clock(datetime):   # the bot starts at 8am; its loop runs at 10am, past the 9am summary
+            @classmethod
+            def now(cls, tz=None):
+                t = datetime(2026, 10, 4, 10 if clock["started"] else 8, 0, tzinfo=ny)
+                if isinstance(tz, ZoneInfo):
+                    clock["started"] = True
+                return t.astimezone(tz) if tz else t.replace(tzinfo=None)
+
+        class Api:
+            remaining, used = 50000.0, None
+            def __init__(self, cfg):
+                self.costs = _arbbot.CostBook()
+                self.costs.add("odds:live", 1, 1)
+                self.costs.add("props:basketball_nba:near", 4, 4)
+            def events(self, sport, horizon_hours=26):
+                return []
+        cfg = replace(LiveMoneylinesOnly.default_cfg(), summary_hour=9)
+        cards = []
+        args = argparse.Namespace(once=False, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        with mock.patch("arbbot.OddsAPI", Api), mock.patch("arbbot.datetime", Clock), \
+                mock.patch.object(_arbbot.Status, "send_card", lambda status, payload: cards.append(payload)), \
+                mock.patch("arbbot.time.sleep", side_effect=StopLoop), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(StopLoop):
+                _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        [card] = cards
+        self.assertIn("Used since the last summary: 1 on live checks, 4 on props", card["embeds"][0]["description"])
+
+    def test_daily_summary_says_where_credits_went(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(closing_file=str(Path(d) / "c.csv"), ev_log_file=str(Path(d) / "e.csv"),
+                         outlier_log_file=str(Path(d) / "o.csv"), markout_file=str(Path(d) / "m.csv"))
+            card = _arbbot.summary_payload(cfg, [], 50_000, {"odds:live": 410, "odds:pre": 300.4, "odds": 50,
+                                                             "props:basketball_nba:near": 120, "scores": 8})
+        self.assertIn("Used since the last summary: 410 on live checks, 300 on pre-game checks, 120 on props, "
+                      "8 on scores, 50 on main-line checks", card["embeds"][0]["description"])
+
+
+class LiveMoneylinesOnly(unittest.TestCase):
+    """LIVE_MARKETS: live checks ask for moneylines only (1 credit, every game in the sport, every
+    minute); the other bet types of upcoming games get their own pre-game check."""
+
+    def env(self, **values):
+        import os
+        from unittest import mock
+        keys = ("ALERT_MODE", "LIVE_MARKETS", "LIVE_MAX_STRETCH", "MARKETS", "EARLY_MINUTES", "EARLY_MIN_MINUTES",
+                "PREGAME_MIN_MINUTES", "SPARE_USE_PCT", "FREE_SCORES", "PREGAME_WITH_LIVE_EVERY")
+        patch = mock.patch.dict(os.environ, {k: v for k, v in values.items()})
+        patch.start()
+        self.addCleanup(patch.stop)
+        for k in keys:
+            if k not in values:
+                os.environ.pop(k, None)
+        return Config.from_env()
+
+    def test_locks_mode_checks_live_games_for_moneylines_only(self):
+        cfg = self.env(ALERT_MODE="locks")
+        self.assertEqual((cfg.live_markets, cfg.split_markets()), ("", None))   # off unless asked for
+        cfg = self.env(ALERT_MODE="locks", LIVE_MARKETS="h2h")
+        self.assertEqual((cfg.live_markets, cfg.live_max_stretch, cfg.split_markets()), ("h2h", 3.0, ("h2h", "spreads,totals")))
+        balanced = self.env(ALERT_MODE="balanced")
+        self.assertEqual((balanced.live_markets, balanced.split_markets()), ("", None))
+        self.assertEqual(balanced.live_max_stretch, Config().live_max_stretch)      # one default, both ways
+        self.assertIsNone(self.env(ALERT_MODE="locks", LIVE_MARKETS="totals,h2h,spreads").split_markets())  # opt out
+        self.assertEqual(self.env(ALERT_MODE="locks", MARKETS="spreads,totals").live_markets, "")         # no moneylines
+        self.assertEqual(self.env(ALERT_MODE="locks", LIVE_MARKETS="h2h", LIVE_MAX_STRETCH="1").live_max_stretch, 1)  # yours wins
+
+    def test_new_settings_are_checked(self):
+        for key, value in (("LIVE_MARKETS", "h2h,player_points"), ("EARLY_MIN_MINUTES", "-1"),
+                           ("PREGAME_MIN_MINUTES", "20"), ("SPARE_USE_PCT", "96"), ("LIVE_MAX_STRETCH", "0.5"),
+                           ("FREE_SCORES", "on"), ("PREGAME_WITH_LIVE_EVERY", "-1"),
+                           ("PREGAME_WITH_LIVE_EVERY", "1.5")):
+            with self.assertRaises(ValueError) as e:
+                self.env(**{key: value})
+            self.assertTrue(str(e.exception).startswith(key), str(e.exception))
+        self.assertEqual(self.env(EARLY_MINUTES="10").early_min_minutes, 10)    # an unset floor never blocks
+        self.assertEqual(self.env(EARLY_MIN_MINUTES="0").early_min_minutes, 0)
+        self.assertEqual([self.env(**({"PREGAME_WITH_LIVE_EVERY": v} if v else {})).pregame_with_live_every
+                          for v in ("", "3", "0")], [1, 3, 0])
+
+    def test_lanes_and_forecast(self):
+        live_game, later = ("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(hours=6))
+        base = Config(sports=["basketball_nba"], props_enabled=False, spare_use_pct=0)
+        one = sched_with({"basketball_nba": [live_game, later]}, base, remaining=60_000)
+        two = sched_with({"basketball_nba": [live_game, later]}, replace(base, live_markets="h2h"), remaining=60_000)
+        self.assertEqual(one.lanes("basketball_nba", NOW), [("all", LIVE)])
+        self.assertEqual(two.lanes("basketball_nba", NOW), [("live", LIVE), ("pre", PRE_LIVE)])
+        self.assertEqual(two.lanes("basketball_nba", NOW + timedelta(hours=3)), [("all", EARLY)])   # nothing live
+        one.update_budget(NOW)
+        two.update_budget(NOW)
+        # 2h10m left of g1, then 2h40m of g2: 290 live checks x 3 credits vs x 1, plus g2's spreads
+        # and totals with every live check while g1 is on (130 checks x 2 credits): the same 3 credits
+        # a minute while a later game is waiting, a third of it once none is.
+        self.assertAlmostEqual(one.demand[LIVE], 290 * 3, delta=15)
+        self.assertAlmostEqual(two.demand[LIVE], 290 * 1, delta=5)
+        self.assertAlmostEqual(two.demand[PRE_LIVE], 130 * 2, delta=5)
+        self.assertLess(two.forecast, one.forecast * 0.65)
+        every2 = sched_with({"basketball_nba": [live_game, later]}, replace(base, live_markets="h2h",
+                                                                             pregame_with_live_every=2), remaining=60_000)
+        every2.update_budget(NOW)
+        self.assertAlmostEqual(every2.demand[PRE_LIVE], 65 * 2, delta=5)           # every 2nd live check
+
+    def test_later_games_spreads_come_with_every_live_check(self):
+        g = {"basketball_nba": [("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(hours=6)),
+                                ("g3", NOW + timedelta(minutes=90))]}
+        cfg = Config(sports=["basketball_nba"], props_enabled=False, live_markets="h2h")
+        s = sched_with(g, cfg)
+        self.assertEqual(s.lanes("basketball_nba", NOW), [("live", LIVE), ("pre", PRE_LIVE)])
+        self.assertEqual((s.interval(LIVE), s.interval(PRE_LIVE)), (60, 60))       # 1 + 2 credits a minute
+        s.last_live["basketball_nba"] = s.last_odds["basketball_nba"] = time.time() - 61
+        self.assertEqual(s.due(NOW) and s._due_lanes["basketball_nba"], [("live", LIVE), ("pre", PRE_LIVE)])
+        every3 = replace(cfg, poll_seconds=45, pregame_with_live_every=3)
+        self.assertEqual(sched_with(g, every3).interval(PRE_LIVE), 135)
+        # 0: the normal pre-game pace. A slower setting than that pace: the normal pace (whichever is faster).
+        self.assertEqual(sched_with(g, replace(cfg, pregame_with_live_every=0)).lanes("basketball_nba", NOW)[1],
+                         ("pre", PREGAME))
+        self.assertEqual(sched_with(g, replace(cfg, pregame_with_live_every=20)).lanes("basketball_nba", NOW)[1],
+                         ("pre", PREGAME))                                           # 20 min vs 15 near kickoff
+        far = {"basketball_nba": g["basketball_nba"][:2]}
+        self.assertEqual(sched_with(far, replace(cfg, pregame_with_live_every=20)).lanes("basketball_nba", NOW)[1],
+                         ("pre", PRE_LIVE))                                          # 20 min vs hourly 6h out
+        s = sched_with(g, replace(cfg, pregame_with_live_every=2))                 # every 2nd live check
+        self.assertEqual(s.interval(PRE_LIVE), 120)
+        s.last_live["basketball_nba"] = s.last_odds["basketball_nba"] = time.time() - 61
+        self.assertEqual((s.due(NOW), s._due_lanes["basketball_nba"]), (["basketball_nba"], [("live", LIVE)]))
+        s.last_live["basketball_nba"] = s.last_odds["basketball_nba"] = time.time() - 121
+        self.assertEqual(s.due(NOW) and s._due_lanes["basketball_nba"], [("live", LIVE), ("pre", PRE_LIVE)])
+
+    def test_on_a_tight_day_later_games_keep_their_pace_while_live_checks_slow(self):
+        # A weeknight with too few credits: the 10pm game's spreads and totals, while its sport has a
+        # live game, still come every minute; the live check slows down to pay for it.
+        games = {"basketball_nba": [("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(hours=2, minutes=30))],
+                 "icehockey_nhl": [("h1", NOW + timedelta(hours=20))]}
+        cfg = Config(sports=["basketball_nba", "icehockey_nhl"], props_enabled=False, live_markets="h2h",
+                     live_max_stretch=3)
+        s = sched_with(games, cfg, remaining=31 * 300)
+        s.update_budget(NOW)
+        self.assertEqual(s.lanes("basketball_nba", NOW)[1], ("pre", PRE_LIVE))
+        self.assertGreater(s.live_scale, 1.2)
+        self.assertGreater(s.interval(LIVE), 70)
+        self.assertEqual((s.scale, s.interval(PRE_LIVE)), (1.0, 60))
+        spend = (s.demand[LIVE] / s.live_scale + s.demand[PRE_LIVE] + s.demand[PREGAME] + s.demand[EARLY]
+                 + s.demand[FAR])
+        self.assertAlmostEqual(spend, s.allowance, delta=2)                        # the plan pays for it
+        s.last_live["basketball_nba"], s.last_odds["basketball_nba"] = time.time() - 70, time.time() - 121
+        s.last_odds["icehockey_nhl"] = time.time()
+        self.assertEqual(s.due(NOW) and s._due_lanes["basketball_nba"], [("pre", PRE_LIVE)])   # live not yet
+        [line] = _arbbot.pace_lines(cfg, s)
+        self.assertIn("so pre-game checks keep their pace, spreads and totals of later games in sports with a "
+                      "live game included (every 60s).", line)
+        # Tighter still: live checks at their most, then everything slows, this check too.
+        tighter = sched_with(games, cfg, remaining=31 * 100)
+        tighter.update_budget(NOW)
+        self.assertEqual(tighter.live_scale, 3)
+        self.assertGreater(tighter.scale, 1.5)
+        self.assertAlmostEqual(tighter.interval(PRE_LIVE), 60 * tighter.scale)
+        self.assertAlmostEqual(tighter.core_demand, tighter.demand[LIVE] / 3 + tighter.demand[PRE_LIVE]
+                               + tighter.demand[PREGAME])
+        lines = "\n".join(_arbbot.pace_lines(cfg, tighter))
+        self.assertIn("as far as LIVE_MAX_STRETCH allows. That wasn't enough:", lines)
+        self.assertIn("spreads and totals of later games in sports with a live game every 3m instead of 60s.", lines)
+
+    def test_fetch_asks_each_check_for_the_right_games_and_bet_types(self):
+        calls = []
+        games = [three_markets("g1", NOW - timedelta(minutes=30)), three_markets("g2", NOW + timedelta(hours=6))]
+
+        class Api:
+            remaining = None
+            def odds(self, sport, until, markets=None, since=None, kind="odds"):
+                calls.append((sport, kind, markets, since, until))
+                if sport == "icehockey_nhl":
+                    return []
+                return [] if kind == "odds:live" and len(calls) > 4 else asked(games, markets, since)
+        cfg = Config(sports=["basketball_nba", "icehockey_nhl"], live_markets="h2h")
+        s = sched_with({"basketball_nba": [("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(hours=6))],
+                        "icehockey_nhl": [("h1", NOW + timedelta(hours=3))]}, cfg)
+        s.api = Api()
+        events, ok = s.fetch(["basketball_nba", "icehockey_nhl"], NOW)
+        by = {(c[0], c[1]): c for c in calls}
+        live, pre, nhl = by[("basketball_nba", "odds:live")], by[("basketball_nba", "odds:pre")], by[("icehockey_nhl", "odds")]
+        self.assertEqual((live[2], live[3]), ("h2h", None))
+        self.assertGreater(live[4], NOW + timedelta(hours=47))      # upcoming games' moneylines come along
+        self.assertEqual((pre[2], pre[3]), ("spreads,totals", NOW))  # the rest, games not started
+        self.assertEqual(nhl[2:4], (None, None))                     # no live game: one check, everything
+        self.assertEqual(ok, {"basketball_nba", "icehockey_nhl"})
+        self.assertEqual([e["id"] for e in events], ["g1", "g2"])   # one event per game...
+        [g2] = [e for e in events if e["id"] == "g2"]
+        self.assertEqual({m["key"] for m in g2["bookmakers"][0]["markets"]}, {"h2h", "spreads", "totals"})   # ...all of it
+        for _ in range(3):                                           # pre-game checks alone never "lose" g1
+            s._due_lanes = {"basketball_nba": [("pre", EARLY)]}
+            s.fetch(["basketball_nba"], NOW)
+        self.assertNotIn("g1", s.ended)
+        games.pop(0)                                                 # g1 is over: no book lists it
+        for _ in range(2):                                           # ...the live check notices
+            s._due_lanes = {"basketball_nba": [("live", LIVE), ("pre", EARLY)]}
+            s.fetch(["basketball_nba"], NOW)
+        self.assertIn("g1", s.ended)
+
+    def scope(self, s, lanes, now, answer=()):
+        class Api:
+            remaining = None
+            def odds(self, sport, until, markets=None, since=None, kind="odds"):
+                return asked(list(answer), markets, since)
+        s.api = Api()
+        s._due_lanes = lanes
+        events, _ = s.fetch(list(lanes), now)
+        return events, s.scope
+
+    def test_each_check_closes_only_what_it_looked_at(self):
+        cfg = replace(CFG, sports=["basketball_nba", "icehockey_nhl"], live_markets="h2h", live_sports=["basketball_nba"],
+                      log_file="", state_dir="")
+        nba = {"basketball_nba": [("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(hours=6))],
+               "icehockey_nhl": [("h1", NOW - timedelta(minutes=1)), ("h2", NOW + timedelta(hours=5))]}
+        s = sched_with(nba, cfg)
+        a = Alerter(cfg, dry_run=True)
+        arb = lambda gid, start, sport="basketball_nba": find_arbs([three_markets(
+            gid, start, sport, home=(2.2, 2.2, 2.2), away=(1.7, 1.7, 1.7))], cfg, NOW)
+        live_ml = [x for x in arb("g1", NOW - timedelta(minutes=30)) if x.market == "h2h"]
+        started_sp = [replace(x, is_live=False) for x in arb("g1", NOW - timedelta(minutes=30)) if x.market == "spreads"]
+        later = arb("g2", NOW + timedelta(hours=6))
+        nhl = arb("h1", NOW - timedelta(minutes=1), "icehockey_nhl") + arb("h2", NOW + timedelta(hours=5), "icehockey_nhl")
+        a.handle(live_ml + started_sp + later + nhl, now=1000)
+        self.assertEqual(len(a.open), 1 + 1 + 3 + 6)
+        has = lambda gid, m: any(k.startswith(f"{gid}|{m}|") for k in a.open)
+        # A live check (moneylines, every game) that finds nothing: the moneylines close, live and
+        # upcoming; g2's spreads/totals stay (it didn't ask for those). A started game's spread is gone
+        # (only moneylines are checked live). NHL wasn't checked, so all of its alerts stay.
+        a.handle([], now=1060, checked_events=self.scope(s, {"basketball_nba": [("live", LIVE)]}, NOW)[1])
+        self.assertEqual((has("g1", "h2h"), has("g2", "h2h"), has("g1", "spreads")), (False, False, False))
+        self.assertEqual((has("g2", "spreads"), has("g2", "totals")), (True, True))
+        self.assertEqual({k.split("|")[0] for k in a.open}, {"g2", "h1", "h2"})
+        # The pre-game check (spreads and totals of upcoming games) closes g2's.
+        a.handle([], now=1120, checked_events=self.scope(s, {"basketball_nba": [("pre", EARLY)]}, NOW)[1])
+        self.assertEqual({k.split("|")[0] for k in a.open}, {"h1", "h2"})
+        # NHL has no live check (LIVE_SPORTS): its own check asks for every game, started h1 too.
+        self.assertEqual(s.lanes("icehockey_nhl", NOW), [("all", EARLY)])
+        a.handle([], now=1180, checked_events=self.scope(s, {"icehockey_nhl": [("all", EARLY)]}, NOW)[1])
+        self.assertEqual(a.open, {})
+
+    def test_a_pass_for_another_sport_leaves_a_game_past_its_window_alone(self):
+        # Extra innings: MLB game A is past GAME_MINUTES (no live check of MLB now; its next game is
+        # tomorrow, so MLB still has an "all" check, which asks for started games too) and its live
+        # moneyline arb is still up. A pass that only checks NHL mustn't close it or end its streak.
+        cfg = replace(CFG, sports=["baseball_mlb", "icehockey_nhl"], live_markets="h2h", log_file="", state_dir="",
+                      live_confirm_checks=2)
+        a_start = NOW - timedelta(minutes=cfg.minutes_for("baseball_mlb") + 20)
+        s = sched_with({"baseball_mlb": [("A", a_start), ("B", NOW + timedelta(hours=20))],
+                        "icehockey_nhl": [("H", NOW - timedelta(minutes=30))]}, cfg)
+        self.assertEqual((s.lanes("baseball_mlb", NOW), s.lanes("icehockey_nhl", NOW)[0]),
+                         ([("all", EARLY)], ("live", LIVE)))
+        game = three_markets("A", a_start, "baseball_mlb", home=(2.2, 2.2, 2.2), away=(1.7, 1.7, 1.7))
+        [ml] = [x for x in find_arbs([game], cfg, NOW) if x.market == "h2h"]
+        self.assertTrue(ml.is_live)
+        alerts, rules = Alerter(cfg, dry_run=True), _arbbot.LiveConfirm(2, 0)
+        alerts.handle([ml], now=1000)
+        self.assertEqual(rules.filter([ml], {"baseball_mlb"}, 1000), [])            # first sighting: waiting
+        _, nhl = self.scope(s, {"icehockey_nhl": [("live", LIVE)]}, NOW)
+        alerts.handle([], now=1030, checked_events=nhl)
+        self.assertEqual(rules.filter([], nhl, 1030), [])
+        self.assertEqual((len(alerts.open), rules.dropped), (1, []))                 # NHL's pass: untouched
+        self.assertEqual(len(rules.filter([ml], {"baseball_mlb"}, 1060)), 1)          # its streak carried on
+        _, mlb = self.scope(s, {"baseball_mlb": [("all", EARLY)]}, NOW)
+        alerts.handle([], now=1090, checked_events=mlb)
+        self.assertEqual(alerts.open, {})                                            # MLB's own check: gone
+
+    def test_a_live_game_isnt_over_while_its_spreads_and_totals_are_up(self):
+        # Books pull g1's moneyline for a while (the live check only asks for moneylines), but its
+        # spreads and totals are still up: the game isn't over, and its live checks go on.
+        cfg = Config(sports=["basketball_nba"], live_markets="h2h", props_enabled=False)
+        g1_start = NOW - timedelta(minutes=30)
+        s = sched_with({"basketball_nba": [("g1", g1_start), ("g2", NOW + timedelta(hours=6))]}, cfg)
+        board = {"g1": three_markets("g1", g1_start), "g2": three_markets("g2", NOW + timedelta(hours=6))}
+        pulled, calls = {"h2h"}, []
+
+        class Api:
+            remaining = None
+            def odds(self, sport, until, markets=None, since=None, kind="odds"):
+                calls.append((kind, since))
+                answer = asked(list(board.values()), markets, since)
+                for ev in answer:
+                    if ev["id"] == "g1":
+                        for bm in ev["bookmakers"]:
+                            bm["markets"] = [m for m in bm["markets"] if m["key"] not in pulled]
+                        ev["bookmakers"] = [bm for bm in ev["bookmakers"] if bm["markets"]]
+                return answer
+        s.api = Api()
+
+        def check(lanes=("live", "pre")):
+            s._due_lanes = {"basketball_nba": [(lane, LIVE if lane == "live" else PRE_LIVE) for lane in lanes]}
+            return s.fetch(["basketball_nba"], NOW)[0]
+        for _ in range(5):
+            events = check()
+            self.assertNotIn("g1", [e["id"] for e in events if e["bookmakers"]])     # no live spreads/totals alerts
+        self.assertNotIn("g1", s.ended)
+        self.assertEqual(s.live_games("basketball_nba", NOW), ["g1"])
+        pre_since = [since for kind, since in calls if kind == "odds:pre"]
+        self.assertEqual(pre_since[0], NOW)                                          # nothing missed yet
+        self.assertLess(pre_since[1], g1_start)                                      # then it looks at g1 too
+        pulled.clear()                                                               # the moneyline is back
+        check()
+        self.assertEqual((s.pre_since("basketball_nba", NOW), s.misses), (NOW, {}))
+        # Every line down for a moment, then all back: that look doesn't count later on.
+        pulled.update({"h2h", "spreads", "totals"})
+        check(["live"])
+        check(["pre"])
+        self.assertNotIn("g1", s.ended)
+        pulled.clear()
+        check()
+        self.assertEqual(s.misses, {})
+        pulled.add("h2h")
+        check(["live"])
+        check(["live"])                                                              # (no pre-game check between)
+        self.assertNotIn("g1", s.ended)
+        # The game ends (every line comes down): the next pre-game check sees it.
+        pulled.update({"spreads", "totals"})
+        check()
+        self.assertIn("g1", s.ended)
+        # A game that missed a check, then ran past its window, doesn't move the pre-game check's start.
+        s.games["basketball_nba"].append(("g0", NOW - timedelta(hours=5)))
+        s.misses["g0"] = 1
+        self.assertEqual(s.pre_since("basketball_nba", NOW), NOW)
+        # A sport with no pre-game check left: the live check alone decides, as before.
+        alone = sched_with({"basketball_nba": [("g1", g1_start)]}, cfg)
+        alone.api = Api()
+        for _ in range(2):
+            alone._due_lanes = {"basketball_nba": [("live", LIVE)]}
+            alone.fetch(["basketball_nba"], NOW)
+        self.assertIn("g1", alone.ended)
+
+    def test_a_live_alert_still_confirms_when_a_pre_game_check_comes_between(self):
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        cfg = replace(Config(round_stakes=0).with_mode(), sports=["basketball_nba"], kalshi_check=False,
+                      log_file=str(d / "arbs.csv"), ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
+                      closing_file=str(d / "close.csv"), markout_file="", state_dir="", live_markets="h2h")
+        self.assertEqual(cfg.live_confirm_checks, 2)
+        t = _arbbot.Trackers(cfg, SimpleNamespace(once=False, demo=False, dry_run=True))
+        s = sched_with({"basketball_nba": [("e1", NOW - timedelta(hours=1)), ("p2", NOW + timedelta(hours=1))]}, cfg)
+        live = outlier_event(1.85, 1.95, start=STARTED)
+        live["sport_key"] = "basketball_nba"
+        upcoming = three_markets("p2", NOW + timedelta(hours=1))
+
+        def check(secs, lane):
+            now = at(secs)
+            evs, scope = self.scope(s, {"basketball_nba": [(lane, LIVE if lane == "live" else PREGAME)]}, now,
+                                    [stamped(live, secs), stamped(upcoming, secs)])
+            return _arbbot.scan_main(t, evs, ["basketball_nba"], now, kalshi=False, scope=scope)
+        self.assertEqual(check(0, "live").held, {"waiting": 1})
+        self.assertEqual(check(30, "pre").outs, [])                  # a pre-game check: it didn't look
+        self.assertEqual(check(60, "live").out_sent, 1)              # found again on the next live check
+
+    def test_related_alerts_count_what_the_check_didnt_look_at(self):
+        from arbbot import note_related
+        a = EVAlerter(replace(EVCFG, log_file="", ev_log_file="", state_dir=""), dry_run=True)
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.2, None)]},
+                      market="spreads")
+        for bm in ev["bookmakers"]:
+            for o in bm["markets"][0]["outcomes"]:
+                o["point"] = -3.5 if o["name"] == "Home" else 3.5
+        ev["sport_key"] = "basketball_nba"
+        [spread] = find_evs([ev], EVCFG, NOW)
+        a.handle([spread], now=1000)
+        ml = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Away", 2.2, None)]})
+        ml["sport_key"] = "basketball_nba"
+        [b] = find_evs([ml], EVCFG, NOW)
+        live_look = _arbbot.Scope()
+        live_look.add("basketball_nba", "h2h", None, NOW + timedelta(hours=48))
+        note_related([([b], a, live_look)])
+        self.assertEqual(b.related, [spread.pick])                   # the spread wasn't looked at: still up
+        pre_look = _arbbot.Scope()
+        pre_look.add("basketball_nba", "spreads,totals", NOW, NOW + timedelta(hours=48))
+        note_related([([b], a, pre_look)])
+        self.assertEqual(b.related, [])                              # looked for and not found: closing
+
+    def test_closing_line_check_asks_for_the_bet_types_it_lacks(self):
+        cfg = Config(sports=["basketball_nba"], live_markets="h2h", closing_minutes=5, pregame_with_live_every=2)
+        s = sched_with({"basketball_nba": [("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(minutes=4))]}, cfg)
+        s.need_close = {"g2"}
+        self.assertEqual(s.closing_lanes("basketball_nba", NOW), ["live", "pre"])
+        s.market_ok["basketball_nba"]["h2h"] = s.last_live["basketball_nba"] = (NOW - timedelta(seconds=30)).timestamp()
+        s.last_live["basketball_nba"] = time.time() - 61
+        self.assertEqual(s.closing_lanes("basketball_nba", NOW), ["pre"])   # moneylines were just read live
+        s.last_live["basketball_nba"] = s.last_odds["basketball_nba"] = time.time()   # (not due by the clock)
+        s.last_odds["basketball_nba"] = time.time() - 61
+        self.assertEqual(s.due(NOW), ["basketball_nba"])
+        self.assertEqual(s._due_lanes["basketball_nba"], [("pre", PREGAME)])
+        for m in ("spreads", "totals"):
+            s.market_ok["basketball_nba"][m] = (NOW - timedelta(seconds=10)).timestamp()
+        self.assertFalse(s.closing_due("basketball_nba", NOW))
+
+    def test_markouts_read_each_bet_type_only_from_a_check_that_asked_for_it(self):
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        cfg = Config(markout_file=str(d / "mk.csv"), state_dir="", pregame_max_age_seconds=10**9)
+        tr = _arbbot.MarkoutTracker(cfg)
+        game = three_markets("p2", NOW + timedelta(hours=1), home=(2.2, 2.2, 2.2), away=(1.7, 1.7, 1.7))
+        for a in find_arbs([game], cfg, NOW):
+            tr.add(a, NOW.timestamp(), "arb")
+        self.assertEqual({m.market for m in tr.pending}, {"h2h", "spreads", "totals"})
+        tr.observe(asked([stamped(game, 60)], "h2h"), at(60))                         # the live check: moneylines
+        still = {(m.market, m.outcome): m.still for m in tr.pending}
+        self.assertTrue(all(v is not None for (mk, _), v in still.items() if mk == "h2h"))   # a 1-minute reading
+        self.assertTrue(all(v is None for (mk, _), v in still.items() if mk != "h2h"))      # not "pulled"
+        tr.observe(asked([stamped(game, 300)], "spreads,totals", at(300)), at(300))  # the pre-game check
+        self.assertTrue(all(m.still is not None and m.still[1] for m in tr.pending))
+
+    @staticmethod
+    def default_cfg():
+        """Config.from_env() with the defaults (locks), its files in a temporary folder, and nothing
+        that would reach the network (Kalshi) or wait for a time of day (summary, grading)."""
+        import os, tempfile
+        from unittest import mock
+        d = tempfile.mkdtemp()
+        files = {k: str(Path(d) / v) for k, v in (
+            ("STATE_DIR", "state"), ("LOG_FILE", "arbs.csv"), ("EV_LOG_FILE", "ev.csv"), ("OUTLIER_LOG_FILE", "out.csv"),
+            ("PARLAY_LOG_FILE", "par.csv"), ("EV_RESULTS_FILE", "res.csv"), ("CLOSING_FILE", "close.csv"),
+            ("MARKOUT_FILE", "mk.csv"), ("SCORE_CHECK_FILE", "sc.csv"))}
+        quiet = {"KALSHI_CHECK": "false", "SUMMARY_HOUR": "-1", "RESULTS_MINUTES": "0", "ODDS_API_KEY": "k"}
+        with mock.patch.dict(os.environ, {**files, **quiet}):
+            for k in [k for k in os.environ if k in ("ALERT_MODE", "LIVE_MARKETS", "MARKETS", "SPORTS", "POLL_SECONDS",
+                                                     "LIVE_CONFIRM_CHECKS", "LIVE_MAX_AGE_ALERT")]:
+                os.environ.pop(k)
+            return Config.from_env()
+
+    @staticmethod
+    def default_api(calls):
+        """A fake Odds API for run(): odds() takes keyword arguments and answers like the real one (only
+        the bet types asked for; with `since`, only games after it), and records each call's cost."""
+        real = datetime.now(timezone.utc)
+        iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
+        live_start, pre_start = iso(real - timedelta(minutes=30)), iso(real + timedelta(hours=1))
+
+        def fresh(ev, gid):
+            ev["id"], ev["sport_key"] = gid, "basketball_nba"
+            return stamped(ev, (datetime.now(timezone.utc) - NOW).total_seconds())
+
+        class Api:
+            remaining, used = 50000.0, None
+            def __init__(self, cfg):
+                self.cfg = cfg
+                self.costs = _arbbot.CostBook(Path(cfg.state_dir) / "call_costs.json")
+            def events(self, sport, horizon_hours=26):
+                if sport != "basketball_nba":
+                    return []
+                return [{"id": "live1", "commence_time": live_start}, {"id": "p1", "commence_time": pre_start}]
+            def odds(self, sport, until, markets=None, since=None, kind="odds"):
+                calls.append((sport, kind, markets, since is not None, until > real + timedelta(hours=40)))
+                self.costs.add(kind, self.cfg.credits_per_call(markets), self.cfg.credits_per_call(markets))
+                pre = event({"Pinnacle": [("h2h", [("Home", 1.91, None), ("Away", 1.91, None)])],
+                             "B": [("h2h", [("Home", 2.20, None)])],
+                             "X": [("totals", [("Over", 2.10, 220.5), ("Under", 1.75, 220.5)])],
+                             "Y": [("totals", [("Over", 1.75, 220.5), ("Under", 2.10, 220.5)])]}, start=pre_start)
+                pre["bookmakers"][0]["key"] = "pinnacle"
+                return asked([fresh(outlier_event(1.85, 1.95, start=live_start), "live1"), fresh(pre, "p1")],
+                             markets, since)
+            def event_odds(self, sport, gid, markets):
+                return {"id": gid, "commence_time": pre_start, "bookmakers": []}
+        return Api
+
+    def test_run_keeps_a_live_alert_confirming_through_a_pre_game_pass(self):
+        import argparse, contextlib, io
+        from unittest import mock
+        cfg = replace(self.default_cfg(), props_enabled=False, parlays_enabled=False, live_markets="h2h")
+        plan = [{"basketball_nba": [("live", LIVE), ("pre", PREGAME)]}, {"basketball_nba": [("pre", PREGAME)]},
+                {"basketball_nba": [("live", LIVE)]}]
+
+        def due(sched, now):
+            sched._due_lanes = plan.pop(0)
+            return list(sched._due_lanes)
+        passes, real_scan = [], _arbbot.scan_main
+
+        def scan(t, *a, **kw):
+            passes.append(real_scan(t, *a, **kw))
+            return passes[-1]
+        args = argparse.Namespace(once=False, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        with mock.patch("arbbot.OddsAPI", self.default_api([])), mock.patch("arbbot.scan_main", scan), \
+                mock.patch.object(_arbbot.Scheduler, "due", due), \
+                mock.patch("arbbot.time.sleep", side_effect=[None, None, StopLoop]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(StopLoop):
+                _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        self.assertEqual([(len(p.outs), p.out_sent, p.held) for p in passes],
+                         [(1, 0, {"waiting": 1}), (0, 0, {}), (1, 1, {})])   # live, pre-game only, live: it pings
+
+    def test_run_with_the_default_settings_makes_one_check_per_sport(self):
+        """Config.from_env() defaults (locks): no split, so one check per sport asks for everything,
+        live and upcoming, as before; live checks aren't slowed on their own."""
+        import argparse, contextlib, io
+        from unittest import mock
+        cfg = self.default_cfg()
+        self.assertIsNone(cfg.split_markets())
+        calls = []
+        args = argparse.Namespace(once=False, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        with mock.patch("arbbot.OddsAPI", self.default_api(calls)), mock.patch("arbbot.time.sleep", side_effect=StopLoop), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(StopLoop):
+                _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        nba = [c for c in calls if c[0] == "basketball_nba"]
+        self.assertEqual([(c[1], c[2]) for c in nba], [("odds", None)])      # one call, MARKETS (all bet types)
+        self.assertNotIn("Odds error", err.getvalue())
+
+    def test_run_with_live_moneylines_only_makes_both_checks(self):
+        """One pass of run() with LIVE_MARKETS=h2h on top of the from_env() defaults (locks), against an
+        API whose odds() takes keyword arguments: the live check (moneylines, every game), the pre-game
+        check (spreads and totals of upcoming games), and alerts from both."""
+        import argparse, contextlib, io
+        from unittest import mock
+        cfg = replace(self.default_cfg(), live_markets="h2h")
+        real = datetime.now(timezone.utc)
+        iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
+        live_start, pre_start = iso(real - timedelta(minutes=30)), iso(real + timedelta(hours=1))
+        calls = []
+        Api = self.default_api(calls)
+        args = argparse.Namespace(once=False, demo=False, dry_run=False, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        followed = []
+        real_update = _arbbot.MarkoutTracker.update
+
+        def spy(tracker, events, prop_events, now):
+            followed.extend((m.kind, m.event_id, m.market) for m in tracker.pending)
+            return real_update(tracker, events, prop_events, now)
+        out = io.StringIO()
+        with mock.patch("arbbot.OddsAPI", Api), mock.patch.object(_arbbot.MarkoutTracker, "update", spy), \
+                mock.patch("arbbot.time.sleep", side_effect=StopLoop), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(StopLoop):
+                _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        self.assertEqual(sorted(c for c in calls if c[0] == "basketball_nba"),
+                         [("basketball_nba", "odds:live", "h2h", False, True),
+                          ("basketball_nba", "odds:pre", "spreads,totals", True, True)])
+        self.assertNotIn("Odds error", err.getvalue())
+        self.assertIn(("arb", "p1", "totals"), followed)                       # from the pre-game check
+        self.assertIn("held back: 1 live, waiting for another check", out.getvalue())   # the live outlier (2 checks)
+        self.assertIn("live games: h2h (1 credit/check), the rest before kickoff (2)", out.getvalue())
+        self.assertIn("Spare credits", out.getvalue())                          # the Budget: line says what it bought
+        saved = _arbbot.CostBook(Path(cfg.state_dir) / "call_costs.json")        # measured costs kept for a restart
+        self.assertEqual((saved.calls("odds:live", 1), saved.calls("odds:pre", 2)), (1, 1))
+
+
+class SpareCredits(unittest.TestCase):
+    """Credits a day can spare buy faster pre-game checks, near kickoff first; live checks never go
+    faster than POLL_SECONDS, and on a short day they slow down first (LIVE_MAX_STRETCH)."""
+
+    GAMES = {"basketball_nba": [("g1", NOW)],
+             "icehockey_nhl": [("h1", NOW + timedelta(hours=1)), ("h2", NOW + timedelta(hours=8)),
+                               ("h3", NOW + timedelta(hours=30))]}
+
+    def test_spare_credits_go_to_pregame_checks_never_live(self):
+        cfg = Config(sports=list(self.GAMES), props_enabled=False)
+        s = sched_with(self.GAMES, cfg, remaining=80_000)
+        s.update_budget(NOW)
+        self.assertEqual(s.interval(LIVE), 60)                                   # live never faster
+        self.assertEqual(s.interval(PREGAME), cfg.pregame_min_minutes * 60)      # near kickoff: as often as allowed
+        self.assertEqual(s.interval(EARLY), cfg.early_min_minutes * 60)
+        self.assertLessEqual(s.forecast + s.spare, s.allowance * cfg.spare_use_pct / 100 + 1)
+        tight = sched_with(self.GAMES, cfg, remaining=31 * 300)
+        tight.update_budget(NOW)
+        self.assertEqual((tight.speed, tight.spare), ({}, 0.0))                  # nothing spare: normal or slower
+        off = sched_with(self.GAMES, replace(cfg, spare_use_pct=0), remaining=80_000)
+        off.update_budget(NOW)
+        self.assertEqual(off.speed, {})
+
+    def test_spare_goes_near_kickoff_first_and_far_out_last_each_down_to_its_floor(self):
+        s = sched_with({"basketball_nba": []}, Config(sports=["basketball_nba"]))
+        tiers = (PREGAME, EARLY, _arbbot.PROP_EARLY, _arbbot.PROP_NEAR, FAR)
+        for budget, want in ((150, {PREGAME: 2.5}),
+                             (650, {PREGAME: 5, EARLY: 3.5}),
+                             (850, {PREGAME: 5, EARLY: 4, _arbbot.PROP_EARLY: 2.5}),
+                             (1050, {PREGAME: 5, EARLY: 4, _arbbot.PROP_EARLY: 4, _arbbot.PROP_NEAR: 1.5}),
+                             (10**6, {PREGAME: 5, EARLY: 4, _arbbot.PROP_EARLY: 4, _arbbot.PROP_NEAR: 2, FAR: 3})):
+            s.demand, s.speed, s.spare = dict.fromkeys(tiers, 100.0), {}, 0.0
+            s._spend_spare(budget)
+            self.assertEqual({k: round(v, 3) for k, v in s.speed.items()}, want)
+        self.assertEqual(s.spare, 400 + 300 + 300 + 100 + 200)                     # every tier at its floor
+        s.speed = {_arbbot.PROP_EARLY: 4.0, _arbbot.PROP_NEAR: 2.0}
+        self.assertEqual((s._prop_every(False), s._prop_every(True)), (3600, 900))   # props use it too
+
+    def test_later_games_in_a_live_sport_get_spare_credits_first_down_to_every_live_check(self):
+        s = sched_with({"basketball_nba": []}, Config(sports=["basketball_nba"], live_markets="h2h",
+                                                      pregame_with_live_every=2))
+        for budget, room, want in ((150, 0, {PRE_LIVE: 2, PREGAME: 1.5}),     # every live check, then near kickoff
+                                   (-50, 80, {PRE_LIVE: 1.8}),                 # the rest of the day's share: this only
+                                   (10**6, 0, {PRE_LIVE: 2, PREGAME: 5, EARLY: 4})):
+            s.demand, s.speed, s.spare = dict.fromkeys((PRE_LIVE, PREGAME, EARLY), 100.0), {}, 0.0
+            s._spend_spare(budget, room)
+            self.assertEqual({k: round(v, 3) for k, v in s.speed.items()}, want)
+        games = {"basketball_nba": [("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(hours=2, minutes=30))],
+                 "icehockey_nhl": [("h1", NOW + timedelta(hours=20))]}
+        cfg = Config(sports=list(games), props_enabled=False, live_markets="h2h", live_max_stretch=3,
+                     pregame_with_live_every=2)
+        roomy = sched_with(games, cfg, remaining=80_000)
+        roomy.update_budget(NOW)
+        self.assertEqual((roomy.interval(PRE_LIVE), roomy.interval(LIVE)), (60, 60))   # never faster than live
+        [line] = _arbbot.pace_lines(cfg, roomy)
+        self.assertIn("buy faster pre-game checks: spreads and totals of later games in sports with a live game "
+                      "every 60s (from 2m), near kickoff every 3m (from 15m)", line)
+        self.assertIn("for the pre-game check (spreads,totals, upcoming games, every 2m at full speed)",
+                      _arbbot.cost_lines(cfg, roomy)[0])
+        # A day that fits with under 15% to spare (SPARE_USE_PCT): only this check gets faster, using
+        # the rest of the day's share (before LIVE_MARKETS it came with every live check).
+        near_full = sched_with(games, cfg, remaining=31 * 400)
+        near_full.update_budget(NOW)
+        self.assertGreater(near_full.forecast, near_full.allowance * cfg.spare_use_pct / 100)
+        self.assertEqual(set(near_full.speed), {PRE_LIVE})
+        self.assertAlmostEqual(near_full.forecast + near_full.spare, near_full.allowance, delta=1)
+        off = sched_with(games, replace(cfg, spare_use_pct=0), remaining=31 * 400)
+        off.update_budget(NOW)
+        self.assertEqual(off.speed, {})                                            # 0: no speed-ups at all
+
+    def test_live_checks_slow_down_first_when_short(self):
+        cfg = Config(sports=["basketball_nba", "icehockey_nhl"], props_enabled=False, early_minutes=5,
+                     live_max_stretch=3, live_markets="h2h")
+        games = {"basketball_nba": [("g1", NOW)], "icehockey_nhl": [("h1", NOW + timedelta(hours=20))]}
+        s = sched_with(games, cfg, remaining=31 * 450)
+        s.update_budget(NOW)
+        self.assertGreater(s.interval(LIVE), 60)
+        self.assertLessEqual(s.interval(EARLY), 5 * 60 + 1)                       # upcoming games keep their pace
+        spend = s.core_demand / s.scale + s.extra_demand / s.extra_scale
+        self.assertLessEqual(spend, s.allowance + 1)
+        old = sched_with(games, replace(cfg, live_max_stretch=0), remaining=31 * 450)
+        old.update_budget(NOW)
+        self.assertEqual(old.interval(LIVE), 60)                                  # 1 (not locks): early checks pay first
+        self.assertGreater(old.interval(EARLY), 5 * 60)
+
+    def test_without_the_split_live_checks_dont_slow_down_alone(self):
+        # The live check also carries the sport's upcoming games, so slowing it alone would slow
+        # their pre-game checks too: without LIVE_MARKETS, LIVE_MAX_STRETCH does nothing.
+        cfg = Config(sports=["basketball_nba", "icehockey_nhl"], props_enabled=False, early_minutes=5,
+                     live_max_stretch=3)
+        games = {"basketball_nba": [("g1", NOW)], "icehockey_nhl": [("h1", NOW + timedelta(hours=20))]}
+        s = sched_with(games, cfg, remaining=31 * 900)
+        s.update_budget(NOW)
+        self.assertEqual(s.live_scale, 1.0)
+        self.assertEqual(s.live_cap_note(NOW), "")
+
+    def test_plan_and_log_say_what_the_budget_did(self):
+        import contextlib, io
+        from unittest import mock
+        cfg = Config(sports=["basketball_nba", "icehockey_nhl"], props_enabled=False, early_minutes=5,
+                     live_max_stretch=3, live_markets="h2h")
+        games = {"basketball_nba": [("g1", NOW)], "icehockey_nhl": [("h1", NOW + timedelta(hours=20))]}
+        short_day = sched_with(games, cfg, remaining=31 * 450)
+        short_day.refresh_events = lambda force=False: None
+        out = io.StringIO()
+        with mock.patch("arbbot.datetime") as dt, contextlib.redirect_stdout(out):
+            dt.now.return_value = NOW
+            dt.side_effect = lambda *a, **k: datetime(*a, **k)
+            _arbbot.print_plan(cfg, short_day)
+        self.assertIn("→ Live checks slowed first: every", out.getvalue())
+        self.assertNotIn("Fits the budget at full speed", out.getvalue())
+        split = sched_with(games, replace(cfg, live_markets="h2h"), remaining=31 * 450)
+        split.refresh_events = lambda force=False: None
+        out = io.StringIO()
+        with mock.patch("arbbot.datetime") as dt, contextlib.redirect_stdout(out):
+            dt.now.return_value = NOW
+            dt.side_effect = lambda *a, **k: datetime(*a, **k)
+            _arbbot.print_plan(split.cfg, split)
+        self.assertIn("L = live every 60s (h2h only; spreads,totals of later games every 60s)", out.getvalue())
+        self.assertTrue(_arbbot.pace_changed((1.0, 1.0, 1.0, 1.0, {}), short_day))
+        roomy = sched_with(SpareCredits.GAMES, Config(sports=list(SpareCredits.GAMES), props_enabled=False),
+                           remaining=80_000)
+        roomy.update_budget(NOW)
+        [line] = _arbbot.pace_lines(roomy.cfg, roomy)
+        self.assertTrue(line.startswith("→ Spare credits (~"), line)
+        self.assertIn("near kickoff every 3m (from 15m), upcoming games every 15m (from 60m)", line)
+        self.assertIn("Live checks never go faster than 60s.", line)
+        self.assertTrue(_arbbot.pace_changed((1.0, 1.0, 1.0, 1.0, {}), roomy))
+        self.assertFalse(_arbbot.pace_changed(_arbbot.pace_state(roomy), roomy))
+
+    def test_spare_spending_shrinks_when_credits_fall_faster_than_the_calls_cost(self):
+        # No x-requests-last header: the bot only has the formula. If the credits left fall faster
+        # than that (costs above the formula, or another process on the key), less is spare.
+        cfg = Config(sports=list(self.GAMES), props_enabled=False)
+
+        def run(header, spent=450, remaining=45_000, s=None):
+            if s is None:
+                api = FakeAPI(remaining)
+                api.costs = _arbbot.CostBook()
+                s = Scheduler(cfg, api)
+                s.games.update(self.GAMES)
+                s.update_budget(NOW)
+            before = s.spare
+            for i in range(100):                                     # 300 credits by the calls
+                s.api.costs.add("odds", 3 if header is True or (header == "half" and i % 2) else None, 3)
+            s.api.remaining -= spent
+            s.update_budget(NOW)
+            return before, s
+        before, s = run(header=False)
+        self.assertAlmostEqual(s.overrun, 1.5)
+        self.assertGreater(before, 200)
+        self.assertEqual((s.spare, s.speed), (0.0, {}))
+        self.assertIn("Credits are going 1.5× as fast as the checks should cost", _arbbot.pace_lines(cfg, s)[-1])
+        _, measured = run(header=True)                               # the header says: the costs are known
+        self.assertEqual((measured.overrun, measured.spare), (1.0, before))
+        self.assertEqual(run(header="half", spent=330)[1].overrun, 1.0)   # measured calls count what they cost
+        self.assertEqual(run(header=False, spent=320)[1].overrun, 1.0)   # within 10%: noise
+        _, reset = run(header=False, spent=-1000)                    # the plan reset: start counting again
+        self.assertEqual((reset.overrun, reset.spare), (1.0, before))
+        self.assertAlmostEqual(run(header=False, s=reset)[1].overrun, 1.5)   # ...from there
+
+    def test_early_props_and_far_out_give_way_before_the_pre_game_checks_that_come_first(self):
+        # Short day: the live check slows first, then early checks; early props and 1-2 days out
+        # slow down further before the spreads/totals of later games in a live sport (or near-kickoff
+        # checks) give up any of their pace.
+        games = {"basketball_nba": [("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(hours=2, minutes=30))],
+                 "americanfootball_nfl": [(f"n{i}", NOW + timedelta(hours=20)) for i in range(12)],
+                 "icehockey_nhl": [("h1", NOW + timedelta(hours=30))]}
+        cfg = Config(sports=list(games), live_markets="h2h", live_max_stretch=3, prop_sports=["americanfootball_nfl"])
+        further = None
+        for remaining in range(31 * 300, 31 * 900, 31 * 10):
+            s = sched_with(games, cfg, remaining=remaining)
+            s.update_budget(NOW)
+            self.assertTrue(s.demand[_arbbot.PROP_EARLY] and s.demand[FAR] and s.demand[PRE_LIVE])
+            if s.scale > 1:                                   # the pre-game checks that come first slow last
+                self.assertEqual((s.live_scale, s.extra_scale, s.side_scale), (3, 4, 4), remaining)
+            if s.side_scale > 1:
+                self.assertEqual((s.live_scale, s.extra_scale), (3, 4), remaining)
+                if s.side_scale < 4:
+                    further = s
+                    self.assertEqual((s.scale, s.interval(PRE_LIVE)), (1.0, 60))
+            if s.forecast > s.allowance:                     # and the plan pays for it
+                spend = s.core_demand / s.scale + s.extra_demand / s.extra_scale
+                self.assertAlmostEqual(spend, s.allowance, delta=1)
+        self.assertIsNotNone(further)
+        x = further.extra_scale * further.side_scale
+        self.assertAlmostEqual(further._prop_every(False), cfg.prop_early_minutes * 60 * x)
+        self.assertAlmostEqual(further.interval(FAR), cfg.far_minutes * 60 * x)
+        self.assertAlmostEqual(further.interval(EARLY), cfg.early_minutes * 60 * 4)
+        lines = "\n".join(_arbbot.pace_lines(cfg, further))
+        self.assertIn("→ Then early props every", lines)
+        self.assertIn("h and games 1-2 days out every", lines)
+        self.assertIn("slower in all), before near-kickoff checks and spreads and totals of later games in sports "
+                      "with a live game slow down.", lines)
+        self.assertNotIn("spreads and totals of later games in sports with a live game every", lines)
+        self.assertTrue(_arbbot.pace_changed((1.0, 4.0, 3.0, 1.0, {}), further))
+        self.assertEqual(_arbbot.pace_state(further)[3], further.side_scale)
+
+    def test_a_live_slow_down_that_fits_exactly_isnt_reported_as_not_enough(self):
+        # Worked out so live checks alone fit, the forecast can come out a hair over the allowance
+        # (floating point): that mustn't read as "live at its max, that wasn't enough, upcoming slowed 4x".
+        games = {"basketball_nba": [("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(hours=1, minutes=30))]}
+        for every in (1, 2):
+            cfg = Config(sports=["basketball_nba"], props_enabled=False, live_markets="h2h", live_max_stretch=3,
+                         lookahead_hours=0, pregame_with_live_every=every)
+            fit = 0
+            for remaining in range(2000, 12000, 37):
+                s = sched_with(games, cfg, remaining=remaining)
+                s.update_budget(NOW)
+                if 1.01 < s.live_scale < 3:
+                    fit += 1
+                    self.assertEqual((s.scale, s.extra_scale), (1.0, 1.0), remaining)
+            self.assertGreater(fit, 50)
+        s = sched_with(games, replace(cfg, pregame_with_live_every=1), remaining=7439)
+        s.update_budget(NOW)
+        [line] = _arbbot.pace_lines(s.cfg, s)
+        self.assertIn("Live checks slowed first", line)
+        self.assertIn("so pre-game checks keep their pace", line)
+        # Live checks at their max and everything slower, with nothing early in the next 24h: no
+        # "upcoming-game checks slowed" (there are none).
+        tight = sched_with(games, cfg, remaining=31 * 40)
+        tight.update_budget(NOW)
+        self.assertEqual((tight.live_scale, tight.extra_scale, tight.demand[EARLY]), (3, 1.0, 0))
+        self.assertGreater(tight.scale, 1.1)
+        lines = "\n".join(_arbbot.pace_lines(cfg, tight))
+        self.assertIn("as far as LIVE_MAX_STRETCH allows. That wasn't enough:", lines)
+        self.assertNotIn("Upcoming-game checks slowed", lines)
+
+    def test_the_log_says_once_a_day_when_live_checks_stay_at_their_slowest(self):
+        games = {"basketball_nba": [("g1", NOW - timedelta(minutes=30)), ("g2", NOW + timedelta(hours=1, minutes=30))]}
+        cfg = Config(sports=["basketball_nba"], props_enabled=False, live_markets="h2h", live_max_stretch=3,
+                     lookahead_hours=0, timezone="America/New_York")
+        s = sched_with(games, cfg, remaining=31 * 40)
+        s.update_budget(NOW)
+        self.assertEqual(s.live_scale, 3)
+        self.assertEqual(s.live_cap_note(NOW), "")                                   # just got there
+        self.assertEqual(s.live_cap_note(NOW + timedelta(minutes=20)), "")
+        note = s.live_cap_note(NOW + timedelta(minutes=31))
+        self.assertIn("Live checks have been at their slowest since 8:00 AM: every", note)
+        self.assertIn("instead of 60s (LIVE_MAX_STRETCH=3)", note)
+        self.assertEqual(s.live_cap_note(NOW + timedelta(minutes=45)), "")           # once a day
+        s.live_scale = 2.0                                                           # eased: starts over
+        self.assertEqual(s.live_cap_note(NOW + timedelta(minutes=50)), "")
+        s.live_scale = 3.0
+        tomorrow = NOW + timedelta(days=1)
+        s.games["basketball_nba"] = [("g3", tomorrow - timedelta(minutes=30))]
+        self.assertEqual(s.live_cap_note(tomorrow), "")
+        self.assertIn("since 8:00 AM", s.live_cap_note(tomorrow + timedelta(minutes=30)))   # the next day: again
+        self.assertEqual(s.live_cap_note(tomorrow + timedelta(hours=3)), "")         # no game on: nothing to say
+        self.assertIsNone(s.capped_since)
+
+    def test_run_prints_the_slowest_live_checks_note(self):
+        import argparse, contextlib, io
+        from unittest import mock
+        cfg = replace(LiveMoneylinesOnly.default_cfg(), props_enabled=False, parlays_enabled=False)
+        args = argparse.Namespace(once=False, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        out = io.StringIO()
+        with mock.patch("arbbot.OddsAPI", LiveMoneylinesOnly.default_api([])), \
+                mock.patch.object(_arbbot.Scheduler, "live_cap_note", return_value="NOTE: live checks at their slowest"), \
+                mock.patch("arbbot.time.sleep", side_effect=StopLoop), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(StopLoop):
+                _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        self.assertIn("NOTE: live checks at their slowest", out.getvalue())
+
+
+def espn_board(games):
+    """A fake ESPN scoreboard: games = [dict(id, date, home=(name, score, periods, winner),
+    away=(...), status, completed, state)]; winner None leaves the flag out."""
+    def get(path):
+        day = path.split("dates=")[1][:8]
+        evs = []
+        for g in games:
+            if g["date"][:10].replace("-", "") != day:
+                continue
+
+            def side(t, ha):
+                nm, score, periods, winner = t
+                loc, _, nick = nm.rpartition(" ")
+                c = {"homeAway": ha, "score": str(score), "team": {"displayName": nm, "location": loc, "name": nick},
+                     "linescores": [{"value": p} for p in periods]}
+                if winner is not None:
+                    c["winner"] = winner
+                return c
+            evs.append({"id": g["id"], "date": g["date"], "competitions": [{
+                "status": {"type": {"name": g.get("status", "STATUS_FINAL"), "completed": g.get("completed", True),
+                                    "state": g.get("state", "post")}},
+                "competitors": [side(g["home"], "home"), side(g["away"], "away")]}]})
+        return {"events": evs}
+    return get
+
+
+def espn(gid="7", date="2026-10-03T23:30Z", home=("Boston Celtics", 101, [20, 30, 25, 26], True),
+         away=("New York Knicks", 99, [30, 20, 24, 25], False), **kw):
+    return dict(id=gid, date=date, home=home, away=away, **kw)
+
+
+class FreeFinals(unittest.TestCase):
+    """ESPN's free scoreboard, in shadow mode: logged next to the Odds API's finals, never used to
+    grade. Anything unexpected means no ESPN final (slower, never wrong)."""
+
+    def setUp(self):
+        import tempfile
+        from unittest import mock
+        self.games, self.asked = [], []
+
+        def fake(path):
+            self.asked.append(path)
+            if self.games is None:
+                raise OSError("ESPN is down")
+            return espn_board(self.games)(path)
+        mock.patch("arbbot._espn_get", side_effect=fake).start()
+        self.addCleanup(mock.patch.stopall)
+        _arbbot._ESPN_CACHE.clear()
+        _arbbot._ESPN_FAILED.clear()
+        self.addCleanup(_arbbot._ESPN_FAILED.clear)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = Path(self.tmp.name)
+        self.cfg = Config(min_ev_pct=3, round_stakes=0, ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
+                          parlay_log_file=str(d / "par.csv"), ev_results_file=str(d / "res.csv"),
+                          closing_file=str(d / "close.csv"), markout_file=str(d / "mk.csv"),
+                          score_check_file=str(d / "sc.csv"), log_file="")
+
+    def final(self, sport="basketball_nba", home="Boston Celtics", away="New York Knicks", start="2026-10-03T23:30:00Z"):
+        _arbbot._ESPN_CACHE.clear()
+        return _arbbot.espn_final(sport, home, away, start)
+
+    def test_a_final_score_and_the_checks_on_it(self):
+        g = espn()
+        self.games = [g]
+        self.assertEqual(self.final(), ({"Boston Celtics": 101, "New York Knicks": 99}, ""))
+        self.games = [espn(home=g["away"], away=g["home"])]                     # listed the other way round
+        self.assertEqual(self.final()[0], {"Boston Celtics": 101, "New York Knicks": 99})
+        self.games = [espn(status="STATUS_IN_PROGRESS", completed=False, state="in")]
+        self.assertEqual(self.final(), (None, "not final: STATUS_IN_PROGRESS"))   # the status name, to add new ones
+        self.games = [espn(status="STATUS_END_OF_REGULATION", completed=True, state="post")]
+        self.assertEqual(self.final(), (None, "not final: STATUS_END_OF_REGULATION"))
+        self.games = [espn(status="STATUS_POSTPONED", completed=False)]
+        self.assertEqual(self.final(), (None, "postponed: STATUS_POSTPONED"))
+        self.games = [espn(home=("Boston Celtics", 111, [20, 30, 25, 26], True))]  # periods don't add up
+        self.assertIsNone(self.final()[0])
+        self.games = [espn(home=("Boston Celtics", 101, [20, 30, 25, 26], False))]  # winner flag says otherwise
+        self.assertEqual(self.final(), (None, "ESPN's winner flag disagrees with the score"))
+        self.games = [g, espn(gid="8")]                                           # two games fit: which one?
+        self.assertEqual(self.final(), (None, "not found"))
+
+    def test_no_tied_finals_and_hockey_needs_the_winner_flag(self):
+        nhl = lambda home, away: espn(home=("Boston Bruins",) + home, away=("New York Rangers",) + away)
+        g = ("icehockey_nhl", "Boston Bruins", "New York Rangers")
+        self.games = [nhl((3, [1, 1, 1], None), (3, [1, 1, 1], None))]            # a shootout goal left out?
+        self.assertEqual(self.final(*g), (None, "tied score"))
+        self.games = [nhl((4, [1, 1, 1, 0], None), (3, [1, 1, 1, 0], None))]
+        self.assertEqual(self.final(*g), (None, "no winner flag"))
+        self.games = [nhl((4, [1, 1, 1, 0], True), (3, [1, 1, 1, 0], False))]     # shootout: periods 3-3, final 4-3
+        self.assertEqual(self.final(*g), ({"Boston Bruins": 4, "New York Rangers": 3}, ""))
+        self.games = [espn(home=("Boston Celtics", 99, [99], None), away=("New York Knicks", 99, [99], None))]
+        self.assertEqual(self.final(), (None, "tied score"))
+
+    def test_a_rain_shortened_baseball_game(self):
+        mlb = ("baseball_mlb", "Los Angeles Dodgers", "San Diego Padres", "2026-10-03T23:00:00Z")
+        self.games = [espn(date="2026-10-03T23:00Z", home=("Los Angeles Dodgers", 4, [1, 0, 2, 0, 1, 0], True),
+                           away=("San Diego Padres", 1, [0, 0, 1, 0, 0, 0], False))]
+        self.assertEqual(self.final(*mlb), (None, "shortened game"))
+        self.games = [espn(date="2026-10-03T23:00Z", home=("Los Angeles Dodgers", 4, [1, 0, 2, 0, 1, 0, 0, 0], True),
+                           away=("San Diego Padres", 1, [0, 0, 1, 0, 0, 0, 0, 0, 0], False))]   # home didn't bat the 9th
+        self.assertEqual(self.final(*mlb)[0], {"Los Angeles Dodgers": 4, "San Diego Padres": 1})
+        # ESPN calls the other team home (a neutral site): the team that batted first still has 9.
+        self.games = [espn(date="2026-10-03T23:00Z", home=("San Diego Padres", 4, [1, 0, 2, 0, 1, 0, 0, 0], True),
+                           away=("Los Angeles Dodgers", 1, [0, 0, 1, 0, 0, 0, 0, 0, 0], False))]
+        self.assertEqual(self.final(*mlb), ({"Los Angeles Dodgers": 1, "San Diego Padres": 4}, ""))
+        self.games = [espn(date="2026-10-03T23:00Z", home=("San Diego Padres", 4, [1, 0, 2, 0, 1], True),
+                           away=("Los Angeles Dodgers", 1, [0, 0, 1, 0, 0, 0], False))]   # swapped, and shortened
+        self.assertEqual(self.final(*mlb), (None, "shortened game"))
+        self.games = [espn(date="2026-10-03T23:00Z", home=("Los Angeles Dodgers", 4, [], True),
+                           away=("San Diego Padres", 1, [], False))]          # no innings listed: not "shortened"
+        self.assertEqual(self.final(*mlb), ({"Los Angeles Dodgers": 4, "San Diego Padres": 1}, ""))
+
+    def log(self, gid, market, outcome, point="", sport="basketball_nba", home="Boston Celtics",
+            away="New York Knicks", start="2026-10-03T23:30:00Z", first_seen="2026-10-03T20:00:00+00:00"):
+        append_csv(self.cfg.ev_log_file, _arbbot.EV_LOG_FIELDS, {
+            "first_seen": first_seen, "event_id": gid, "sport": "X", "sport_key": sport, "matchup": f"{away} @ {home}",
+            "home_team": home, "away_team": away, "commence_time": start, "live": False, "market": market,
+            "outcome": outcome, "point": point, "n_outcomes": 2, "book": "B", "price": 2.0, "fair_odds": 1.9,
+            "best_ev_pct": 5, "stake": 10, "player": "", "confidence": "high", "fair_from": "Pinnacle"})
+
+    def grade(self, api_final, sport="basketball_nba", gid="nba7", home="Boston Celtics", away="New York Knicks"):
+        calls = []
+
+        class Api:
+            def scores(self, s, days_from=3):
+                calls.append(s)
+                return [{"id": gid, "completed": True,
+                         "scores": [{"name": home, "score": str(api_final[0])}, {"name": away, "score": str(api_final[1])}]}]
+        import contextlib, io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rows = settle_pending(self.cfg, Api(), datetime(2026, 10, 4, 4, 0, tzinfo=timezone.utc))
+        checks = _read(self.cfg.score_check_file) if Path(self.cfg.score_check_file).exists() else []
+        return rows, calls, checks, err.getvalue()
+
+    def test_shadow_logs_agreement_once_per_game_and_grades_from_the_api(self):
+        self.games = [espn(home=("Boston Celtics", 101, [101], True), away=("New York Knicks", 99, [99], False))]
+        self.log("nba7", "h2h", "Boston Celtics")
+        rows, calls, checks, _ = self.grade((101, 99))
+        self.assertEqual(([r["result"] for r in rows], calls), (["win"], ["basketball_nba"]))
+        self.assertEqual([c["verdict"] for c in checks], ["agree"])
+        self.log("nba7", "totals", "Over", 190.5, first_seen="2026-10-03T21:00:00+00:00")   # another bet, same game
+        rows, _, checks, _ = self.grade((101, 99))
+        self.assertEqual(([r["result"] for r in rows], len(checks)), (["win"], 1))          # still one row
+
+    def test_shadow_logs_a_disagreement_and_the_api_still_decides(self):
+        self.games = [espn(home=("Boston Celtics", 101, [101], True), away=("New York Knicks", 99, [99], False))]
+        self.log("nba7", "h2h", "Boston Celtics")
+        rows, _, checks, err = self.grade((98, 99))
+        self.assertEqual([c["verdict"] for c in checks], ["disagree"])
+        self.assertEqual(rows[0]["result"], "loss")
+        self.assertIn("disagree", err)
+
+    def test_shadow_writes_nothing_when_espn_is_down_and_waits_before_asking_again(self):
+        self.games = None
+        self.log("nba7", "h2h", "Boston Celtics")
+        rows, _, checks, err = self.grade((101, 99))
+        self.assertEqual(([r["result"] for r in rows], checks), (["win"], []))
+        self.assertEqual(err.count("ESPN scoreboard"), 1)
+        asked = len(self.asked)
+        with self.assertRaises(OSError):
+            _arbbot._espn_quick(self.asked[0])
+        self.assertEqual(len(self.asked), asked)                                  # a recent failure isn't asked again
+
+    def test_off_doesnt_ask_espn_about_main_lines(self):
+        self.cfg = replace(self.cfg, free_scores="off")
+        self.games = [espn(home=("Boston Celtics", 101, [101], True), away=("New York Knicks", 99, [99], False))]
+        self.log("nba7", "h2h", "Boston Celtics")
+        rows, _, checks, _ = self.grade((101, 99))
+        self.assertEqual(([r["result"] for r in rows], checks, self.asked), (["win"], [], []))
+
+    def test_run_lines_and_totals_on_a_rain_shortened_game_stay_manual_in_every_mode(self):
+        mlb = dict(sport="baseball_mlb", home="Los Angeles Dodgers", away="San Diego Padres", start="2026-10-03T23:00:00Z")
+        for mode in ("off", "shadow"):
+            with self.subTest(mode=mode):
+                for f in (self.cfg.ev_log_file, self.cfg.ev_results_file, self.cfg.score_check_file):
+                    Path(f).unlink(missing_ok=True)
+                self.cfg = replace(self.cfg, free_scores=mode)
+                self.games = [espn(date="2026-10-03T23:00Z", home=("Los Angeles Dodgers", 4, [1, 0, 2, 0, 1, 0], True),
+                                   away=("San Diego Padres", 1, [0, 0, 1, 0, 0, 0], False))]
+                _arbbot._ESPN_CACHE.clear()
+                self.log("mlb1", "h2h", "Los Angeles Dodgers", **mlb)
+                self.log("mlb1", "spreads", "Los Angeles Dodgers", -1.5, **mlb)
+                self.log("mlb1", "totals", "Over", 7.5, **mlb)
+                rows, _, _, _ = self.grade((4, 1), sport="baseball_mlb", gid="mlb1", home="Los Angeles Dodgers",
+                                           away="San Diego Padres")
+                self.assertEqual([(r["market"], r["result"]) for r in rows], [("h2h", "win")])
+                held = sorted((r["market"], r["result"], r["actual"]) for r in _read(self.cfg.ev_results_file))[1:]
+                self.assertEqual(held, [("spreads", "", "rain-shortened"), ("totals", "", "rain-shortened")])
+        # Written once: later passes don't buy scores or ask ESPN about it again.
+        self.asked.clear()
+        rows, calls, _, _ = self.grade((4, 1), sport="baseball_mlb", gid="mlb1", home="Los Angeles Dodgers",
+                                       away="San Diego Padres")
+        self.assertEqual((rows, calls, self.asked, len(_read(self.cfg.ev_results_file))), ([], [], [], 3))
+
+    def test_a_slow_espn_pass_leaves_rain_checks_for_the_next_pass(self):
+        from unittest import mock
+        mlb = dict(sport="baseball_mlb", home="Los Angeles Dodgers", away="San Diego Padres", start="2026-10-03T23:00:00Z")
+        self.games = [espn(date="2026-10-03T23:00Z", home=("Los Angeles Dodgers", 4, [1, 0, 2, 0, 1, 0, 0, 0], True),
+                           away=("San Diego Padres", 1, [0, 0, 1, 0, 0, 0, 0, 0, 0], False))]
+        self.log("mlb1", "h2h", "Los Angeles Dodgers", **mlb)
+        self.log("mlb1", "spreads", "Los Angeles Dodgers", -1.5, **mlb)
+        game = dict(sport="baseball_mlb", gid="mlb1", home="Los Angeles Dodgers", away="San Diego Padres")
+        with mock.patch("arbbot.ESPN_PASS_SECONDS", -1):                         # out of time before asking
+            rows, _, checks, _ = self.grade((4, 1), **game)
+        self.assertEqual(([r["market"] for r in rows], checks, self.asked), (["h2h"], [], []))
+        rows, _, _, _ = self.grade((4, 1), **game)                                 # next pass: a full game
+        self.assertEqual([r["market"] for r in rows], ["spreads"])
+
+    def test_a_parlay_leg_on_a_rain_shortened_game_isnt_graded(self):
+        leg = {"event_id": "mlb1", "home_team": "LA", "away_team": "SD", "market": "spreads", "outcome": "LA",
+               "point": -1.5, "price": 2.0, "player": "", "n_outcomes": 2}
+        other = {**leg, "event_id": "nhl1", "home_team": "Home", "away_team": "Away", "market": "h2h", "outcome": "Home",
+                 "point": ""}
+        r = {"_legs": [leg, other], "stake": 10}
+        finals = {"mlb1": {"LA": 4, "SD": 1}, "nhl1": {"Home": 3, "Away": 2}}
+        self.assertEqual(_arbbot.settle_parlay(r, finals)[0], "win")
+        self.assertIsNone(_arbbot.settle_parlay(r, finals, hold={"mlb1"}))
+        self.assertEqual(_arbbot.settle_parlay({**r, "_legs": [{**leg, "market": "h2h", "point": ""}, other]},
+                                               finals, hold={"mlb1"})[0], "win")       # the moneyline still stands
+
+    MLB = dict(sport="baseball_mlb", home="Los Angeles Dodgers", away="San Diego Padres", start="2026-10-03T23:00:00Z")
+    FULL = dict(date="2026-10-03T23:00Z", home=("Los Angeles Dodgers", 4, [1, 0, 2, 0, 1, 0, 0, 0], True),
+                away=("San Diego Padres", 1, [0, 0, 1, 0, 0, 0, 0, 0, 0], False))
+    RAIN = dict(date="2026-10-03T23:00Z", home=("Los Angeles Dodgers", 4, [1, 0, 2, 0, 1, 0], True),
+                away=("San Diego Padres", 1, [0, 0, 1, 0, 0, 0], False))
+    NBA = dict(home=("Boston Celtics", 101, [101], True), away=("New York Knicks", 99, [99], False))
+
+    class TwoGames:
+        """Odds API finals: Dodgers 4-1 (mlb1) and Celtics 101-99 (nba7)."""
+        def __init__(self):
+            self.calls = []
+
+        def scores(self, s, days_from=3):
+            self.calls.append(s)
+            if s == "baseball_mlb":
+                return [{"id": "mlb1", "completed": True, "scores": [{"name": "Los Angeles Dodgers", "score": "4"},
+                                                                     {"name": "San Diego Padres", "score": "1"}]}]
+            return [{"id": "nba7", "completed": True, "scores": [{"name": "Boston Celtics", "score": "101"},
+                                                                 {"name": "New York Knicks", "score": "99"}]}]
+
+    def settle(self, api, at=datetime(2026, 10, 4, 4, 0, tzinfo=timezone.utc)):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rows = settle_pending(self.cfg, api, at)
+        return rows, out.getvalue()
+
+    def parlay(self, *legs):
+        import json
+        mk = lambda gid, sport, home, away, market, outcome, point: {
+            "event_id": gid, "sport_key": sport, "home_team": home, "away_team": away, "market": market,
+            "outcome": outcome, "point": point, "price": 2.0, "player": "", "n_outcomes": 2,
+            "commence_time": "2026-10-03T23:00:00Z"}
+        append_csv(self.cfg.parlay_log_file, ["first_seen", "book", "price", "fair_prob", "best_ev_pct", "stake",
+                                              "games", "legs", "legs_json"],
+                   {"first_seen": "2026-10-03T20:00:00+00:00", "book": "B", "price": 4.0, "fair_prob": 0.27,
+                    "best_ev_pct": 5, "stake": 10, "games": "x", "legs": "y",
+                    "legs_json": json.dumps([mk(*l) for l in legs])})
+
+    MLB_SPREAD = ("mlb1", "baseball_mlb", "Los Angeles Dodgers", "San Diego Padres", "spreads", "Los Angeles Dodgers",
+                  -1.5)
+
+    def test_a_rain_held_bet_is_written_once_shown_as_rain_and_left_out_of_the_record(self):
+        self.games = [espn(**self.RAIN)]
+        self.log("mlb1", "h2h", "Los Angeles Dodgers", **self.MLB)
+        self.log("mlb1", "spreads", "Los Angeles Dodgers", -1.5, **self.MLB)
+        self.log("mlb1", "totals", "Over", 7.5, **self.MLB)
+        api = self.TwoGames()
+        rows, out = self.settle(api)
+        self.assertEqual([(r["market"], r["result"]) for r in rows], [("h2h", "win")])   # only real grades returned
+        self.assertEqual(out.count("ended before the 9th"), 1)                          # said once, for the game
+        rows, out = self.settle(api)
+        self.assertEqual((rows, out, api.calls, len(self.asked)), ([], "", ["baseball_mlb"], 1))  # never asked again
+        later = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)                       # long after: would be "stuck"
+        day = _arbbot.local_day(self.cfg, self.MLB["start"])
+        bets = _arbbot.day_bets(self.cfg, day)
+        lines = {r["market"]: _arbbot.result_line(r, self.cfg, later) for r in bets}
+        for m in ("spreads", "totals"):
+            self.assertIn("🌧️", lines[m])
+            self.assertIn("· game ended early (rain): books usually void run lines and totals, check your book",
+                          lines[m])
+            self.assertNotIn("check the box score", lines[m])
+        summary = _arbbot.day_summary(bets, self.cfg, later)
+        self.assertIn("🌧️ 2 on games that ended early (rain): check your book", summary)
+        self.assertNotIn("to check yourself", summary)
+        self.assertNotIn("still to finish", summary)
+        self.assertIn("**All:** 1-0 ·", summary)                                         # the record: the moneyline
+        self.assertTrue(_arbbot.ev_record(self.cfg).startswith("1 bets, 1-0-0"))
+        self.assertEqual(_arbbot._record(_read(self.cfg.ev_results_file))[:3], (1, 0, 0))
+
+    def test_a_parlay_waiting_only_on_a_rain_held_leg_is_written_once_for_you_to_check(self):
+        self.games = [espn(**self.NBA), espn(gid="9", **self.RAIN)]
+        self.parlay(self.MLB_SPREAD, ("nba7", "basketball_nba", "Boston Celtics", "New York Knicks", "h2h",
+                                      "Boston Celtics", ""))
+        api = self.TwoGames()
+        rows, out = self.settle(api)
+        self.assertEqual((rows, out.count("ended before the 9th")), ([], 1))
+        [row] = _read(self.cfg.ev_results_file)
+        self.assertEqual((row["kind"], row["result"], row["actual"]), ("parlay", "", "rain-shortened"))
+        self.assertEqual(self.settle(api)[0], [])
+        self.assertEqual(len(api.calls), 2)                                              # not fetched again
+        later = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+        [bet] = _arbbot.day_bets(self.cfg, _arbbot.local_day(self.cfg, self.MLB["start"]))
+        self.assertIn("🌧️", _arbbot.result_line(bet, self.cfg, later))
+        self.assertIn("has a leg on a game that ended early (rain)", _arbbot.result_line(bet, self.cfg, later))
+        summary = _arbbot.day_summary([bet], self.cfg, later)
+        self.assertIn("🌧️ 1 on a game that ended early (rain): check your book", summary)
+        self.assertNotIn("prop leg", summary)
+        self.assertIn("no graded bets yet", summary)
+
+    def test_a_parlay_still_waiting_on_another_game_isnt_written_yet(self):
+        self.games = [espn(gid="9", **self.RAIN)]
+        self.parlay(self.MLB_SPREAD, ("nba7", "basketball_nba", "Boston Celtics", "New York Knicks", "h2h",
+                                      "Boston Celtics", ""))
+
+        class NotFinal(self.TwoGames):
+            def scores(self, s, days_from=3):
+                return [dict(g, completed=False) if g["id"] == "nba7" else g for g in super().scores(s, days_from)]
+        self.assertEqual(self.settle(NotFinal())[0], [])
+        self.assertFalse(Path(self.cfg.ev_results_file).exists())                       # the NBA game isn't over
+        self.games.append(espn(**self.NBA))
+        _arbbot._ESPN_CACHE.clear()
+        self.settle(self.TwoGames())
+        [row] = _read(self.cfg.ev_results_file)
+        self.assertEqual((row["result"], row["actual"]), ("", "rain-shortened"))
+
+    def test_a_parlay_lost_on_another_leg_with_a_rain_held_leg_stays_out_of_the_record(self):
+        self.games = [espn(**self.NBA), espn(gid="9", **self.RAIN)]
+        self.parlay(self.MLB_SPREAD, ("nba7", "basketball_nba", "Boston Celtics", "New York Knicks", "h2h",
+                                      "New York Knicks", ""))
+        rows, _ = self.settle(self.TwoGames())
+        self.assertEqual([(r["kind"], r["result"], r["manual_legs"]) for r in rows], [("parlay", "loss", 1)])
+
+    def test_a_totals_only_bet_on_a_rain_shortened_game_isnt_graded_with_free_scores_off(self):
+        self.cfg = replace(self.cfg, free_scores="off")
+        self.games = [espn(**self.RAIN)]
+        self.log("mlb1", "totals", "Over", 7.5, **self.MLB)
+        rows, _, checks, _ = self.grade((4, 1), sport="baseball_mlb", gid="mlb1", home="Los Angeles Dodgers",
+                                        away="San Diego Padres")
+        self.assertEqual((rows, checks), ([], []))
+        [row] = _read(self.cfg.ev_results_file)
+        self.assertEqual((row["market"], row["result"], row["actual"]), ("totals", "", "rain-shortened"))
+
+    def test_rain_checks_go_first_when_espn_is_slow(self):
+        from unittest import mock
+        # A shadow-only NBA game is logged first, then a full-length MLB game with a run line bet;
+        # there's time for one ESPN check. It goes to the rain check, so the run line is graded now.
+        self.games = [espn(**self.NBA), espn(gid="9", **self.FULL)]
+        self.log("nba7", "h2h", "Boston Celtics")
+        self.log("mlb1", "spreads", "Los Angeles Dodgers", -1.5, **self.MLB)
+        real, asked = _arbbot.espn_final, []
+
+        def one_then_out(*a, **k):
+            asked.append(a[0])
+            _arbbot.ESPN_PASS_SECONDS = -1          # out of time after the first game
+            return real(*a, **k)
+        with mock.patch.object(_arbbot, "ESPN_PASS_SECONDS", 15), mock.patch("arbbot.espn_final", one_then_out):
+            rows, _ = self.settle(self.TwoGames())
+        self.assertEqual(asked, ["baseball_mlb"])
+        self.assertEqual(sorted(r["market"] for r in rows), ["h2h", "spreads"])
+
+    def test_the_agreement_count_and_where_results_print_it(self):
+        import argparse, contextlib, io
+        from unittest import mock
+        self.assertEqual(_arbbot.score_check_line(self.cfg), "")                         # nothing logged yet
+        for gid, v in (("a", "agree"), ("b", "disagree"), ("c", "espn: not found")):
+            append_csv(self.cfg.score_check_file, _arbbot.SCORE_CHECK_FIELDS, {"event_id": gid, "verdict": v})
+        line = _arbbot.score_check_line(self.cfg)
+        self.assertEqual(line, "ESPN's free scoreboard agreed on 1 of 3 finals (1 disagreement; the rest it couldn't "
+                               f"grade). Details: {self.cfg.score_check_file}")
+        d = Path(self.tmp.name)
+        cfg = replace(self.cfg, state_dir=str(d / "state"), log_file=str(d / "arbs.csv"))
+        args = argparse.Namespace(once=False, demo=False, dry_run=False, plan=False, check_kalshi=False,
+                                  results="today", post_results=None)
+        out = io.StringIO()
+        with mock.patch("arbbot.OddsAPI", lambda cfg: SimpleNamespace(remaining=None)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        self.assertIn(line, out.getvalue())
+
+    def test_a_scoreboard_event_without_two_teams_isnt_a_final(self):
+        from unittest import mock
+        # (_espn_game already skips these; espn_final doesn't count on it.)
+        ev = {"competitions": [{"status": {"type": {"name": "STATUS_FINAL", "completed": True, "state": "post"}},
+                                "competitors": [{"team": {"displayName": "Boston Celtics"}, "score": "1"}] * 3}]}
+        with mock.patch("arbbot._espn_game", return_value=ev):
+            self.assertEqual(self.final(), (None, "not two teams"))
+
+
+class DataFilesStayOutOfGit(unittest.TestCase):
+    def test_every_default_data_file_is_in_gitignore(self):
+        # The server's copy is a git checkout: a data file git doesn't ignore shows up as changed by
+        # hand, and could be committed with the code.
+        from dataclasses import fields
+        ignored = (Path(__file__).parent / ".gitignore").read_text().split()
+        d = Config()
+        files = [getattr(d, f.name) for f in fields(Config) if f.name.endswith("_file")]
+        self.assertIn("score_checks.csv", files)
+        for name in files:
+            self.assertIn(name, ignored)
+        self.assertIn(d.state_dir + "/", ignored)
+
+
+class UpcomingProbe(unittest.TestCase):
+    """--check-upcoming: one look at the combined live call, compared with each sport's own."""
+
+    def api(self, combined, per_sport, schedule):
+        live = lambda gid, sport, books: {"id": gid, "sport_key": sport, "commence_time": "2026-10-03T11:30:00Z",
+                                         "home_team": "H", "away_team": "A", "bookmakers": [{"key": b} for b in books]}
+
+        class Api:
+            remaining = used = None
+            calls = []
+            def events(self, sport, horizon_hours=26):
+                return [{"id": g, "commence_time": "2026-10-03T11:30:00Z"} for g in schedule.get(sport, [])]
+            def _request(self, path, params):
+                Api.calls.append((path, params["markets"]))
+                if path == "/sports/upcoming/odds":
+                    return [live(g, s, b) for g, s, b in combined], 1.0
+                sport = path.split("/")[2]
+                return [live(g, sport, b) for g, b in per_sport.get(sport, [])], 1.0
+        return Api()
+
+    def probe(self, api, cfg=None):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rep = _arbbot.check_upcoming(cfg or Config(sports=["basketball_nba", "icehockey_nhl"], live_markets="h2h"),
+                                         api, NOW)
+        return rep, out.getvalue()
+
+    def test_reports_cost_missing_games_and_books(self):
+        api = self.api(combined=[("n1", "basketball_nba", "ab"), ("h1", "icehockey_nhl", "ab"), ("s1", "soccer_epl", "ab")],
+                       per_sport={"basketball_nba": [("n1", "ab")], "icehockey_nhl": [("h1", "abc"), ("h2", "ab")]},
+                       schedule={"basketball_nba": ["n1", "n2"], "icehockey_nhl": ["h1", "h2"]})
+        rep, text = self.probe(api)
+        self.assertEqual((rep["cost"], rep["formula"]), (1.0, 1))
+        self.assertEqual(rep["missing"], {"basketball_nba": [], "icehockey_nhl": ["h2"]})
+        self.assertEqual(rep["schedule_only"]["basketball_nba"], ["n2"])     # it ended: not the combined call's fault
+        self.assertEqual(rep["fewer_books"]["icehockey_nhl"], ["A @ H: no c"])
+        self.assertIn("Don't switch", text)
+        self.assertEqual({m for _, m in api.calls}, {"h2h"})                  # LIVE_MARKETS only
+
+    def test_a_game_only_the_schedule_calls_live_doesnt_fail_it(self):
+        api = self.api(combined=[("n1", "basketball_nba", "ab"), ("h1", "icehockey_nhl", "ab")],
+                       per_sport={"basketball_nba": [("n1", "ab")], "icehockey_nhl": [("h1", "ab")]},
+                       schedule={"basketball_nba": ["n1", "n0"], "icehockey_nhl": ["h1"]})
+        rep, text = self.probe(api)
+        self.assertEqual(rep["missing"], {"basketball_nba": [], "icehockey_nhl": []})
+        self.assertIn("Looks good: the combined call had every live game for 1 credits instead of 2", text)
+
+    def test_nothing_live_costs_nothing(self):
+        api = self.api(combined=[], per_sport={}, schedule={"basketball_nba": []})
+        rep, text = self.probe(api)
+        self.assertEqual(api.calls, [])
+        self.assertIn("No credits used", text)
+
+    def test_the_command_line_flag(self):
+        import os, sys, contextlib, io
+        from unittest import mock
+        loop = AssertionError("the main loop started")
+        with mock.patch.dict(os.environ, {"ODDS_API_KEY": "k", "STATE_DIR": ""}), \
+                mock.patch.object(sys, "argv", ["arbbot.py", "--check-upcoming"]), mock.patch("arbbot.load_dotenv"), \
+                mock.patch("arbbot.check_upcoming") as probe, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(_arbbot.Scheduler, "refresh_events", side_effect=loop), \
+                mock.patch("arbbot.time.sleep", side_effect=loop):
+            _arbbot.main()
+        self.assertEqual(probe.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ ev_results.csv
 outliers.csv
 closing_lines.csv
 markouts.csv
+score_checks.csv
 parlays.csv
 state/
 .update-skipped
