@@ -150,7 +150,8 @@ Kalshi says the price isn't good. Outliers need Kalshi to agree as well. When it
 the card says "Kalshi agrees" and the bet's confidence goes up. Each card shows Kalshi's line
 ("Kalshi 51% to win, buy 52¢ · sell 50¢"). Kalshi prices only count when its market is tight
 (`KALSHI_MAX_SPREAD=3` cents, 5 for college) and deep (`KALSHI_MIN_SIZE=100` contracts); if Kalshi
-is down or a game isn't listed, alerts go ahead as before. See what it matches with
+is down or a game isn't listed, alerts go ahead as before. For a bet at Kalshi itself, Kalshi's own
+order book is used to confirm the price is still there instead. See what it matches with
 `python arbbot.py --check-kalshi`.
 
 **Bigger edge, new alert.** Discord doesn't ping you when a message is edited. So if a bet's edge

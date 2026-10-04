@@ -1817,7 +1817,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                     fair[k], sharp_name[k], n_used[k], n_total[k] = probs, f"consensus of {n} books", n, n
 
         # Every soft-book price that beats fair by enough (and every price, for the board).
-        offers: dict[tuple, list[tuple[float, str, str, float | None]]] = {}
+        offers: dict[tuple, list[tuple[float, str, str, float | None, str]]] = {}
         boards: dict[tuple, list[tuple[str, float, float, str, bool]]] = {}
         for key, bm in books.items():
             if key in sharp or (allowed and key not in allowed):
@@ -1840,11 +1840,11 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                     if max(cfg.min_ev_pct, cfg.sport_min_ev.get(ev.get("sport_key", ""), 0)) <= ev_pct <= cfg.max_ev_pct:
                         link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
                         offers.setdefault((k, oc["name"]), []).append(
-                            (price, bm.get("title", key), link, oc.get("point")))
+                            (price, bm.get("title", key), link, oc.get("point"), key))
 
         for (k, name), lst in offers.items():
             lst.sort(key=lambda o: (-o[0], o[1]))   # best price; ties by book name, so it's stable
-            price, book, link, point = lst[0]
+            price, book, link, point, book_key = lst[0]
             bet = EVBet(
                 event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
                 sport_key=ev.get("sport_key", ""), matchup=f"{ev['away_team']} @ {ev['home_team']}",
@@ -1853,7 +1853,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 market=k[0], line=k[1], outcome=name, point=point,
                 book=book, price=price, link=link,
                 fair_prob=fair[k][name], sharp_book=sharp_name[k], n_outcomes=len(fair[k]),
-                also=[(b, pr) for pr, b, _, _ in lst[1:]],
+                also=[(b, pr) for pr, b, *_ in lst[1:]],
                 sources_used=n_used[k], sources_total=n_total[k], unit_size=cfg.unit_size,
                 sharp_quotes=[(titles[sk], [outs[name]] + [pr for n, pr in outs.items() if n != name])
                               for sk, outs in raw_src.get(k, {}).items() if name in outs],
@@ -1875,11 +1875,15 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
             kgap = None
             if k[0] == "h2h" and kalshi and name in kalshi.get(ev["id"], {}):
                 bet.kalshi = kalshi[ev["id"]][name]
-                kgap = round(abs(bet.kalshi[0] - bet.fair_prob) * 100, 6)
-                if kgap > kalshi_gap_limit(cfg, ev.get("sport_key", ""), hours):
-                    continue
-                if not book.lower().startswith("kalshi") and bet.kalshi[0] * price < 1:
-                    continue
+                if book_key == "kalshi":
+                    if not kalshi_still_there(bet.kalshi, price, cfg):
+                        continue   # Kalshi's own order book no longer has this price
+                else:
+                    kgap = round(abs(bet.kalshi[0] - bet.fair_prob) * 100, 6)
+                    if kgap > kalshi_gap_limit(cfg, ev.get("sport_key", ""), hours):
+                        continue
+                    if bet.kalshi[0] * price < 1:
+                        continue
             move = history.record((ev["id"], k[0], k[1], name), now, bet.fair_prob) if history and from_sharp else None
             bet.confidence, bet.confidence_notes = rate_confidence(hold, gap, hours, bet.ev_pct, is_prop(k[1]), move,
                                                                    kgap)
@@ -2060,9 +2064,18 @@ KALSHI_ALIASES = {   # Kalshi team labels the usual name matching can't read -> 
     "ulmonroe": "Louisiana Monroe Warhawks",
 }
 KALSHI_MIN_GAP = 0.2            # seconds between Kalshi calls (at most 5 a second)
+KALSHI_TIMEOUT = 5              # seconds to wait for Kalshi before giving up on it for this scan
+KALSHI_SCAN_SECONDS = 8         # stop asking Kalshi for more sports once a scan has spent this long on it
+KALSHI_COOLDOWNS = (60, 300, 900)   # after Kalshi can't be reached: leave it alone this long (grows)
+COLLEGE_QUALIFIERS = {   # "Texas" mustn't claim "Texas Southern" / "Texas A&M" / "Texas State"...
+    "state", "st", "tech", "am", "at", "southern", "northern", "eastern", "western", "central", "pine",
+    "valley", "international", "intl", "atlantic", "gulf", "christian", "baptist", "oh", "fl", "city",
+    "upstate", "monroe", "lafayette", "poly", "wesleyan", "methodist", "little", "el", "rio", "san",
+    "arlington", "martin", "chattanooga", "commerce", "corpus", "coast", "mountain",
+}
 KALSHI_MAX_ASK_SUM = 1.10       # both teams' asks together above this: not a real market yet
 KALSHI_MID_SUM = (0.96, 1.04)   # both teams' middle prices should add up to about 100%
-_KALSHI_STATE = {"host": 0, "last": 0.0, "pause_until": 0.0}
+_KALSHI_STATE = {"host": 0, "last": 0.0, "pause_until": 0.0, "fails": 0}
 _KALSHI_WARNED: dict[str, float] = {}
 _MONTHS = {m: i for i, m in enumerate(("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
                                         "NOV", "DEC"), 1)}
@@ -2122,14 +2135,16 @@ def _kalshi_start(ticker: str) -> datetime | None:
     return datetime.combine(day, dtime(int(m.group(1)), int(m.group(2))), ZoneInfo("America/New_York"))
 
 
-def _kalshi_label_match(team: str, label: str) -> bool:
+def _kalshi_label_match(team: str, label: str, college: bool = False) -> bool:
     """Does a Kalshi team label ("Tampa Bay", "New York G", "Los Angeles R", "LA Rams") name this
-    team ("Tampa Bay Buccaneers")?"""
+    team ("Tampa Bay Buccaneers")? In college, a label that stops just before "State", "Tech",
+    "A&M", "Southern"... names a different school ("Texas" isn't "Texas Southern Tigers")."""
     t, l = _words(team), _words(label)
     if not t or not l or len(l) > len(t):
         return False
     if l[:-1] == t[:len(l) - 1] and t[len(l) - 1].startswith(l[-1]):
-        return True                                   # same start, last word maybe shortened
+        if not (college and len(t) > len(l) and t[len(l)] in COLLEGE_QUALIFIERS):
+            return True                               # same start, last word maybe shortened
     return len(l[-1]) > 2 and l[-1] == t[-1]          # same nickname
 
 
@@ -2146,9 +2161,9 @@ def _kalshi_strength(team: str, m: dict, pro: bool) -> int:
     The team label first (and the alias table for labels like "Chicago WS"), then, in pro sports
     only, the team code at the end of the ticker."""
     label = m.get("yes_sub_title") or ""
-    best = len(_words(label)) if _kalshi_label_match(team, label) else 0
+    best = len(_words(label)) if _kalshi_label_match(team, label, not pro) else 0
     alias = KALSHI_ALIASES.get(_norm(label))
-    if alias and _kalshi_label_match(team, alias):
+    if alias and _kalshi_label_match(team, alias, not pro):
         best = max(best, len(_words(alias)))
     if not best and pro and _kalshi_code_match(team, (m.get("ticker") or "").rsplit("-", 1)[-1]):
         best = 1
@@ -2177,7 +2192,7 @@ def _kalshi_fetch(url: str) -> dict:
             time.sleep(gap)
         _KALSHI_STATE["last"] = time.time()
         try:
-            return _get_json(url)
+            return _get_json(url, timeout=KALSHI_TIMEOUT)
         except urllib.error.HTTPError as e:
             if e.code != 429:
                 raise
@@ -2190,19 +2205,24 @@ def _kalshi_fetch(url: str) -> dict:
 
 def _kalshi_get(query: str) -> dict:
     """GET a Kalshi market-data page (public, no key; cached 30 s). Starts with the address that
-    worked last time and tries the other if it fails (but not when Kalshi asked to slow down)."""
+    worked last time and tries the other if it fails (but not when Kalshi asked to slow down).
+    When neither address answers (down, timing out, blocked), Kalshi is left alone for a minute,
+    then 5, then 15, so an outage never slows the scans down."""
     def fetch() -> dict:
         if time.time() < _KALSHI_STATE["pause_until"]:
-            raise RuntimeError("Kalshi asked the bot to slow down; trying again in a couple of minutes")
+            raise RuntimeError(f"Kalshi paused until {datetime.fromtimestamp(_KALSHI_STATE['pause_until']):%H:%M:%S} "
+                               "(it was unreachable or asked the bot to slow down)")
         bases = list(dict.fromkeys(KALSHI_APIS))
         first = _KALSHI_STATE["host"] % len(bases)
         last: Exception | None = None
+        unreachable = True
         for base in bases[first:] + bases[:first]:
             try:
                 data = _kalshi_fetch(f"{base}/{query}")
             except urllib.error.HTTPError as e:
                 if e.code == 429:
                     raise
+                unreachable = unreachable and e.code >= 500   # a 4xx is about this page, not Kalshi
                 last = e
                 continue
             except Exception as e:  # noqa: BLE001 - timeouts, refused connections, bad JSON
@@ -2212,22 +2232,33 @@ def _kalshi_get(query: str) -> dict:
                 last = ValueError(f"unexpected reply from {base}")
                 continue
             _KALSHI_STATE["host"] = bases.index(base)
+            _KALSHI_STATE["fails"] = 0
             return data
+        if unreachable:
+            wait = KALSHI_COOLDOWNS[min(_KALSHI_STATE["fails"], len(KALSHI_COOLDOWNS) - 1)]
+            _KALSHI_STATE["fails"] += 1
+            _KALSHI_STATE["pause_until"] = time.time() + wait
         raise last or RuntimeError("no Kalshi address to try")
     return _cached("kalshi:" + query, fetch, ttl=30)
 
 
 def kalshi_markets(sport_key: str) -> list[dict]:
-    """Open game-winner markets for a sport."""
+    """Open game-winner markets for a sport. A series name Kalshi doesn't know (a 4xx) moves on
+    to the next name; any other failure is raised."""
     for series in KALSHI_SERIES.get(sport_key, []):
         out, cursor = [], ""
-        for _ in range(5):   # pages of up to 1,000
-            page = _kalshi_get(f"markets?series_ticker={series}&status=open&limit=1000"
-                               + (f"&cursor={urllib.parse.quote(cursor)}" if cursor else ""))
-            out += [m for m in page.get("markets") or [] if isinstance(m, dict)]
-            cursor = page.get("cursor") or ""
-            if not cursor:
-                break
+        try:
+            for _ in range(5):   # pages of up to 1,000
+                page = _kalshi_get(f"markets?series_ticker={series}&status=open&limit=1000"
+                                   + (f"&cursor={urllib.parse.quote(str(cursor))}" if cursor else ""))
+                out += [m for m in page.get("markets") or [] if isinstance(m, dict)]
+                cursor = page.get("cursor") or ""
+                if not cursor:
+                    break
+        except urllib.error.HTTPError as e:
+            if not 400 <= e.code < 500 or e.code == 429:
+                raise
+            continue
         if out:
             return out
     return []
@@ -2259,7 +2290,9 @@ def _kalshi_problem(ms: tuple[dict, dict], cfg: Config, sport_key: str) -> str:
         if round((q[1] - q[0]) * 100, 6) > kalshi_spread_limit(cfg, sport_key):
             return f"quotes too wide ({(q[1] - q[0]) * 100:.0f}¢ between bid and ask)"
         sizes = [_kalshi_num(m, f) for f in ("yes_bid_size_fp", "yes_ask_size_fp")]
-        if any(s is not None and s < cfg.kalshi_min_size for s in sizes):
+        if any(s is None for s in sizes):
+            return "Kalshi didn't say how many contracts are on offer"
+        if any(s < cfg.kalshi_min_size for s in sizes):
             return f"fewer than {cfg.kalshi_min_size:.0f} contracts at the best price"
         quotes.append(q)
     asks, mids = quotes[0][1] + quotes[1][1], sum((b + a) / 2 for b, a in quotes)
@@ -2278,85 +2311,120 @@ def kalshi_fair(events: list[dict], cfg: Config, now: datetime | None = None,
     enough (KALSHI_MIN_SIZE) and add up. Anything missing or odd means no Kalshi price for that game,
     and alerts go ahead as they would without Kalshi. `report`, if given, gets
     {event id: (Kalshi event ticker or "", why it wasn't used or "")} for --check-kalshi."""
-    if not cfg.kalshi_check:
+    if not kalshi_useful(cfg):
         return {}
     now = now or datetime.now(timezone.utc)
     tz = ZoneInfo("America/New_York")
     report = {} if report is None else report
     out: dict[str, dict] = {}
+    t0 = time.monotonic()
     for sport in sorted({ev.get("sport_key", "") for ev in events} & set(KALSHI_SERIES)):
-        evs = []
-        for ev in events:
-            if ev.get("sport_key") != sport:
-                continue
-            if cfg.kalshi_live or now < _parse_time(ev["commence_time"]):
-                evs.append(ev)
-            else:
+        pool = [ev for ev in events if ev.get("sport_key") == sport]
+        use = {ev["id"] for ev in pool if cfg.kalshi_live or now < _parse_time(ev["commence_time"])}
+        for ev in pool:
+            if ev["id"] not in use:
                 report[ev["id"]] = ("", "game has started (KALSHI_LIVE=false)")
-        if not evs:
+        if not use:
             continue   # nothing before kickoff: no need to ask Kalshi
+        if time.monotonic() - t0 > KALSHI_SCAN_SECONDS:
+            for i in use:
+                report[i] = ("", "skipped: Kalshi was slow this scan")
+            continue
         try:
             markets = kalshi_markets(sport)
         except Exception as e:  # noqa: BLE001 - Kalshi down or refusing: carry on without it
-            if time.time() - _KALSHI_WARNED.get(sport, 0) > 3600:   # say so once an hour, not every scan
-                _KALSHI_WARNED[sport] = time.time()
-                print(f"! Kalshi prices unavailable for {sport}: {e!r:.120}", file=sys.stderr)
-            for ev in evs:
-                report[ev["id"]] = ("", f"couldn't reach Kalshi ({e!r:.80})")
+            _kalshi_warn(sport, f"! Kalshi prices unavailable for {sport}: {e!r:.120}")
+            for i in use:
+                report[i] = ("", f"couldn't reach Kalshi ({e!r:.80})")
             continue
-        games: dict[str, list[dict]] = {}
-        for m in markets:
-            games.setdefault(m.get("event_ticker") or "", []).append(m)
-        pro = "ncaa" not in sport
-        # Each game takes its single best-fitting Kalshi game (same Eastern date, and for MLB a start
-        # within 90 minutes; the longest team-name match wins). A Kalshi game that two games both
-        # pick is used by neither: better no second opinion than someone else's.
-        best: dict[str, tuple[str, dict, dict] | None] = {}
-        for ev in evs:
-            start = _parse_time(ev["commence_time"])
-            fits: list[tuple[int, str, dict, dict]] = []
-            for day in dict.fromkeys((start.astimezone(tz).date(), start.date())):
-                for ticker, ms in games.items():
-                    if len(ms) != 2 or _kalshi_day(ticker) != day:
-                        continue
-                    when = _kalshi_start(ticker)
-                    if when is not None and abs((when - start).total_seconds()) > 90 * 60:
-                        continue   # the other game of a doubleheader
-                    pair = _kalshi_pair(ev, ms, pro)
-                    if pair:
-                        fits.append((pair[0], ticker, pair[1], pair[2]))
-                if fits:
-                    break   # the Eastern date found it; only try the UTC date if it didn't
-            fits.sort(key=lambda f: -f[0])
-            if not fits:
-                best[ev["id"]] = None
-                report[ev["id"]] = ("", "no Kalshi game found for it")
-            elif len(fits) > 1 and fits[0][0] == fits[1][0]:
-                best[ev["id"]] = None
-                report[ev["id"]] = ("", f"{fits[0][1]} and {fits[1][1]} both fit; can't tell which")
-            else:
-                best[ev["id"]] = fits[0][1:]
-        picked: dict[str, int] = {}
-        for b in best.values():
-            if b:
-                picked[b[0]] = picked.get(b[0], 0) + 1
-        for ev in evs:
-            b = best.get(ev["id"])
-            if not b:
-                continue
-            ticker, hm, am = b
-            if picked[ticker] > 1:
-                report[ev["id"]] = (ticker, "that Kalshi game also fits another game; not using it")
-                continue
-            why = _kalshi_problem((hm, am), cfg, sport)
-            report[ev["id"]] = (ticker, why)
-            if why:
-                continue
-            (hb, ha), (ab, aa) = _kalshi_quote(hm), _kalshi_quote(am)
-            h_mid, a_mid = (hb + ha) / 2, (ab + aa) / 2
-            out[ev["id"]] = {ev["home_team"]: (h_mid / (h_mid + a_mid), hb, ha),
-                             ev["away_team"]: (a_mid / (h_mid + a_mid), ab, aa)}
+        try:
+            out.update(_kalshi_match(pool, use, markets, sport, cfg, tz, report))
+        except Exception as e:  # noqa: BLE001 - an odd reply must never stop the scan
+            _kalshi_warn("read:" + sport, f"! Couldn't read Kalshi's {sport} markets: {e!r:.120}")
     return out
+
+
+def _kalshi_warn(key: str, msg: str) -> None:
+    """Log a Kalshi problem once an hour, not every scan."""
+    if time.time() - _KALSHI_WARNED.get(key, 0) > 3600:
+        _KALSHI_WARNED[key] = time.time()
+        print(msg, file=sys.stderr)
+
+
+def _kalshi_match(pool: list[dict], use: set[str], markets: list[dict], sport: str, cfg: Config,
+                  tz, report: dict) -> dict[str, dict]:
+    """Match the sport's games to Kalshi games and read the usable prices (see kalshi_fair).
+
+    Each game takes its single best-fitting Kalshi game (same Eastern date, and for MLB a start
+    within 90 minutes; the longest team-name match wins). A Kalshi game that two games both pick is
+    used by neither: better no second opinion than someone else's. Games that have started still
+    take part in the matching, so their Kalshi game can't be handed to a later one."""
+    games: dict[str, list[dict]] = {}
+    for m in markets:
+        games.setdefault(str(m.get("event_ticker") or ""), []).append(m)
+    pro = "ncaa" not in sport
+    best: dict[str, tuple[str, dict, dict] | None] = {}
+    for ev in pool:
+        start = _parse_time(ev["commence_time"])
+        fits: list[tuple[int, str, dict, dict]] = []
+        for day in dict.fromkeys((start.astimezone(tz).date(), start.date())):
+            for ticker, ms in games.items():
+                if len(ms) != 2 or _kalshi_day(ticker) != day:
+                    continue
+                when = _kalshi_start(ticker)
+                if when is not None and abs((when - start).total_seconds()) > 90 * 60:
+                    continue   # the other game of a doubleheader
+                pair = _kalshi_pair(ev, ms, pro)
+                if pair:
+                    fits.append((pair[0], ticker, pair[1], pair[2]))
+            if fits:
+                break   # the Eastern date found it; only try the UTC date if it didn't
+        fits.sort(key=lambda f: -f[0])
+        best[ev["id"]] = None
+        if not fits:
+            reason = "no Kalshi game found for it"
+        elif len(fits) > 1 and fits[0][0] == fits[1][0]:
+            reason = f"{fits[0][1]} and {fits[1][1]} both fit; can't tell which"
+        else:
+            best[ev["id"]], reason = fits[0][1:], ""
+        if reason and ev["id"] in use:
+            report[ev["id"]] = ("", reason)
+    picked: dict[str, int] = {}
+    for b in best.values():
+        if b:
+            picked[b[0]] = picked.get(b[0], 0) + 1
+    out: dict[str, dict] = {}
+    for ev in pool:
+        b = best.get(ev["id"])
+        if not b or ev["id"] not in use:
+            continue
+        ticker, hm, am = b
+        if picked[ticker] > 1:
+            report[ev["id"]] = (ticker, "that Kalshi game also fits another game; not using it")
+            continue
+        why = _kalshi_problem((hm, am), cfg, sport)
+        report[ev["id"]] = (ticker, why)
+        if why:
+            continue
+        (hb, ha), (ab, aa) = _kalshi_quote(hm), _kalshi_quote(am)
+        h_mid, a_mid = (hb + ha) / 2, (ab + aa) / 2
+        out[ev["id"]] = {ev["home_team"]: (h_mid / (h_mid + a_mid), hb, ha),
+                         ev["away_team"]: (a_mid / (h_mid + a_mid), ab, aa)}
+    return out
+
+
+def kalshi_useful(cfg: Config) -> bool:
+    """Would a Kalshi price change anything this scan? (Moneyline +EV or outliers, before games.)"""
+    return (cfg.kalshi_check and (cfg.ev_enabled or cfg.outliers_enabled) and "h2h" in _csv(cfg.markets)
+            and not (cfg.live_only and not cfg.kalshi_live))
+
+
+def kalshi_still_there(q: tuple[float, float, float], price: float, cfg: Config) -> bool:
+    """For a bet AT Kalshi: is Kalshi's own best ask, after its fee, still at least this price?
+    (Kalshi's quote can't be a second opinion on itself, but it does show the price is real.)"""
+    ask = q[2]
+    real = 1 / (ask + cfg.kalshi_fee_rate * ask * (1 - ask))
+    return real >= price * 0.995
 
 
 def check_kalshi(cfg: Config, api: "OddsAPI", now: datetime | None = None) -> None:
@@ -2384,7 +2452,8 @@ def check_kalshi(cfg: Config, api: "OddsAPI", now: datetime | None = None) -> No
         for ev in events:
             ev.setdefault("sport_key", sport)
         report: dict = {}
-        fair = kalshi_fair(events, replace(cfg, kalshi_check=True), now=now, report=report)
+        fair = kalshi_fair(events, replace(cfg, kalshi_check=True, ev_enabled=True, markets="h2h", live_only=False),
+                           now=now, report=report)
         print(f"{short(sport)}: {len(markets)} open Kalshi markets, {len(fair)} of {len(events)} upcoming games usable")
         if markets:
             m = markets[0]
@@ -2392,6 +2461,9 @@ def check_kalshi(cfg: Config, api: "OddsAPI", now: datetime | None = None) -> No
                   f"bid {m.get('yes_bid_dollars')} ask {m.get('yes_ask_dollars')} "
                   f"(sizes {m.get('yes_bid_size_fp')} / {m.get('yes_ask_size_fp')})")
             print(f"  fields: {', '.join(sorted(m))[:400]}")
+            if _kalshi_num(m, "yes_bid_size_fp") is None:
+                print("  ⚠️ Kalshi's reply doesn't say how many contracts are on offer (yes_bid_size_fp), so every "
+                      "game is skipped. The bot needs an update for Kalshi's new format.")
         for ev in events[:12]:
             f = fair.get(ev["id"])
             ticker, why = report.get(ev["id"], ("", ""))
@@ -2495,7 +2567,8 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                         continue
                     # So does Kalshi's exchange price, when there is one (before the game only, unless KALSHI_LIVE).
                     kq = kalshi.get(ev["id"], {}).get(name) if kalshi and k[0] == "h2h" else None
-                    if kq is not None and (kq[0] * price - 1) * 100 < cfg.min_ev_pct:
+                    if kq is not None and (not kalshi_still_there(kq, price, cfg) if bk == "kalshi"
+                                           else (kq[0] * price - 1) * 100 < cfg.min_ev_pct):
                         continue
                     board = sorted(((titles[b], oo[name], (fair_p * oo[name] - 1) * 100,
                                      links.get((k, b, name), ""), True)
@@ -3234,11 +3307,11 @@ def _norm(name: str) -> str:
 _ESPN_CACHE: dict[str, tuple[float, dict]] = {}
 
 
-def _get_json(url: str) -> dict:
-    """GET a public JSON page (free stats sites, no key)."""
+def _get_json(url: str, timeout: float = 20) -> dict:
+    """GET a public JSON page (free stats sites and Kalshi, no key)."""
     req = urllib.request.Request(url, headers={
         "User-Agent": "arbbot/3.0 (bet results)", "Accept-Encoding": "gzip", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read()
         if resp.headers.get("Content-Encoding") == "gzip":
             raw = gzip.decompress(raw)

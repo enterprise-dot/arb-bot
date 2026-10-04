@@ -17,7 +17,7 @@ from arbbot import (LIVE, PREGAME, EARLY, FAR, Alerter, Config, EVAlerter, Outli
 import arbbot as _arbbot
 
 
-def _no_network(path):
+def _no_network(path, timeout=None):
     raise OSError("tests don't use the network")
 
 
@@ -2994,7 +2994,7 @@ class ConsensusStake(unittest.TestCase):
 
 def kalshi_market(event, team_code, label, bid, ask, dollars=True, **extra):
     m = {"ticker": f"{event}-{team_code}", "event_ticker": event, "yes_sub_title": label, "status": "active",
-         "market_type": "binary"}
+         "market_type": "binary", "yes_bid_size_fp": "5000.00", "yes_ask_size_fp": "5000.00"}
     if dollars:
         m.update(yes_bid_dollars=f"{bid:.4f}", yes_ask_dollars=f"{ask:.4f}")
     else:
@@ -3010,7 +3010,7 @@ class KalshiCrossCheck(unittest.TestCase):
                                       kalshi_market("KXNFLGAME-26OCT04BUFNYJ", "NYJ", "New York J", 0.37, 0.39,
                                                     dollars=False)]}
         self.calls = []
-        def fake(url):
+        def fake(url, timeout=None):
             self.calls.append(url)
             series = url.split("series_ticker=")[1].split("&")[0]
             return {"markets": self.markets.get(series, []), "cursor": ""}
@@ -3063,6 +3063,12 @@ class KalshiCrossCheck(unittest.TestCase):
         self.assertEqual(self.calls, [])           # nothing pre-game: Kalshi isn't even asked
         live = self.fair([self.game()], Config(kalshi_live=True), now=datetime(2026, 10, 4, 18, tzinfo=timezone.utc))
         self.assertIn("nfl1", live)
+        # One game under way, another still to come: only the one still to come gets a price.
+        self.markets["KXNFLGAME"] += [kalshi_market("KXNFLGAME-26OCT04MIANE", "MIA", "Miami", 0.40, 0.41),
+                                      kalshi_market("KXNFLGAME-26OCT04MIANE", "NE", "New England", 0.59, 0.60)]
+        later = self.game("2026-10-04T20:25:00Z", home="New England Patriots", away="Miami Dolphins", gid="nfl2")
+        f = self.fair([self.game(), later], now=datetime(2026, 10, 4, 18, tzinfo=timezone.utc))
+        self.assertEqual(list(f), ["nfl2"])
 
     def test_wide_quotes_and_outages_are_ignored(self):
         self.markets["KXNFLGAME"][0] = kalshi_market("KXNFLGAME-26OCT04BUFNYJ", "BUF", "Buffalo", 0.55, 0.70)
@@ -3134,24 +3140,52 @@ class KalshiCrossCheck(unittest.TestCase):
         self.assertAlmostEqual(f["Texas A&M Aggies"][0], 0.395)
 
     def test_never_borrows_another_games_price(self):
+        from unittest import mock
         tk = self.game(home="Kansas Jayhawks", away="Texas Longhorns", gid="tk", sport="americanfootball_ncaaf")
         tt = self.game(home="Kansas State Wildcats", away="Texas Tech Red Raiders", gid="tt",
                        sport="americanfootball_ncaaf")
         texas_kansas = [kalshi_market("KXNCAAFGAME-26OCT04TEXKU", "TEX", "Texas", 0.70, 0.71),
                         kalshi_market("KXNCAAFGAME-26OCT04TEXKU", "KU", "Kansas", 0.29, 0.30)]
-        # Only Texas-Kansas is on Kalshi. "Texas"/"Kansas" also fit Texas Tech/Kansas State, so it's
-        # unclear which game it is: neither gets a Kalshi price.
         self.markets["KXNCAAFGAME"] = list(texas_kansas)
+        # "Texas" isn't "Texas Tech" and "Kansas" isn't "Kansas State": only Texas-Kansas fits.
         report = {}
-        self.assertEqual(self.fair([tk, tt], report=report), {})
-        self.assertIn("another game", report["tt"][1])
-        # With Texas Tech-Kansas State listed too, each game finds its own (the closer name wins).
-        self.markets["KXNCAAFGAME"] = texas_kansas + [
-            kalshi_market("KXNCAAFGAME-26OCT04TTUKSU", "TTU", "Texas Tech", 0.45, 0.46),
-            kalshi_market("KXNCAAFGAME-26OCT04TTUKSU", "KSU", "Kansas St.", 0.54, 0.55)]
-        f = self.fair([tk, tt])
-        self.assertAlmostEqual(f["tk"]["Texas Longhorns"][0], 0.705)
-        self.assertAlmostEqual(f["tt"]["Texas Tech Red Raiders"][0], 0.455)
+        f = self.fair([tk, tt], report=report)
+        self.assertEqual(list(f), ["tk"])
+        self.assertIn("no Kalshi game found", report["tt"][1])
+        # Names that do fit two games (here: without the State/Tech rule) give neither game a price.
+        with mock.patch.object(_arbbot, "COLLEGE_QUALIFIERS", set()):
+            report = {}
+            self.assertEqual(self.fair([tk, tt], report=report), {})
+            self.assertIn("another game", report["tt"][1])
+            # With Texas Tech-Kansas State listed too, each game finds its own (the closer name wins).
+            self.markets["KXNCAAFGAME"] = texas_kansas + [
+                kalshi_market("KXNCAAFGAME-26OCT04TTUKSU", "TTU", "Texas Tech", 0.45, 0.46),
+                kalshi_market("KXNCAAFGAME-26OCT04TTUKSU", "KSU", "Kansas St.", 0.54, 0.55)]
+            f = self.fair([tk, tt])
+            self.assertAlmostEqual(f["tk"]["Texas Longhorns"][0], 0.705)
+            self.assertAlmostEqual(f["tt"]["Texas Tech Red Raiders"][0], 0.455)
+
+    def test_a_started_game_keeps_its_kalshi_game(self):
+        from unittest import mock
+        self.markets["KXNCAAMBGAME"] = [kalshi_market("KXNCAAMBGAME-27JAN16TEXARK", "TEX", "Texas", 0.30, 0.31),
+                                        kalshi_market("KXNCAAMBGAME-27JAN16TEXARK", "ARK", "Arkansas", 0.69, 0.70)]
+        big = self.game("2027-01-16T17:00:00Z", home="Arkansas Razorbacks", away="Texas Longhorns", gid="big",
+                        sport="basketball_ncaab")
+        small = self.game("2027-01-16T23:30:00Z", home="Arkansas-Pine Bluff Golden Lions",
+                          away="Texas Southern Tigers", gid="small", sport="basketball_ncaab")
+        during = datetime(2027, 1, 16, 18, tzinfo=timezone.utc)                 # big game under way
+        with mock.patch.object(_arbbot, "COLLEGE_QUALIFIERS", set()):            # names that collide
+            report = {}
+            self.assertEqual(self.fair([big, small], now=during, report=report), {})
+            self.assertIn("another game", report["small"][1])
+        # And "Texas"/"Arkansas" don't name Texas Southern / Arkansas-Pine Bluff at all, even when
+        # the big game isn't in the feed.
+        self.assertEqual(self.fair([small], now=during), {})
+        from arbbot import _kalshi_label_match
+        self.assertFalse(_kalshi_label_match("Texas Southern Tigers", "Texas", college=True))
+        self.assertTrue(_kalshi_label_match("Texas Southern Tigers", "Texas Southern", college=True))
+        self.assertTrue(_kalshi_label_match("Arkansas State Red Wolves", "Arkansas St.", college=True))
+        self.assertTrue(_kalshi_label_match("Texas Longhorns", "Texas", college=True))
 
     def test_doubleheaders_use_the_start_time(self):
         self.markets["KXMLBGAME"] = [
@@ -3221,7 +3255,7 @@ class KalshiCrossCheck(unittest.TestCase):
         _arbbot._KALSHI_STATE.update(pause_until=0.0)
         _arbbot._ESPN_CACHE.clear()
         urls = []
-        def flaky(url):
+        def flaky(url, timeout=None):
             urls.append(url)
             if "elections" in url:
                 raise urllib.error.URLError("refused")
@@ -3231,6 +3265,93 @@ class KalshiCrossCheck(unittest.TestCase):
             _arbbot._ESPN_CACHE.clear()
             kalshi_markets("americanfootball_nfl")
         self.assertEqual(["elections" in u for u in urls], [True, False, False])
+
+    def test_an_outage_never_slows_the_scans(self):
+        from unittest import mock
+        both = [self.game(), self.game(home="Tampa Bay Lightning", away="Florida Panthers", gid="h1",
+                                       sport="icehockey_nhl")]
+        with mock.patch("arbbot._get_json", side_effect=TimeoutError("timed out")) as g:
+            report = {}
+            self.assertEqual(self.fair(both, report=report), {})
+            self.assertEqual(g.call_count, 2)          # one try per address, then the second sport waits
+            self.assertIn("paused", report["h1"][1])
+            self.fair(both)                             # the next scan inside the cool-down: no calls
+            self.assertEqual(g.call_count, 2)
+            first = _arbbot._KALSHI_STATE["pause_until"] - time.time()
+            _arbbot._KALSHI_STATE["pause_until"] = 0
+            self.fair(both)                             # cool-down over: tries again, waits longer now
+            self.assertEqual(g.call_count, 4)
+            self.assertGreater(_arbbot._KALSHI_STATE["pause_until"] - time.time(), first + 60)
+        self.assertTrue(55 <= first <= 60)
+        _arbbot._KALSHI_STATE["pause_until"] = 0
+        self.assertIn("nfl1", self.fair([self.game()]))   # back: works and resets the cool-down
+        self.assertEqual(_arbbot._KALSHI_STATE["fails"], 0)
+
+    def test_short_timeout_and_unknown_series(self):
+        from unittest import mock
+        from arbbot import kalshi_markets
+        seen = []
+        def fake(url, timeout=None):
+            seen.append((url.split("series_ticker=")[1].split("&")[0], timeout))
+            if "KXNCAAMBGAME" in url:
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            return {"markets": [kalshi_market("KXNCAABGAME-27JAN16DUKEUNC", "DUKE", "Duke", 0.6, 0.61)],
+                    "cursor": ""}
+        with mock.patch("arbbot._get_json", side_effect=fake):
+            self.assertEqual(len(kalshi_markets("basketball_ncaab")), 1)   # fell through to the old name
+        self.assertEqual([x[0] for x in seen], ["KXNCAAMBGAME", "KXNCAAMBGAME", "KXNCAABGAME"])
+        self.assertTrue(all(t == _arbbot.KALSHI_TIMEOUT for _, t in seen))
+        self.assertEqual(_arbbot._KALSHI_STATE["pause_until"], 0)          # a missing page isn't an outage
+
+    def test_stops_asking_when_a_scan_has_spent_enough(self):
+        from unittest import mock
+        both = [self.game(), self.game(home="Tampa Bay Lightning", away="Florida Panthers", gid="h1",
+                                       sport="icehockey_nhl")]
+        clock = iter([0.0, 0.0, 100.0])
+        with mock.patch("arbbot.time.monotonic", side_effect=lambda: next(clock)):
+            report = {}
+            self.assertIn("nfl1", self.fair(both, report=report))   # NFL comes first...
+        self.assertIn("slow", report["h1"][1])                       # ...then the time was up
+
+    def test_bets_at_kalshi_itself(self):
+        cfg = Config(min_ev_pct=3, round_stakes=0)
+        # Kalshi sells Home at 45¢: 2.1398 after its fee, +7% against Pinnacle's 50%.
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"Kalshi": [("Home", 2.1398, None)]})
+        same = {"e1": {"Home": (0.445, 0.44, 0.45)}}
+        [b] = find_evs([ev], cfg, NOW, kalshi=same)                 # its own quote isn't a veto...
+        self.assertEqual(b.book, "Kalshi")
+        self.assertNotIn("Kalshi agrees", b.confidence_notes)       # ...nor a second opinion
+        moved = {"e1": {"Home": (0.465, 0.46, 0.47)}}               # 47¢ now: the price is gone
+        self.assertEqual(find_evs([ev], cfg, NOW, kalshi=moved), [])
+        # Outliers at Kalshi the same way.
+        out = outlier_event(1.85, 1.95)
+        out["bookmakers"][-1].update(key="kalshi", title="Kalshi")
+        [o] = find_outliers([out], Config(), NOW, kalshi={"e1": {"Home": (0.515, 0.51, 0.52)}})
+        self.assertEqual(o.book, "Kalshi")
+        self.assertEqual(find_outliers([out], Config(), NOW, kalshi={"e1": {"Home": (0.555, 0.55, 0.56)}}), [])
+
+    def test_depth_must_be_shown(self):
+        report = {}
+        self.markets["KXNFLGAME"][0].pop("yes_ask_size_fp")
+        self.assertEqual(self.fair([self.game()], report=report), {})
+        self.assertIn("how many contracts", report["nfl1"][1])
+
+    def test_only_asks_kalshi_when_it_can_matter(self):
+        from arbbot import kalshi_useful
+        self.assertTrue(kalshi_useful(Config()))
+        self.assertFalse(kalshi_useful(Config(kalshi_check=False)))
+        self.assertFalse(kalshi_useful(Config(ev_enabled=False, outliers_enabled=False)))
+        self.assertFalse(kalshi_useful(Config(markets="spreads,totals")))
+        self.assertFalse(kalshi_useful(Config(live_only=True)))
+        self.assertTrue(kalshi_useful(Config(live_only=True, kalshi_live=True)))
+        self.assertEqual(self.fair([self.game()], Config(ev_enabled=False, outliers_enabled=False)), {})
+        self.assertEqual(self.calls, [])
+
+    def test_odd_replies_dont_crash(self):
+        self.markets["KXNFLGAME"] = [{"event_ticker": "KXNFLGAME-26OCT04BUFNYJ", "yes_sub_title": 7},
+                                     {"event_ticker": "KXNFLGAME-26OCT04BUFNYJ", "yes_sub_title": None,
+                                      "ticker": None}]
+        self.assertEqual(self.fair([self.game()]), {})
 
     def ev(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})   # 10% edge
