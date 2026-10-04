@@ -2992,6 +2992,42 @@ class ConsensusStake(unittest.TestCase):
                          kelly_stake(o.fair_prob, o.price, cfg))
 
 
+class OddsApiCosts(unittest.TestCase):
+    """The free events call is checked with the API's own per-call cost, so another process using
+    the same key (the running bot, while you run a check) can't trigger a false warning."""
+
+    def call(self, headers):
+        import io, contextlib
+        from unittest import mock
+        from arbbot import OddsAPI
+        class Resp:
+            def __init__(self, h):
+                self.headers = h
+            def read(self):
+                return b"[]"
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        api = OddsAPI(Config(api_key="k"))
+        err = io.StringIO()
+        with mock.patch("urllib.request.urlopen", side_effect=[Resp(h) for h in headers]), \
+                contextlib.redirect_stderr(err):
+            api.events("icehockey_nhl")
+            api.events("icehockey_nhl")
+        return err.getvalue()
+
+    def test_other_processes_spending_isnt_blamed_on_events(self):
+        self.assertEqual(self.call([{"x-requests-used": "100", "x-requests-last": "0"},
+                                    {"x-requests-used": "112", "x-requests-last": "0"}]), "")
+        self.assertIn("events endpoint used credits",
+                      self.call([{"x-requests-used": "100", "x-requests-last": "0"},
+                                 {"x-requests-used": "101", "x-requests-last": "1"}]))
+        # No per-call header: fall back to the running total.
+        self.assertIn("events endpoint used credits",
+                      self.call([{"x-requests-used": "100"}, {"x-requests-used": "101"}]))
+
+
 def kalshi_market(event, team_code, label, bid, ask, dollars=True, **extra):
     m = {"ticker": f"{event}-{team_code}", "event_ticker": event, "yes_sub_title": label, "status": "active",
          "market_type": "binary", "yes_bid_size_fp": "5000.00", "yes_ask_size_fp": "5000.00"}
@@ -3425,18 +3461,24 @@ class KalshiCrossCheck(unittest.TestCase):
         import io, contextlib
         from arbbot import check_kalshi
         self.markets["KXNFLGAME"] += [kalshi_market("KXNFLGAME-26OCT04XXXYYY", "XXX", "Nowhere", 0.5, 0.51),
-                                      kalshi_market("KXNFLGAME-26OCT04XXXYYY", "YYY", "Elsewhere", 0.49, 0.5)]
+                                      kalshi_market("KXNFLGAME-26OCT04XXXYYY", "YYY", "Elsewhere", 0.49, 0.5),
+                                      kalshi_market("KXNFLGAME-26OCT03MIANE", "MIA", "Miami", 0.40, 0.41),
+                                      kalshi_market("KXNFLGAME-26OCT03MIANE", "NE", "New England", 0.59, 0.60)]
         class Api:
             def events(self, sport, horizon_hours=48):
                 return [{"id": "nfl1", "commence_time": "2026-10-04T17:00:00Z", "home_team": "New York Jets",
                          "away_team": "Buffalo Bills"},
                         {"id": "nfl2", "commence_time": "2026-10-04T20:25:00Z", "home_team": "Denver Broncos",
-                         "away_team": "Las Vegas Raiders"}] if sport == "americanfootball_nfl" else []
+                         "away_team": "Las Vegas Raiders"},
+                        {"id": "nfl3", "commence_time": "2026-10-03T11:00:00Z", "home_team": "New England Patriots",
+                         "away_team": "Miami Dolphins"}] if sport == "americanfootball_nfl" else []
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             check_kalshi(Config(sports=["americanfootball_nfl", "soccer_epl"]), Api(), now=NOW)
         text = out.getvalue()
-        self.assertIn("NFL: 4 open Kalshi markets, 1 of 2 upcoming games usable", text)
+        self.assertIn("NFL: 6 open Kalshi markets, 1 of 3 upcoming games usable", text)
+        self.assertIn("Miami Dolphins @ New England Patriots: game has started (KALSHI_LIVE=false) "
+                      "[KXNFLGAME-26OCT03MIANE]", text)
         self.assertIn("✅ Buffalo Bills @ New York Jets: Buffalo Bills 62% · New York Jets 38%", text)
         self.assertIn("[KXNFLGAME-26OCT04BUFNYJ]", text)
         self.assertIn("Las Vegas Raiders @ Denver Broncos: no Kalshi game found", text)

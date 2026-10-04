@@ -696,6 +696,10 @@ class OddsAPI:
         self._warned_events_cost = False
 
     def _get(self, path: str, params: dict) -> list | dict:
+        return self._request(path, params)[0]
+
+    def _request(self, path: str, params: dict) -> tuple[list | dict, float | None]:
+        """(the JSON, what this one call cost in credits if the API said)."""
         params = {"apiKey": self.cfg.api_key, **params}
         url = f"{API_BASE}{path}?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={"User-Agent": "arbbot/2.0", "Accept-Encoding": "gzip"})
@@ -707,17 +711,23 @@ class OddsAPI:
                 self.remaining = float(rem)
             if (used := resp.headers.get("x-requests-used")) is not None:
                 self.used = float(used)
-            return json.loads(raw)
+            cost = resp.headers.get("x-requests-last")
+            try:
+                cost = float(cost) if cost is not None else None
+            except ValueError:
+                cost = None
+            return json.loads(raw), cost
 
     def events(self, sport: str, horizon_hours: float = 26) -> list[dict]:
         """Live + upcoming games for a sport. Free: doesn't use credits."""
         used_before = self.used
-        data = self._get(f"/sports/{sport}/events", {
+        data, cost = self._request(f"/sports/{sport}/events", {
             "dateFormat": "iso",
             "commenceTimeTo": _iso(datetime.now(timezone.utc) + timedelta(hours=horizon_hours)),
         })
-        if used_before is not None and self.used is not None and self.used > used_before \
-                and not self._warned_events_cost:
+        if cost is None and used_before is not None and self.used is not None:
+            cost = self.used - used_before   # no per-call header: the running total (another process can bump it)
+        if cost and cost > 0 and not self._warned_events_cost:
             self._warned_events_cost = True
             print("! The events endpoint used credits. Raise EVENTS_REFRESH_MINUTES.", file=sys.stderr)
         return data
@@ -2405,6 +2415,9 @@ def _kalshi_match(pool: list[dict], use: set[str], markets: list[dict], sport: s
     for b in best.values():
         if b:
             picked[b[0]] = picked.get(b[0], 0) + 1
+    for ev in pool:
+        if best.get(ev["id"]) and ev["id"] not in use:   # (so --check-kalshi knows that Kalshi game is placed)
+            report[ev["id"]] = (best[ev["id"]][0], report.get(ev["id"], ("", ""))[1])
     out: dict[str, dict] = {}
     for ev in pool:
         b = best.get(ev["id"])
