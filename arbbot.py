@@ -3381,8 +3381,8 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
             + day_summary(day_rows, cfg, now) + (f"\n{arbs}" if arbs else ""))
     color = 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else GREY)
     return _card(title, desc, color,
-                 footer="Results assume every alert was bet at the stake shown. Props need a box score, "
-                        "so check those in your book's app.")
+                 footer="Results assume every alert was bet at the stake shown. Props are graded from the box "
+                        "score; 🎯 means check that one yourself.")
 
 
 def _graded(cfg: Config, since: datetime | None = None) -> list[dict]:
