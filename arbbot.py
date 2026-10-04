@@ -79,6 +79,11 @@ DEFAULT_SPORT_MIN_EV = {"americanfootball_ncaaf": 6.0, "basketball_ncaab": 6.0}
 DEFAULT_BUDGET_WEIGHTS = {"mon": 1.2, "tue": 0.6, "wed": 0.6, "thu": 1.2, "fri": 1.0, "sat": 2.0, "sun": 2.2}
 WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
+# The Odds API's bookmaker keys whose display names aren't just the key ("williamhill_us" is Caesars).
+BOOK_TITLES = {"williamhill_us": "Caesars", "espnbet": "ESPN BET", "hardrockbet": "Hard Rock Bet",
+               "ballybet": "Bally Bet", "betonlineag": "BetOnline.ag", "lowvig": "LowVig.ag",
+               "mybookieag": "MyBookie.ag", "betparx": "betPARX", "betrivers": "BetRivers", "fanatics": "Fanatics"}
+
 # Prop markets checked per sport (each one costs a credit per game per check).
 DEFAULT_PROP_MARKETS = {
     "americanfootball_nfl": "player_pass_yds,player_rush_yds,player_reception_yds,player_receptions",
@@ -524,6 +529,15 @@ class Config:
         """Can alerts tell you to bet at this book?"""
         mine = _csv(self.my_books)
         return not mine or book_key in mine
+
+    def counts(self, book_title: str) -> bool:
+        """Does a logged bet at this book count in your results? Only your books (MY_BOOKS) do:
+        an alert at a book you can't bet isn't a bet you could have made."""
+        mine = _csv(self.my_books)
+        if not mine or not book_title:
+            return True
+        t = _norm(book_title)
+        return any(t in (_norm(k), _norm(BOOK_TITLES.get(k, ""))) for k in mine)
 
     def ev_allowed(self) -> set[str]:
         """Books +EV-style alerts (and parlays) may use: EV_BOOKS, but never outside MY_BOOKS
@@ -2531,6 +2545,8 @@ def logged_bets(cfg: Config, since: datetime | None = None) -> dict[str, dict]:
             bid = _bet_id(r)
             if bid in out or (since and _parse_time(r["commence_time"]) < since):
                 continue  # repeats count once
+            if not cfg.counts(r.get("book", "")):
+                continue  # not one of your books
             cp = closing.get(bid)
             out[bid] = {**r, "kind": kind,
                         "closing_fair_odds": round(1 / cp, 3) if cp else "",
@@ -2673,7 +2689,8 @@ def record_line(rows: list[dict]) -> str:
 
 
 def ev_record(cfg: Config, days: int | None = None, kinds: tuple[str, ...] = ("ev", "")) -> str:
-    rows = [r for r in _read_csv(cfg.ev_results_file) if r.get("kind", "") in kinds and not r.get("manual_legs")]
+    rows = [r for r in _read_csv(cfg.ev_results_file) if r.get("kind", "") in kinds and not r.get("manual_legs")
+            and cfg.counts(r.get("book", ""))]
     if days is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         rows = [r for r in rows if _parse_time(r["commence_time"]) >= cutoff]
@@ -3370,7 +3387,7 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
 
 def _graded(cfg: Config, since: datetime | None = None) -> list[dict]:
     rows = [r for r in _read_csv(cfg.ev_results_file)
-            if r.get("result") in ("win", "loss", "push") and not r.get("manual_legs")]
+            if r.get("result") in ("win", "loss", "push") and not r.get("manual_legs") and cfg.counts(r.get("book", ""))]
     return [r for r in rows if not since or _parse_time(r["commence_time"]) >= since]
 
 
@@ -3504,7 +3521,8 @@ class Results:
         self._load()
         cutoff = now - timedelta(days=3)
         new = [r for r in _read_csv(self.cfg.ev_results_file)
-               if _bet_id(r) not in self.posted and _parse_time(r["commence_time"]) > cutoff]
+               if _bet_id(r) not in self.posted and _parse_time(r["commence_time"]) > cutoff
+               and self.cfg.counts(r.get("book", ""))]
         if not new:
             return 0
         bets = logged_bets(self.cfg, since=cutoff)
@@ -3829,7 +3847,7 @@ def clv_rows(cfg: Config, days: int | None = None) -> list[dict]:
     for kind, name in (("ev", cfg.ev_log_file), ("outlier", cfg.outlier_log_file)):
         for r in _read_csv(name) if name else []:
             bid = _bet_id(r)
-            if bid in seen or bid not in closing:
+            if bid in seen or bid not in closing or not cfg.counts(r.get("book", "")):
                 continue
             if cutoff and _parse_time(r["commence_time"]) < cutoff:
                 continue

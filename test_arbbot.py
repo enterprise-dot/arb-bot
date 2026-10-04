@@ -2920,5 +2920,32 @@ class PropMatchingMore(unittest.TestCase):
             self.assertIsNone(grade_prop(dict(row, player="CeeDee Lamb"))[0])         # 2 TDs, only 1 credited
 
 
+
+class OnlyYourBooksCount(unittest.TestCase):
+    START, LATER = BetResults.START, BetResults.LATER
+    setUp, tearDown, scores = BetResults.setUp, BetResults.tearDown, BetResults.scores
+
+    def log(self, gid, book):
+        append_csv(self.cfg.ev_log_file, _arbbot.EV_LOG_FIELDS, {
+            "first_seen": "2026-10-03T12:00:00+00:00", "event_id": gid, "sport": "NHL", "sport_key": "icehockey_nhl",
+            "matchup": "Away @ Home", "home_team": "Home", "away_team": "Away", "commence_time": self.START,
+            "live": False, "market": "h2h", "outcome": "Home", "point": "", "n_outcomes": 2, "book": book,
+            "price": 2.2, "fair_odds": 2.0, "best_ev_pct": 10, "stake": 10, "player": "", "confidence": "high"})
+
+    def test_alerts_at_other_books_are_left_out(self):
+        from arbbot import day_bets, scoreboard_text
+        from datetime import date
+        self.cfg = replace(self.cfg, my_books="fanduel,draftkings,betmgm,williamhill_us,kalshi")
+        self.log("g1", "Hard Rock Bet")
+        self.log("g2", "Caesars")                                    # williamhill_us is Caesars
+        self.log("g3", "FanDuel")
+        settle_pending(self.cfg, self.scores({"g1": (4, 2), "g2": (4, 2), "g3": (1, 2)}), self.LATER)
+        self.assertEqual(sorted(r["book"] for r in day_bets(self.cfg, date(2026, 10, 3))), ["Caesars", "FanDuel"])
+        self.assertIn("**All:** 1-1", scoreboard_text(self.cfg, self.LATER))
+        self.assertTrue(ev_record(self.cfg).startswith("2 bets, 1-1-0"))
+        everyone = replace(self.cfg, my_books="")                    # no MY_BOOKS: everything counts
+        self.assertEqual(len(day_bets(everyone, date(2026, 10, 3))), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
