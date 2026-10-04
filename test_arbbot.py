@@ -1782,7 +1782,14 @@ class BetResults(unittest.TestCase):
         from arbbot import Results
         self.log_ev("g1")
         settle_pending(self.cfg, self.scores({"g1": (4, 2)}), self.LATER)  # graded before this update
-        res = Results(self.cfg, dry_run=False)
+        from unittest import mock
+        later = self.LATER
+        class Clock(datetime):                     # the first save happens "now": make that LATER
+            @classmethod
+            def now(cls, tz=None):
+                return later
+        with mock.patch("arbbot.datetime", Clock):
+            res = Results(self.cfg, dry_run=False)
         res.send = lambda payload: self.fail("should not post old results")
         self.assertEqual(res.run(self.scores({}), self.LATER), 0)
 
@@ -1895,7 +1902,7 @@ class ReviewFixes(unittest.TestCase):
 
     def test_restored_prop_waits_for_its_game_not_the_grace_period(self):
         from arbbot import close_started
-        ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)}, start="2026-10-03T23:00:00Z")
+        ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)}, start="2030-01-05T23:00:00Z")
         ev["bookmakers"][0]["key"] = "pinnacle"
         [bet] = find_evs([ev], self.cfg.for_props(), NOW)
         b = self.restored_alerter(EVAlerter, [bet], noun="+EV props")
@@ -1903,7 +1910,7 @@ class ReviewFixes(unittest.TestCase):
         b.handle([], checked_events={"p2"}, now=time.time())              # another game's props
         self.assertEqual(self.sent, [])
         self.assertIn(bet.key, b.restored)
-        close_started(datetime(2026, 10, 3, 23, 1, tzinfo=timezone.utc), b)   # its game starts
+        close_started(datetime(2030, 1, 5, 23, 1, tzinfo=timezone.utc), b)    # its game starts
         self.assertTrue(self.sent and self.sent[0][1].startswith("❌ GONE"))
         self.assertEqual(b.restored, {})
 
@@ -2966,6 +2973,23 @@ class ConsensusStake(unittest.TestCase):
         same = find_evs([ev], replace(cfg, consensus_stake=1.0), NOW)[0]
         self.assertEqual(same.stake, full)
 
+
+    def test_prop_outliers_without_pinnacle_bet_less_too(self):
+        books = {"DK": (1.90, 1.92), "FD": (1.91, 1.91), "MGM": (1.89, 1.93), "BetOnline": (1.92, 1.90),
+                 "Stale": (2.60, 1.45)}
+        cfg = Config(round_stakes=0)
+        [o] = find_outliers([prop_event(books)], cfg, NOW)
+        self.assertEqual(o.stake, kelly_stake(o.fair_prob, o.price, cfg, 0.7))
+        self.assertLess(o.stake, kelly_stake(o.fair_prob, o.price, cfg))
+        self.assertIn("📉 No Pinnacle price: stake 30% smaller.", outlier_payload(o)["embeds"][0]["description"])
+        # Pinnacle prices it (and agrees): full stake, no note.
+        priced = prop_event({"Pinnacle": (1.91, 1.91), **books})
+        priced["bookmakers"][0]["key"] = "pinnacle"
+        [p] = find_outliers([priced], cfg, NOW)
+        self.assertEqual(p.stake, kelly_stake(p.fair_prob, p.price, cfg))
+        self.assertNotIn("📉", outlier_payload(p)["embeds"][0]["description"])
+        self.assertEqual(find_outliers([prop_event(books)], replace(cfg, consensus_stake=1.0), NOW)[0].stake,
+                         kelly_stake(o.fair_prob, o.price, cfg))
 
 
 def kalshi_market(event, team_code, label, bid, ask, dollars=True, **extra):

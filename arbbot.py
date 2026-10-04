@@ -2513,6 +2513,12 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                         unit_size=cfg.unit_size, board=board, kalshi=kq,
                     )
                     bet.stake = kelly_stake(fair_p, price, cfg)
+                    if sp is None and cfg.consensus_stake < 1:
+                        # No sharp price backs the other books up (usually a prop Pinnacle doesn't
+                        # offer): same checks, smaller bet (CONSENSUS_STAKE).
+                        bet.stake = kelly_stake(fair_p, price, cfg, cfg.consensus_stake)
+                        bet.confidence_notes.append(f"no {_csv(cfg.sharp_books)[0].title()} price: stake "
+                                                    f"{round((1 - cfg.consensus_stake) * 100)}% smaller")
                     # The board shows every book you have; parlays stick to EV_BOOKS like +EV bets.
                     bet.parlay_books = {titles[b] for b in full if not ev_allowed or b in ev_allowed}
                     # Can the other side(s) be bet elsewhere to lock in a profit?
@@ -2658,7 +2664,8 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
                      f"guaranteed** (per $100 total):\n" + "\n".join(lines))
     details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}\n\n"
                f"**Why:** {b.book} has {b.pick} at **{odds(b.price)}**, but the other {b.sources_used} books "
-               f"say **{odds(b.fair_odds)}** ({b.fair_prob:.1%} to win)." + _kalshi_line(b))
+               f"say **{odds(b.fair_odds)}** ({b.fair_prob:.1%} to win)." + _kalshi_line(b)
+               + "".join(f"\n📉 {n[0].upper()}{n[1:]}." for n in b.confidence_notes if "smaller" in n))
     desc = "\n\n".join(parts) + DIVIDER + details
     if b.board:
         desc += "\n\n**Every book**\n" + _board_lines(b)
