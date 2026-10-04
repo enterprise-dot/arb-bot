@@ -142,6 +142,17 @@ skipped. If only one of them priced it, the stake is halved (`SINGLE_SOURCE_STAK
 A prop Pinnacle doesn't price uses the median of at least 4 other books instead, with a 30%
 smaller stake (`CONSENSUS_STAKE=0.7`).
 
+**Kalshi second opinion (free).** Before a game starts, the bot also reads Kalshi's own exchange
+prices for game winners straight from Kalshi (no key, no Odds API credits). Kalshi's prices are
+about as sharp as Pinnacle's. A moneyline +EV bet is skipped when Kalshi's win chance is more than
+3 points from Pinnacle's (`KALSHI_MAX_GAP`; 4 for games over a day away, 5 for college), or when
+Kalshi says the price isn't good. Outliers need Kalshi to agree as well. When it's within 2 points,
+the card says "Kalshi agrees" and the bet's confidence goes up. Each card shows Kalshi's line
+("Kalshi 51% to win, buy 52¢ · sell 50¢"). Kalshi prices only count when its market is tight
+(`KALSHI_MAX_SPREAD=3` cents, 5 for college) and deep (`KALSHI_MIN_SIZE=100` contracts); if Kalshi
+is down or a game isn't listed, alerts go ahead as before. See what it matches with
+`python arbbot.py --check-kalshi`.
+
 **Bigger edge, new alert.** Discord doesn't ping you when a message is edited. So if a bet's edge
 grows by 2.5 points or more while it's open (`REALERT_JUMP_PCT`), you get a fresh alert.
 

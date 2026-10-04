@@ -244,6 +244,7 @@ Open the console the same way (Droplet → Access → Launch Droplet Console), t
 | What hit today (bet by bet) | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --results` (or `--results yesterday`) |
 | Post today's results to Discord | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --post-results` |
 | Check prop grading works | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --check-props` |
+| Check the Kalshi second opinion | `sudo -u arbbot python3 /opt/arb-bot/arbbot.py --check-kalshi` |
 | Get the latest code | `cd /opt/arb-bot && sudo -u arbbot git pull && systemctl restart arbbot` |
 | See the arb log | `cat /opt/arb-bot/arbs.csv` |
 

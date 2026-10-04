@@ -2967,5 +2967,300 @@ class ConsensusStake(unittest.TestCase):
         self.assertEqual(same.stake, full)
 
 
+
+def kalshi_market(event, team_code, label, bid, ask, dollars=True, **extra):
+    m = {"ticker": f"{event}-{team_code}", "event_ticker": event, "yes_sub_title": label, "status": "active",
+         "market_type": "binary"}
+    if dollars:
+        m.update(yes_bid_dollars=f"{bid:.4f}", yes_ask_dollars=f"{ask:.4f}")
+    else:
+        m.update(yes_bid=round(bid * 100), yes_ask=round(ask * 100))
+    m.update(extra)
+    return m
+
+
+class KalshiCrossCheck(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        self.markets = {"KXNFLGAME": [kalshi_market("KXNFLGAME-26OCT04BUFNYJ", "BUF", "Buffalo", 0.61, 0.63),
+                                      kalshi_market("KXNFLGAME-26OCT04BUFNYJ", "NYJ", "New York J", 0.37, 0.39,
+                                                    dollars=False)]}
+        self.calls = []
+        def fake(url):
+            self.calls.append(url)
+            series = url.split("series_ticker=")[1].split("&")[0]
+            return {"markets": self.markets.get(series, []), "cursor": ""}
+        mock.patch("arbbot._get_json", side_effect=fake).start()
+        mock.patch.object(_arbbot, "KALSHI_MIN_GAP", 0).start()
+        self.sleeps = []
+        mock.patch("arbbot.time.sleep", side_effect=self.sleeps.append).start()
+        self.addCleanup(mock.patch.stopall)
+        _arbbot._ESPN_CACHE.clear()
+        _arbbot._KALSHI_STATE.update(host=0, last=0.0, pause_until=0.0)
+
+    def game(self, start="2026-10-04T17:00:00Z", home="New York Jets", away="Buffalo Bills", gid="nfl1",
+             sport="americanfootball_nfl"):
+        return {"id": gid, "sport_key": sport, "commence_time": start, "home_team": home, "away_team": away}
+
+    def fair(self, games, cfg=None, now=NOW, report=None):
+        from arbbot import kalshi_fair
+        _arbbot._ESPN_CACHE.clear()
+        return kalshi_fair(games, cfg or Config(), now, report)
+
+    def test_reading_and_matching(self):
+        from arbbot import _kalshi_price, _kalshi_quote, _kalshi_day, _kalshi_label_match
+        self.assertEqual(_kalshi_price({"yes_bid_dollars": "0.5600"}, "yes_bid"), 0.56)
+        self.assertEqual(_kalshi_price({"yes_bid": 56}, "yes_bid"), 0.56)
+        # Only the NO side quoted: the YES side is its mirror image.
+        no_side = {"no_bid_dollars": "0.3700", "no_ask_dollars": "0.3800"}
+        self.assertEqual((_kalshi_price(no_side, "yes_bid"), _kalshi_price(no_side, "yes_ask")), (0.62, 0.63))
+        # A $0 bid or a $1 ask is Kalshi's "nobody there", not a price.
+        self.assertIsNone(_kalshi_quote({"yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0400"}))
+        self.assertIsNone(_kalshi_quote({"yes_bid_dollars": "0.9700", "yes_ask_dollars": "1.0000"}))
+        self.assertEqual(str(_kalshi_day("KXNFLGAME-26SEP20CLETB")), "2026-09-20")
+        for label, team, ok in (("Tampa Bay", "Tampa Bay Buccaneers", True), ("New York G", "New York Giants", True),
+                                ("New York G", "New York Jets", False), ("Los Angeles R", "Los Angeles Rams", True),
+                                ("Los Angeles R", "Los Angeles Chargers", False), ("LA Rams", "Los Angeles Rams", True),
+                                ("Miami (OH)", "Miami (OH) RedHawks", True)):
+            self.assertEqual(_kalshi_label_match(team, label), ok, (label, team))
+        fair = self.fair([self.game()])["nfl1"]
+        self.assertAlmostEqual(fair["Buffalo Bills"][0], 0.62)
+        self.assertAlmostEqual(fair["New York Jets"][0], 0.38)
+        self.assertEqual(fair["New York Jets"][1:], (0.37, 0.39))
+        self.assertEqual(self.fair([self.game("2026-10-11T17:00:00Z")]), {})   # another week
+        self.assertEqual(self.fair([self.game()], Config(kalshi_check=False)), {})
+        self.assertEqual(self.calls[0].split("?")[0], "https://api.elections.kalshi.com/trade-api/v2/markets")
+
+    def test_before_the_game_only(self):
+        report = {}
+        self.assertEqual(self.fair([self.game()], now=datetime(2026, 10, 4, 17, 1, tzinfo=timezone.utc),
+                                   report=report), {})
+        self.assertIn("started", report["nfl1"][1])
+        self.assertEqual(self.calls, [])           # nothing pre-game: Kalshi isn't even asked
+        live = self.fair([self.game()], Config(kalshi_live=True), now=datetime(2026, 10, 4, 18, tzinfo=timezone.utc))
+        self.assertIn("nfl1", live)
+
+    def test_wide_quotes_and_outages_are_ignored(self):
+        self.markets["KXNFLGAME"][0] = kalshi_market("KXNFLGAME-26OCT04BUFNYJ", "BUF", "Buffalo", 0.55, 0.70)
+        report = {}
+        self.assertEqual(self.fair([self.game()], report=report), {})       # 15¢ wide: not trusted
+        self.assertIn("too wide", report["nfl1"][1])
+        from unittest import mock
+        with mock.patch("arbbot._get_json", side_effect=OSError("down")):
+            self.assertEqual(self.fair([self.game()]), {})
+
+    def nfl(self, buf=(0.61, 0.63), nyj=(0.37, 0.39), **extra):
+        self.markets["KXNFLGAME"] = [
+            kalshi_market("KXNFLGAME-26OCT04BUFNYJ", "BUF", "Buffalo", *buf, **extra),
+            kalshi_market("KXNFLGAME-26OCT04BUFNYJ", "NYJ", "New York J", *nyj)]
+        return self.fair([self.game()])
+
+    def test_trust_filters(self):
+        self.assertIn("nfl1", self.nfl(buf=(0.60, 0.63)))                   # 3¢: fine for pro games
+        self.assertEqual(self.nfl(buf=(0.59, 0.63)), {})                    # 4¢: too wide
+        self.assertEqual(self.nfl(status="inactive"), {})                   # paused / not trading
+        self.assertEqual(self.nfl(market_type="scalar"), {})
+        self.assertEqual(self.nfl(mve_collection_ticker="KXMVE-1"), {})     # a parlay market
+        self.assertEqual(self.nfl(yes_bid_size_fp="40.00", yes_ask_size_fp="5000.00"), {})   # thin
+        self.assertIn("nfl1", self.nfl(yes_bid_size_fp="400.00", yes_ask_size_fp="5000.00"))
+        self.assertEqual(self.nfl(buf=(0.66, 0.68)), {})                    # middles add up to 105%
+        self.assertEqual(self.nfl(buf=(0.0, 0.03)), {})                     # no bid at all
+        # A third market in the event: not the two-team shape the bot understands.
+        self.assertIn("nfl1", self.nfl())
+        self.markets["KXNFLGAME"].append(kalshi_market("KXNFLGAME-26OCT04BUFNYJ", "TIE", "Tie", 0.01, 0.02))
+        self.assertEqual(self.fair([self.game()]), {})
+
+    def test_college_allows_a_bit_wider(self):
+        from arbbot import kalshi_gap_limit
+        self.markets["KXNCAAFGAME"] = [kalshi_market("KXNCAAFGAME-26OCT04PURUCLA", "PUR", "Purdue", 0.40, 0.45),
+                                       kalshi_market("KXNCAAFGAME-26OCT04PURUCLA", "UCLA", "UCLA", 0.55, 0.60)]
+        g = self.game(home="UCLA Bruins", away="Purdue Boilermakers", gid="cf1", sport="americanfootball_ncaaf")
+        self.assertAlmostEqual(self.fair([g])["cf1"]["UCLA Bruins"][0], 0.575)   # 5¢ is fine for college
+        cfg = Config()
+        self.assertEqual(kalshi_gap_limit(cfg, "americanfootball_nfl", 5), 3)
+        self.assertEqual(kalshi_gap_limit(cfg, "americanfootball_nfl", 30), 4)
+        self.assertEqual(kalshi_gap_limit(cfg, "americanfootball_ncaaf", 5), 5)
+
+    def test_names_kalshi_spells_differently(self):
+        self.markets["KXMLBGAME"] = [kalshi_market("KXMLBGAME-26OCT041910CWSATH", "CWS", "Chicago WS", 0.44, 0.45),
+                                     kalshi_market("KXMLBGAME-26OCT041910CWSATH", "ATH", "A's", 0.55, 0.56)]
+        g = self.game("2026-10-04T23:10:00Z", home="Athletics", away="Chicago White Sox", gid="m1",
+                      sport="baseball_mlb")
+        f = self.fair([g])["m1"]
+        self.assertAlmostEqual(f["Chicago White Sox"][0], 0.445)
+        self.markets["KXNCAAFGAME"] = [
+            kalshi_market("KXNCAAFGAME-26OCT04UMASSMIA", "UMASS", "UMass", 0.05, 0.06),
+            kalshi_market("KXNCAAFGAME-26OCT04UMASSMIA", "MIA", "Miami (FL)", 0.94, 0.95)]
+        g = self.game(home="Miami Hurricanes", away="Massachusetts Minutemen", gid="c1", sport="americanfootball_ncaaf")
+        self.assertAlmostEqual(self.fair([g])["c1"]["Miami Hurricanes"][0], 0.945)
+
+    def test_team_code_when_the_label_is_unreadable(self):
+        self.markets["KXNFLGAME"] = [kalshi_market("KXNFLGAME-26OCT04NESEA", "SEA", "", 0.62, 0.63),
+                                     kalshi_market("KXNFLGAME-26OCT04NESEA", "NE", "", 0.37, 0.38)]
+        g = self.game(home="Seattle Seahawks", away="New England Patriots")
+        self.assertAlmostEqual(self.fair([g])["nfl1"]["Seattle Seahawks"][0], 0.625)
+
+    def test_similar_school_names(self):
+        # "Texas" also starts "Texas A&M": the way round where both markets fit wins.
+        self.markets["KXNCAAFGAME"] = [kalshi_market("KXNCAAFGAME-26OCT04TEXTXAM", "TEX", "Texas", 0.60, 0.61),
+                                       kalshi_market("KXNCAAFGAME-26OCT04TEXTXAM", "TXAM", "Texas A&M", 0.39, 0.40)]
+        g = self.game(home="Texas A&M Aggies", away="Texas Longhorns", gid="c1", sport="americanfootball_ncaaf")
+        f = self.fair([g])["c1"]
+        self.assertAlmostEqual(f["Texas Longhorns"][0], 0.605)
+        self.assertAlmostEqual(f["Texas A&M Aggies"][0], 0.395)
+
+    def test_never_borrows_another_games_price(self):
+        tk = self.game(home="Kansas Jayhawks", away="Texas Longhorns", gid="tk", sport="americanfootball_ncaaf")
+        tt = self.game(home="Kansas State Wildcats", away="Texas Tech Red Raiders", gid="tt",
+                       sport="americanfootball_ncaaf")
+        texas_kansas = [kalshi_market("KXNCAAFGAME-26OCT04TEXKU", "TEX", "Texas", 0.70, 0.71),
+                        kalshi_market("KXNCAAFGAME-26OCT04TEXKU", "KU", "Kansas", 0.29, 0.30)]
+        # Only Texas-Kansas is on Kalshi. "Texas"/"Kansas" also fit Texas Tech/Kansas State, so it's
+        # unclear which game it is: neither gets a Kalshi price.
+        self.markets["KXNCAAFGAME"] = list(texas_kansas)
+        report = {}
+        self.assertEqual(self.fair([tk, tt], report=report), {})
+        self.assertIn("another game", report["tt"][1])
+        # With Texas Tech-Kansas State listed too, each game finds its own (the closer name wins).
+        self.markets["KXNCAAFGAME"] = texas_kansas + [
+            kalshi_market("KXNCAAFGAME-26OCT04TTUKSU", "TTU", "Texas Tech", 0.45, 0.46),
+            kalshi_market("KXNCAAFGAME-26OCT04TTUKSU", "KSU", "Kansas St.", 0.54, 0.55)]
+        f = self.fair([tk, tt])
+        self.assertAlmostEqual(f["tk"]["Texas Longhorns"][0], 0.705)
+        self.assertAlmostEqual(f["tt"]["Texas Tech Red Raiders"][0], 0.455)
+
+    def test_doubleheaders_use_the_start_time(self):
+        self.markets["KXMLBGAME"] = [
+            kalshi_market("KXMLBGAME-26OCT041305NYMPHI", "NYM", "New York M", 0.40, 0.41),
+            kalshi_market("KXMLBGAME-26OCT041305NYMPHI", "PHI", "Philadelphia", 0.59, 0.60),
+            kalshi_market("KXMLBGAME-26OCT041840NYMPHI", "NYM", "New York M", 0.50, 0.51),
+            kalshi_market("KXMLBGAME-26OCT041840NYMPHI", "PHI", "Philadelphia", 0.49, 0.50)]
+        g1 = self.game("2026-10-04T17:05:00Z", home="Philadelphia Phillies", away="New York Mets", gid="g1",
+                       sport="baseball_mlb")
+        g2 = dict(g1, id="g2", commence_time="2026-10-04T22:40:00Z")
+        f = self.fair([g1, g2])
+        self.assertAlmostEqual(f["g1"]["New York Mets"][0], 0.405)
+        self.assertAlmostEqual(f["g2"]["New York Mets"][0], 0.505)
+        # Moved to a time Kalshi doesn't have: no price rather than the wrong game's.
+        self.assertEqual(self.fair([dict(g1, commence_time="2026-10-04T20:00:00Z")]), {})
+
+    def test_monday_night_is_dated_monday(self):
+        self.markets["KXNFLGAME"] = [kalshi_market("KXNFLGAME-26OCT05ATLNO", "ATL", "Atlanta", 0.45, 0.46),
+                                     kalshi_market("KXNFLGAME-26OCT05ATLNO", "NO", "New Orleans", 0.54, 0.55)]
+        g = self.game("2026-10-06T00:15:00Z", home="New Orleans Saints", away="Atlanta Falcons")
+        self.assertIn("nfl1", self.fair([g]))
+
+    def test_cant_tell_which_means_no_price(self):
+        # Both teams labelled just "Los Angeles": either way round fits, so no price.
+        self.markets["KXNFLGAME"] = [kalshi_market("KXNFLGAME-26OCT04LACLAR", "LAX", "Los Angeles", 0.45, 0.46),
+                                     kalshi_market("KXNFLGAME-26OCT04LACLAR", "LAY", "Los Angeles", 0.54, 0.55)]
+        g = self.game(home="Los Angeles Rams", away="Los Angeles Chargers")
+        self.assertEqual(self.fair([g]), {})
+        # Two Kalshi games on the same day that fit equally well: no price either.
+        self.nfl()
+        self.markets["KXNFLGAME"] += [kalshi_market("KXNFLGAME-26OCT04BUFNYJ2", "BUF", "Buffalo", 0.50, 0.51),
+                                      kalshi_market("KXNFLGAME-26OCT04BUFNYJ2", "NYJ", "New York J", 0.49, 0.50)]
+        report = {}
+        self.assertEqual(self.fair([self.game()], report=report), {})
+        self.assertIn("both fit", report["nfl1"][1])
+
+    def test_back_to_back_against_the_same_team(self):
+        # Saturday 8 PM Eastern is already Sunday in UTC; the same teams meet again on Sunday.
+        self.markets["KXNHLGAME"] = [kalshi_market("KXNHLGAME-26OCT03TBFLA", "TB", "Tampa Bay", 0.45, 0.46),
+                                     kalshi_market("KXNHLGAME-26OCT03TBFLA", "FLA", "Florida", 0.54, 0.55),
+                                     kalshi_market("KXNHLGAME-26OCT04TBFLA", "TB", "Tampa Bay", 0.38, 0.39),
+                                     kalshi_market("KXNHLGAME-26OCT04TBFLA", "FLA", "Florida", 0.61, 0.62)]
+        sat = self.game("2026-10-04T00:00:00Z", home="Florida Panthers", away="Tampa Bay Lightning", gid="h1",
+                        sport="icehockey_nhl")
+        self.assertAlmostEqual(self.fair([sat])["h1"]["Tampa Bay Lightning"][0], 0.455)
+
+    def test_slow_down_and_second_address(self):
+        from unittest import mock
+        from arbbot import kalshi_markets
+        good = {"markets": [], "cursor": ""}
+        too_many = urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)
+        with mock.patch("arbbot._get_json", side_effect=[too_many, too_many, good]) as g:
+            self.assertEqual(kalshi_markets("americanfootball_nfl"), [])
+            self.assertEqual(g.call_count, 3)
+        self.assertEqual(self.sleeps, [1, 2])
+        # Kalshi keeps refusing: give up for this scan and leave it alone for a while.
+        _arbbot._ESPN_CACHE.clear()
+        with mock.patch("arbbot._get_json", side_effect=too_many) as g:
+            with self.assertRaises(urllib.error.HTTPError):
+                kalshi_markets("americanfootball_nfl")
+            self.assertEqual(g.call_count, 4)                 # never hops to the other address for a 429
+            _arbbot._ESPN_CACHE.clear()
+            with self.assertRaises(RuntimeError):
+                kalshi_markets("americanfootball_nfl")
+            self.assertEqual(g.call_count, 4)                 # paused: didn't even ask
+        # First address down: the second one answers, and is tried first next time.
+        _arbbot._KALSHI_STATE.update(pause_until=0.0)
+        _arbbot._ESPN_CACHE.clear()
+        urls = []
+        def flaky(url):
+            urls.append(url)
+            if "elections" in url:
+                raise urllib.error.URLError("refused")
+            return good
+        with mock.patch("arbbot._get_json", side_effect=flaky):
+            kalshi_markets("americanfootball_nfl")
+            _arbbot._ESPN_CACHE.clear()
+            kalshi_markets("americanfootball_nfl")
+        self.assertEqual(["elections" in u for u in urls], [True, False, False])
+
+    def ev(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})   # 10% edge
+        return ev
+
+    def test_ev_bets_need_kalshi_to_agree(self):
+        cfg = Config(min_ev_pct=3, round_stakes=0)
+        agree = {"e1": {"Home": (0.51, 0.50, 0.52)}}
+        [b] = find_evs([self.ev()], cfg, NOW, kalshi=agree)
+        self.assertIn("Kalshi agrees", b.confidence_notes)
+        self.assertIn("**Kalshi** 51.0% to win (buy 52¢ · sell 50¢)", ev_payload(b)["embeds"][0]["description"])
+        self.assertEqual(find_evs([self.ev()], cfg, NOW, kalshi={"e1": {"Home": (0.44, 0.43, 0.45)}}), [])  # 6 pts off
+        self.assertEqual(len(find_evs([self.ev()], cfg, NOW, kalshi={"e1": {"Home": (0.47, 0.46, 0.48)}})), 1)
+        # 3.5 points off: too far for a game today, allowed for one more than a day out.
+        off = {"e1": {"Home": (0.535, 0.53, 0.54)}}
+        self.assertEqual(find_evs([self.ev()], cfg, NOW, kalshi=off), [])
+        far = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]},
+                       start="2026-10-05T18:00:00Z")
+        self.assertEqual(len(find_evs([far], cfg, NOW, kalshi=off)), 1)
+        # Within the gap but Kalshi says the price isn't good: skipped.
+        thin = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.06, None)]})
+        self.assertEqual(find_evs([thin], cfg, NOW, kalshi={"e1": {"Home": (0.47, 0.46, 0.48)}}), [])
+        self.assertEqual(len(find_evs([thin], cfg, NOW)), 1)                     # no Kalshi price: as before
+
+    def test_outliers_need_kalshi_too(self):
+        ev = outlier_event(1.85, 1.95)
+        self.assertEqual(len(find_outliers([ev], Config(), NOW)), 1)
+        self.assertEqual(find_outliers([ev], Config(), NOW, kalshi={"e1": {"Home": (0.52, 0.51, 0.53)}}), [])
+        [o] = find_outliers([ev], Config(), NOW, kalshi={"e1": {"Home": (0.77, 0.76, 0.78)}})
+        self.assertIn("**Kalshi** 77.0% to win", outlier_payload(o)["embeds"][0]["description"])
+
+    def test_check_kalshi_report(self):
+        import io, contextlib
+        from arbbot import check_kalshi
+        self.markets["KXNFLGAME"] += [kalshi_market("KXNFLGAME-26OCT04XXXYYY", "XXX", "Nowhere", 0.5, 0.51),
+                                      kalshi_market("KXNFLGAME-26OCT04XXXYYY", "YYY", "Elsewhere", 0.49, 0.5)]
+        class Api:
+            def events(self, sport, horizon_hours=48):
+                return [{"id": "nfl1", "commence_time": "2026-10-04T17:00:00Z", "home_team": "New York Jets",
+                         "away_team": "Buffalo Bills"},
+                        {"id": "nfl2", "commence_time": "2026-10-04T20:25:00Z", "home_team": "Denver Broncos",
+                         "away_team": "Las Vegas Raiders"}] if sport == "americanfootball_nfl" else []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            check_kalshi(Config(sports=["americanfootball_nfl", "soccer_epl"]), Api(), now=NOW)
+        text = out.getvalue()
+        self.assertIn("NFL: 4 open Kalshi markets, 1 of 2 upcoming games usable", text)
+        self.assertIn("✅ Buffalo Bills @ New York Jets: Buffalo Bills 62% · New York Jets 38%", text)
+        self.assertIn("[KXNFLGAME-26OCT04BUFNYJ]", text)
+        self.assertIn("Las Vegas Raiders @ Denver Broncos: no Kalshi game found", text)
+        self.assertIn("Kalshi games not placed (1): KXNFLGAME-26OCT04XXXYYY (Nowhere / Elsewhere)", text)
+        self.assertIn("fields: ", text)
+        self.assertIn("EPL: Kalshi has no game markets", text)
+
+
 if __name__ == "__main__":
     unittest.main()
