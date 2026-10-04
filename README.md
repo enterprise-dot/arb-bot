@@ -36,6 +36,12 @@ python arbbot.py --post-guide
   The headline edge is always for the stakes printed, after rounding.
 - **Live arbs are marked 🔴 LIVE** and need a bigger edge (1%; 5% in locks mode). They can go to
   their own channel (`DISCORD_LIVE_WEBHOOK_URL`) or be turned off (`ARB_LIVE=false`).
+- **After-tax line (optional, off by default).** Set `TAX_RATE` to your tax rate as a fraction
+  (`0.33`) and each arb card adds a rough after-tax profit: "🧾 After tax (~33%): about +$1.70 per
+  $100". The simple model: the winning bet's winnings are taxed, and the losing stakes are
+  deducted at 90% (that assumes you itemize), whichever way the game goes. Small arbs often come
+  out below zero this way. A rough guide, not tax advice. `MIN_AFTER_TAX_PCT` (0 = off) then skips
+  arbs under that after-tax %.
 
 **What else you get:**
 - **`arbs.csv`:** every gap: when a check first found it (`spotted`), when the alert went out and how
@@ -243,7 +249,11 @@ the card says "Kalshi agrees" and the bet's confidence goes up. Each card shows 
 ("Kalshi 51% to win, buy 52¢ · sell 50¢"). Kalshi prices only count when its market is tight
 (`KALSHI_MAX_SPREAD=3` cents, 5 for college) and deep (`KALSHI_MIN_SIZE=100` contracts); if Kalshi
 is down or a game isn't listed, alerts go ahead as before. For a bet at Kalshi itself, Kalshi's own
-order book is used to confirm the price is still there instead. See what it matches with
+order book is used to confirm the price is still there instead, and to see how much it has at that
+price (contracts x price). When the stake is more than that, the card says "Kalshi only has about
+$43 at this price; the rest would fill at a worse price", and a +EV or outlier stake is cut to
+what's there (rounded down the usual way). An arb with a Kalshi bet gets the same note, but its
+stakes stay as they are (its bets must stay balanced). See what it matches with
 `python arbbot.py --check-kalshi`.
 
 **Bigger edge, new alert.** Discord doesn't ping you when a message is edited. So if a bet's edge
@@ -287,7 +297,32 @@ results go to the bot health channel. On the command line:
 python arbbot.py --results              # today's bets one by one, then 7-day and all-time records
 python arbbot.py --results yesterday    # or a date: --results 2026-10-03
 python arbbot.py --post-results         # post today's card to the results channel now
+python arbbot.py --weekly               # the weekly report card for the last 7 days (free)
+python arbbot.py --post-weekly          # post it to the results channel now
 ```
+
+**📋 Weekly report card (Mondays).** Every Monday at the daily summary time (`SUMMARY_HOUR`; -1 turns
+it off too) the results channel (or the health channel, without one) gets the last 7 days for each
+alert type: pre-game arbs, live arbs, +EV, outliers, props and parlays. For each: the record and
+profit at the stakes shown (arbs: what they locked in at `BANKROLL`, each arb once a day, as in the
+daily recaps), ROI, CLV for pre-game bets, whether the edge held a few minutes later (📏 markouts and
+how often the price was still there), and how many alerts the hourly caps and live rules held back
+(each alert once a day, however many checks held it back). Then suggestions in plain English, for
+example:
+
+```
+• Live outliers: 64 bets, sent +22.0% → -1.1% ~3 min later (still there 38%) → consider OUTLIER_LIVE=false
+• Props with no Pinnacle price: CLV +3.1%, beat the close 68% over 22 bets → keep
+• Pre-game outliers: CLV +0.4%, beat the close 50% → too early to tell (12 bets)
+```
+
+A change is only suggested on enough bets, by the rules the bot already uses: live alert types by
+the 📏 markout rule (50+ bets and below 0 even at the high end), pre-game ones by CLV (50+ bets with
+CLV below 0 and the close beaten less than half the time). "Keep" needs 5+ bets beating the close
+(CLV above 0, the close beaten more often than not), the same test as the daily summary's ✅.
+Anything else says "too early to tell (N bets)". **The bot never changes a setting by itself**: the
+card only says what the numbers point to. It goes out once a week, even across restarts (and a
+`--post-weekly` the same Monday counts). Each line works with its file missing or empty.
 
 **Closing line value (CLV)** is the faster test. For every logged +EV and outlier bet, the bot
 keeps tracking Pinnacle's fair price until kickoff and saves it as the closing line

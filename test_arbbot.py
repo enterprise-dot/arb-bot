@@ -47,6 +47,19 @@ def event(books, home="Home", away="Away", start="2026-10-03T18:00:00Z"):
 CFG = Config(min_profit_pct=0.0, bankroll=100, round_stakes=0)
 
 
+def temp_data(test, cfg):
+    """cfg with every data file and the state folder in a temporary folder, removed after the test: an
+    alerter that logs must never write the bot's own ev_bets.csv, outliers.csv... beside the code."""
+    import tempfile
+    from dataclasses import fields
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    d = Path(tmp.name)
+    files = {f.name: str(d / Path(getattr(cfg, f.name)).name) for f in fields(Config)
+             if f.name.endswith("_file") and getattr(cfg, f.name)}
+    return replace(cfg, **files, state_dir=str(d / "state"))
+
+
 class FindArbs(unittest.TestCase):
     def test_two_way_arb(self):
         ev = event({
@@ -495,7 +508,7 @@ class PlusEV(unittest.TestCase):
         ev1 = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
         ev2 = ev_event([("Home", 1.87, None), ("Away", 1.95, None)], {"B": [("Home", 2.20, None)]})
         [b1], [b2] = find_evs([ev1], EVCFG, NOW), find_evs([ev2], EVCFG, NOW)
-        a = EVAlerter(EVCFG, dry_run=True)
+        a = EVAlerter(temp_data(self, EVCFG), dry_run=True)
         a.handle([b1], now=1000)
         a.handle([b2], now=1060)
         cur = a.open[b2.key].arb
@@ -596,7 +609,7 @@ class PlusEV(unittest.TestCase):
         note_related([([over, ml], a, {ml.sport_key})])
         self.assertEqual(over.related, [])           # ML will be skipped by the cap, so not named
         # An open alert that this scan re-checked and didn't find is about to close: not named.
-        b = EVAlerter(EVCFG, dry_run=True)
+        b = EVAlerter(temp_data(self, EVCFG), dry_run=True)
         b.handle([ml], now=1000)
         note_related([([over], b, {ml.sport_key})])
         self.assertEqual(over.related, [])
@@ -647,7 +660,8 @@ class EVLifecycle(unittest.TestCase):
         d = Path(self.tmp.name)
         self.cfg = Config(min_ev_pct=3, ev_log_file=str(d / "ev.csv"), ev_results_file=str(d / "res.csv"),
                           outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"),
-                          markout_file=str(d / "mk.csv"))
+                          markout_file=str(d / "mk.csv"), parlay_log_file=str(d / "par.csv"),
+                          score_check_file=str(d / "sc.csv"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -736,7 +750,7 @@ class Outliers(unittest.TestCase):
         self.assertEqual(len(home), 1)                       # one alert per bet...
         self.assertEqual(home[0].book, "Stale")               # ...at the best price (1.85 beats 1.60)
         self.assertEqual(home[0].also, [("Stale2", 1.60)])
-        a = OutlierAlerter(Config(), dry_run=True)
+        a = OutlierAlerter(temp_data(self, Config()), dry_run=True)
         a.handle(outs, now=1000)
         self.assertEqual(a.open[home[0].key].arb.book, "Stale")   # not overwritten by the worse book
 
@@ -955,7 +969,7 @@ class Props(unittest.TestCase):
     def test_prop_alerts_close_only_when_their_game_is_rechecked(self):
         ev = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)})
         ev["bookmakers"][0]["key"] = "pinnacle"
-        a = EVAlerter(Config(), dry_run=True)
+        a = EVAlerter(temp_data(self, Config()), dry_run=True)
         a.handle(find_evs([ev], Config().for_props(), NOW), checked_events={"p1"}, now=1000)
         a.handle([], checked_events={"other-game"}, now=1060)
         self.assertEqual(len(a.open), 1)
@@ -1033,7 +1047,7 @@ class LocksMode(unittest.TestCase):
         self.assertEqual(find_arbs([ev], Config(min_profit_pct=0.5).with_mode(), NOW), [])
 
     def test_hourly_cap_keeps_the_best(self):
-        a = EVAlerter(Config(), dry_run=True)
+        a = EVAlerter(temp_data(self, Config()), dry_run=True)
         a.max_per_hour = 2
         bets = [replace(ev_leg(f"g{i}", {"DK": 2.30}), event_id=f"g{i}") for i in range(4)]
         self.assertEqual(a.handle(bets, now=1000), 2)
@@ -1667,7 +1681,8 @@ class BetResults(unittest.TestCase):
                           results_webhook_url="https://results", log_file=str(d / "arbs.csv"),
                           ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
                           parlay_log_file=str(d / "par.csv"), ev_results_file=str(d / "res.csv"),
-                          closing_file=str(d / "close.csv"), markout_file=str(d / "mk.csv"), pregame_max_age_seconds=10**9)
+                          closing_file=str(d / "close.csv"), markout_file=str(d / "mk.csv"), pregame_max_age_seconds=10**9,
+                          score_check_file=str(d / "sc.csv"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -2315,7 +2330,7 @@ class PropGrading(unittest.TestCase):
         self.cfg = Config(min_ev_pct=3, round_stakes=0, ev_log_file=str(d / "ev.csv"),
                           outlier_log_file=str(d / "out.csv"), parlay_log_file=str(d / "par.csv"),
                           ev_results_file=str(d / "res.csv"), closing_file=str(d / "close.csv"),
-                          markout_file=str(d / "mk.csv"), log_file="")
+                          markout_file=str(d / "mk.csv"), log_file="", score_check_file=str(d / "sc.csv"))
         self.games = [nhl_game()]
         mock.patch("arbbot._espn_get", side_effect=lambda path: espn_fake(self.games)(path)).start()
         self.addCleanup(mock.patch.stopall)
@@ -3016,7 +3031,7 @@ class OddsApiCosts(unittest.TestCase):
                 return self
             def __exit__(self, *a):
                 return False
-        api = OddsAPI(Config(api_key="k"))
+        api = OddsAPI(Config(api_key="k", state_dir=""))
         err = io.StringIO()
         with mock.patch("urllib.request.urlopen", side_effect=[Resp(h) for h in headers]), \
                 contextlib.redirect_stderr(err):
@@ -7522,14 +7537,633 @@ class UpcomingProbe(unittest.TestCase):
     def test_the_command_line_flag(self):
         import os, sys, contextlib, io
         from unittest import mock
+        import tempfile
         loop = AssertionError("the main loop started")
-        with mock.patch.dict(os.environ, {"ODDS_API_KEY": "k", "STATE_DIR": ""}), \
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        files = {k: str(Path(tmp.name) / k.lower()) for k in ("LOG_FILE", "EV_LOG_FILE", "OUTLIER_LOG_FILE", "PARLAY_LOG_FILE",
+                                                              "EV_RESULTS_FILE", "CLOSING_FILE", "MARKOUT_FILE",
+                                                              "SCORE_CHECK_FILE")}
+        with mock.patch.dict(os.environ, {"ODDS_API_KEY": "k", "STATE_DIR": "", **files}), \
                 mock.patch.object(sys, "argv", ["arbbot.py", "--check-upcoming"]), mock.patch("arbbot.load_dotenv"), \
                 mock.patch("arbbot.check_upcoming") as probe, contextlib.redirect_stdout(io.StringIO()), \
                 mock.patch.object(_arbbot.Scheduler, "refresh_events", side_effect=loop), \
                 mock.patch("arbbot.time.sleep", side_effect=loop):
             _arbbot.main()
         self.assertEqual(probe.call_count, 1)
+
+
+# --------------------------------------------------------------------------- Kalshi depth for bets at Kalshi
+
+class KalshiDepth(unittest.TestCase):
+    """A bet at Kalshi bigger than Kalshi's order book holds at that price: the card says so, and a
+    +EV or outlier stake is cut to what's there (an arb's stakes stay: its bets must balance)."""
+
+    setUp, game, fair = KalshiCrossCheck.setUp, KalshiCrossCheck.game, KalshiCrossCheck.fair
+
+    def test_the_quote_carries_the_ask_size_and_still_reads_as_three_numbers(self):
+        self.markets["KXNFLGAME"][1]["yes_ask_size_fp"] = "250.00"
+        fair = self.fair([self.game()])["nfl1"]
+        jets = fair["New York Jets"]
+        self.assertEqual(getattr(jets, "ask_size", None), 250)
+        self.assertEqual(getattr(fair["Buffalo Bills"], "ask_size", None), 5000)
+        p, bid, ask = jets                                                  # old callers unpack three
+        self.assertEqual((bid, ask), (0.37, 0.39))
+        self.assertEqual(jets, (p, 0.37, 0.39))                            # and compare with plain tuples
+        self.assertEqual(_arbbot.kalshi_room(jets), 250 * 0.39)
+        self.assertIsNone(_arbbot.kalshi_room((p, 0.37, 0.39)))            # a plain tuple: size not known
+        import copy, pickle
+        for again in (copy.deepcopy(jets), pickle.loads(pickle.dumps(jets))):
+            self.assertEqual((again, getattr(again, "ask_size", None)), (jets, 250))
+        self.assertIn("about $0.60 at this price", _arbbot.kalshi_room_line(0.6))
+
+    def test_ev_bet_at_kalshi_is_cut_to_what_kalshi_has(self):
+        from arbbot import KalshiQuote
+        cfg = Config(min_ev_pct=3, round_stakes=5, confidence_stakes="1,1,1")
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"Kalshi": [("Home", 2.1398, None)]})
+        [full] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": (0.445, 0.44, 0.45)}})   # no size: as before
+        self.assertEqual((full.stake, full.kalshi_room), (15.0, 0.0))
+        self.assertNotIn("Kalshi only has", ev_payload(full)["embeds"][0]["description"])
+        [b] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 30)}})   # $13.50 there
+        self.assertEqual(b.stake, 10.0)                                    # rounded down to $5s, never over
+        desc = ev_payload(b)["embeds"][0]["description"]
+        self.assertIn("bet **$10** on **Home ML", desc)
+        self.assertIn("↳ Kalshi only has about $13 at this price; the rest would fill at a worse price.", desc)
+        [deep] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 1000)}})
+        self.assertEqual((deep.stake, deep.kalshi_room), (15.0, 0.0))     # enough there: unchanged
+        # Kalshi's quote on a bet somewhere else is only a second opinion: that stake isn't Kalshi's to cut.
+        other = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [b2] = find_evs([other], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.51, 0.50, 0.52, 1)}})
+        [same] = find_evs([other], cfg, NOW, kalshi={"e1": {"Home": (0.51, 0.50, 0.52)}})
+        self.assertEqual((b2.stake, b2.kalshi_room), (same.stake, 0.0))
+
+    def test_outlier_at_kalshi_is_cut_too(self):
+        from arbbot import KalshiQuote
+        out = outlier_event(1.85, 1.95)
+        out["bookmakers"][-1].update(key="kalshi", title="Kalshi")
+        [full] = find_outliers([out], Config(), NOW, kalshi={"e1": {"Home": (0.515, 0.51, 0.52)}})
+        [o] = find_outliers([out], Config(), NOW, kalshi={"e1": {"Home": KalshiQuote(0.515, 0.51, 0.52, 10)}})
+        self.assertGreater(full.stake, 5.2)
+        self.assertEqual((o.stake, o.kalshi_room), (5.0, 10 * 0.52))
+        self.assertIn("↳ Kalshi only has about $5 at this price; the rest would fill at a worse price.",
+                      outlier_payload(o)["embeds"][0]["description"])
+
+    def kalshi_arb(self):
+        return event({"Kalshi": [("h2h", [("Home", 2.20, None), ("Away", 1.60, None)])],
+                      "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])]})
+
+    def test_kalshi_arb_bet_gets_a_note_and_keeps_its_stake(self):
+        from arbbot import KalshiQuote, note_kalshi_room
+        [arb] = find_arbs([self.kalshi_arb()], CFG, NOW)
+        stakes = [(l.book, l.stake) for l in arb.legs]
+        note_kalshi_room([arb], {"e1": {"Home": KalshiQuote(0.44, 0.42, 0.43, 100)}}, CFG)   # $43 at 43¢
+        self.assertEqual([(l.book, l.stake) for l in arb.legs], stakes)   # an arb's stakes stay balanced
+        kalshi = next(l for l in arb.legs if l.book == "Kalshi")
+        self.assertGreater(kalshi.stake, 43)
+        self.assertAlmostEqual(kalshi.room, 43.0)
+        desc = discord_payload(arb)["embeds"][0]["description"]
+        self.assertIn("↳ Kalshi only has about $43 at this price; the rest would fill at a worse price.", desc)
+        self.assertEqual(desc.count("Kalshi only has"), 1)
+        # Kalshi's best ask no longer the card's price (its own order book moved): nothing to count.
+        [moved] = find_arbs([self.kalshi_arb()], CFG, NOW)
+        note_kalshi_room([moved], {"e1": {"Home": KalshiQuote(0.46, 0.45, 0.46, 100)}}, CFG)
+        self.assertEqual([l.room for l in moved.legs], [0.0, 0.0])
+        [deep] = find_arbs([self.kalshi_arb()], CFG, NOW)                   # enough there: no note
+        note_kalshi_room([deep], {"e1": {"Home": KalshiQuote(0.44, 0.42, 0.43, 5000)}}, CFG)
+        self.assertNotIn("Kalshi only has", discord_payload(deep)["embeds"][0]["description"])
+
+
+class KalshiDepthScan(MixFiles):
+    def test_a_kalshi_arb_waits_for_kalshi_so_its_first_card_has_the_note(self):
+        from unittest import mock
+        from arbbot import KalshiQuote
+        t = _arbbot.Trackers(self.cfg(Config(min_profit_pct=0, round_stakes=0)), self.args())
+        ev = KalshiDepth.kalshi_arb(self)
+        ev["sport_key"] = "basketball_nba"
+        quotes = {"e1": {"Home": KalshiQuote(0.44, 0.42, 0.43, 100), "Away": KalshiQuote(0.56, 0.55, 0.57, 100)}}
+        with mock.patch("arbbot.kalshi_fair", return_value=quotes) as asked:
+            _arbbot.scan_main(t, [ev], ["basketball_nba"], NOW)
+        self.assertEqual(asked.call_count, 1)                               # asked once, for everything
+        [op] = t.arbs.open.values()
+        self.assertIn("Kalshi only has about $43", discord_payload(op.arb)["embeds"][0]["description"])
+        self.assertEqual(op.card, t.arbs.card_hash(op.arb, op.first_seen))  # in the card as it went out
+        # No Kalshi bet in an arb: arbs still go out before Kalshi is asked.
+        t2 = _arbbot.Trackers(self.cfg(Config(min_profit_pct=0, round_stakes=0)), self.args())
+        plain = event({"A": [("h2h", [("Home", 2.20, None), ("Away", 1.60, None)])],
+                       "B": [("h2h", [("Home", 1.70, None), ("Away", 2.15, None)])]})
+        plain["sport_key"] = "basketball_nba"
+        order = []
+        real_handle = t2.arbs.handle
+        t2.arbs.handle = lambda *a, **k: order.append("arbs") or real_handle(*a, **k)
+        with mock.patch("arbbot.kalshi_fair", side_effect=lambda *a, **k: order.append("kalshi") or {}):
+            _arbbot.scan_main(t2, [plain], ["basketball_nba"], NOW)
+        self.assertEqual(order, ["arbs", "kalshi"])
+        # Nor for a Kalshi bet Kalshi's quote can't speak for: a live game (KALSHI_LIVE=false), or a spread.
+        for live, market in ((True, "h2h"), (False, "spreads")):
+            t3 = _arbbot.Trackers(self.cfg(Config(min_profit_pct=0, min_live_profit_pct=0, round_stakes=0)), self.args())
+            pt = -1.5 if market == "spreads" else None
+            other = event({"Kalshi": [(market, [("Home", 2.20, pt), ("Away", 1.60, None if pt is None else -pt)])],
+                           "B": [(market, [("Home", 1.70, pt), ("Away", 2.15, None if pt is None else -pt)])]},
+                          start="2026-10-03T11:30:00Z" if live else "2026-10-03T18:00:00Z")
+            other["sport_key"] = "basketball_nba"
+            order = []
+            real3 = t3.arbs.handle
+            t3.arbs.handle = lambda *a, real3=real3, **k: order.append("arbs") or real3(*a, **k)
+            with mock.patch("arbbot.kalshi_fair", side_effect=lambda *a, **k: order.append("kalshi") or quotes):
+                _arbbot.scan_main(t3, [other], ["basketball_nba"], NOW)
+            self.assertEqual(order, ["arbs", "kalshi"], (live, market))
+            self.assertEqual([l.room for op in t3.arbs.open.values() for l in op.arb.legs], [0.0, 0.0])
+        [spread] = find_arbs([other], CFG, NOW)                             # a Kalshi quote is the moneyline's
+        _arbbot.note_kalshi_room([spread], quotes, CFG)
+        self.assertEqual([l.room for l in spread.legs], [0.0, 0.0])
+
+
+# --------------------------------------------------------------------------- weekly report card
+
+class WeeklyReportCard(MixFiles):
+    """📋 Monday's report card: the last 7 days by alert type, from each one's own file, with
+    plain-English suggestions only (the bot never changes a setting)."""
+
+    MONDAY = datetime(2026, 10, 5).date()     # the card covers Mon Sep 28 - Sun Oct 4
+
+    def bet(self, i, kind="ev", live=False, player="", result="win", fair_from="Pinnacle", day="2026-10-01",
+            close=0.47, start=None):
+        from arbbot import RESULT_FIELDS, EV_LOG_FIELDS, CLOSING_FIELDS
+        r = {"first_seen": f"{day}T15:00:00+00:00", "event_id": f"g{i}", "sport": "NHL", "sport_key": "icehockey_nhl",
+             "matchup": "A @ H", "home_team": "H", "away_team": "A", "commence_time": start or f"{day}T23:00:00Z",
+             "live": live,
+             "market": "player_points" if player else "h2h", "outcome": "Over" if player else "H",
+             "point": 0.5 if player else "", "n_outcomes": 2, "book": "DraftKings", "price": 2.2, "fair_odds": 2.0,
+             "best_ev_pct": 10, "stake": 20, "player": player, "confidence": "high", "fair_from": fair_from}
+        append_csv(self.files["ev_log_file" if kind == "ev" else "outlier_log_file"], EV_LOG_FIELDS, r)
+        append_csv(self.files["ev_results_file"], RESULT_FIELDS,
+                   {**r, "kind": kind, "result": result, "profit": 24 if result == "win" else -20})
+        if close and not live:
+            append_csv(self.files["closing_file"], CLOSING_FIELDS,
+                       {"bet_id": _arbbot._bet_id(r), "closing_fair_prob": close, "closing_fair_odds": 1 / close})
+
+    def mark(self, i, kind="outlier", live=True, pct=-1.0, still=0, day="2026-10-02"):
+        append_csv(self.files["markout_file"], _arbbot.MARKOUT_FIELDS,
+                   {"first_seen": f"{day}T01:00:00+00:00", "bet_id": f"m{i}", "kind": kind, "live": live,
+                    "book": "DraftKings", "edge_pct": 22, "markout_pct": pct, "markout_secs": 170, "still_ok": still,
+                    "arb_id": f"a{i}" if kind == "arb" else ""})
+
+    def arb(self, matchup, pct, live=False, day="2026-10-02", reason="", at="01:00"):
+        append_csv(self.files["log_file"], _arbbot.LOG_FIELDS,
+                   {"first_seen": f"{day}T{at}:00+00:00", "matchup": matchup, "market": "h2h", "line": "",
+                    "live": live, "best_profit_pct": pct, "reason": reason})
+
+    def card(self, held=None, cfg=None):
+        return _arbbot.weekly_text(cfg or self.cfg(), self.MONDAY, held)
+
+    def test_every_alert_type_from_its_own_files_this_week_only(self):
+        for i in range(8):
+            self.bet(i, result="win" if i % 3 else "loss")                  # 5-3
+        self.bet(90, day="2026-09-20")                                        # last week: not counted
+        self.bet(91, day="2026-10-05")                                        # nor this week's
+        for i in range(10, 13):
+            self.bet(i, kind="outlier", live=True, result="loss")
+        for i in range(13, 15):
+            self.bet(i, kind="outlier")
+        for i in range(20, 26):
+            self.bet(i, player="LeBron James", fair_from="consensus of DraftKings, FanDuel, BetMGM, Caesars")
+        for i in range(40):
+            self.mark(i, pct=-1 + (i % 5) * 0.3, still=int(i % 3 == 0))
+        self.mark(99, day="2026-09-21")                                       # last week
+        for i in range(5):
+            self.arb(f"X{i} @ Y", 2.5)
+        self.arb("X0 @ Y", 2.0)                                               # the same arb again: once
+        self.arb("Z @ Y", 6, live=True)
+        self.arb("Q @ Y", 9, reason="capped")                                 # held back, never sent
+        self.arb("W @ Y", 3, day="2026-09-27")                                # last week
+        held = {"2026-10-02": {"Live arbs": {"unconfirmed": 3, "live cap": 1}, "Outliers": {"capped": 2}},
+                "2026-09-27": {"+EV": {"capped": 9}}}
+        title, text, profit = self.card(held)
+        self.assertEqual(title, "📋 Weekly report card · Sep 28 – Oct 4")
+        self.assertIn("💰 **Pre-game arbs** · 5 different · about +$12.50 locked in at $100 each (ROI +2.5%)", text)
+        self.assertIn("💰 **Live arbs** · 1 different · about +$6 locked in at $100 each (ROI +6.0%)", text)
+        self.assertIn("✋ Held back: 4 (3 live, gone before it was confirmed, 1 over the live-alert cap)", text)
+        self.assertIn("📈 **+EV** · 5-3 · +$60 on $160 staked (ROI +37.5%)\n"
+                      "📐 CLV (pre-game): avg +3.4%, beat the close on 100% of 8 bets\n"
+                      "📏 Did the edge hold: nothing measured yet\n✋ Held back: none", text)
+        self.assertIn("🚨 **Outliers** · 2-3 · −$12 on $100 staked (ROI -12.0%) · 🔴 live 0-3 −$60 · "
+                      "⏰ pre-game 2-0 +$48", text)
+        self.assertIn("📐 CLV (pre-game): avg +3.4%, beat the close on 100% of 2 bets", text)
+        self.assertIn("📏 Live outliers: sent +22.0% → later -0.4% (40 bets", text)
+        self.assertIn("still there 35%", text)
+        self.assertIn("✋ Held back: 2 (2 over the hourly cap)", text)
+        self.assertIn("🎯 **Props** · 6-0 · +$144 on $120 staked (ROI +120.0%)", text)
+        self.assertIn("📦 **Parlays** · no graded bets yet\n\n💡 **Suggestions**", text)   # nothing else to say
+        self.assertIn("• Live outliers: sent +22.0% → -0.4% ~3 min later (still there 35%) → too early to tell "
+                      "(40 bets)", text)
+        self.assertIn("• Pre-game +EV: CLV +3.4%, beat the close 100% over 8 bets → keep", text)
+        self.assertIn("• Props with no Pinnacle price: CLV +3.4%, beat the close 100% over 6 bets → keep", text)
+        self.assertEqual(profit, 60 - 12 + 144)
+        payload = _arbbot.weekly_payload(self.cfg(), self.MONDAY, held)["embeds"][0]
+        self.assertEqual((payload["title"], payload["color"]), (title, 0x2ECC71))
+        self.assertIn("never changes a setting", payload["footer"]["text"])
+
+    def test_a_series_counts_each_game_as_the_daily_recaps_do(self):
+        for day, pct in (("2026-09-29", 2.5), ("2026-09-30", 3), ("2026-10-01", 4)):   # 7pm, 3 nights in a row
+            self.arb("Detroit Tigers @ Cleveland Guardians", pct, day=day, at="23:00")
+        self.arb("Detroit Tigers @ Cleveland Guardians", 2.0, day="2026-10-02", at="01:30")   # 9:30pm the 3rd
+        self.assertIn("💰 **Pre-game arbs** · 3 different · about +$9.50 locked in at $100 each (ROI +3.2%)",
+                      self.card({})[1])
+        nights = [self.MONDAY - timedelta(days=d) for d in (6, 5, 4)]                # Tue-Thu in New York
+        self.assertEqual([_arbbot.arbs_on(self.cfg(), d).split(" if you")[0] for d in nights],
+                         ["💰 **Arbs:** 1 different · about +$2.50", "💰 **Arbs:** 1 different · about +$3",
+                          "💰 **Arbs:** 1 different (2 alerts) · about +$4"])          # the card is their sum
+
+    def test_the_week_is_monday_to_sunday_night_new_york_time(self):
+        self.bet(1, day="2026-09-28")                                         # Mon Sep 28, 7pm: the first day
+        self.bet(2, start="2026-10-05T01:00:00Z")                             # Sun Oct 4, 9pm: the last night
+        self.bet(3, start="2026-09-28T01:00:00Z", result="loss")              # Sun Sep 27, 9pm: last week's
+        self.bet(4, start="2026-10-06T01:00:00Z", result="loss")              # Mon Oct 5, 9pm: next week's
+        self.mark(1, day="2026-09-29", pct=-1.0)                              # sent Mon Sep 28, 9pm
+        self.mark(2, day="2026-09-28", pct=5.0)                               # Sun Sep 27, 9pm: last week's
+        self.mark(3, day="2026-10-05", pct=-3.0)                              # Sun Oct 4, 9pm
+        self.arb("A1 @ B", 2, day="2026-09-29")                               # the same, for arbs
+        self.arb("A2 @ B", 9, day="2026-09-28")
+        self.arb("A3 @ B", 3, day="2026-10-05")
+        held = {"2026-09-27": {"+EV": {"capped": 9}}, "2026-09-28": {"+EV": {"capped": 1}},
+                "2026-10-04": {"+EV": {"capped": 2}}, "2026-10-05": {"+EV": {"capped": 5}}}
+        title, text, profit = self.card(held)
+        self.assertIn("📈 **+EV** · 2-0 · +$48 on $40 staked", text)
+        self.assertIn("✋ Held back: 3 (3 over the hourly cap)", text)
+        self.assertIn("• Live outliers: sent +22.0% → -2.0% ~3 min later (still there 0%) → too early to tell "
+                      "(2 bets)", text)
+        self.assertIn("💰 **Pre-game arbs** · 2 different · about +$5 locked in at $100 each (ROI +2.5%)", text)
+        self.assertEqual(profit, 48)
+
+    def test_every_line_works_with_its_file_missing_empty_or_broken(self):
+        title, text, profit = self.card()                                     # no files at all
+        for line in ("💰 **Pre-game arbs** · no alerts", "💰 **Live arbs** · no alerts", "📈 **+EV** · no graded bets yet",
+                     "🚨 **Outliers** · no graded bets yet", "🎯 **Props** · no graded bets yet",
+                     "📦 **Parlays** · no graded bets yet", "• Nothing to judge yet this week."):
+            self.assertIn(line, text)
+        for part in ("📐", "📏", "✋ Held back:"):                           # an empty type is one line
+            self.assertNotIn(part, text)
+        off = replace(self.cfg(), log_file="", ev_results_file="", closing_file="", markout_file="", state_dir="")
+        self.assertEqual(self.card(cfg=off)[1], text)                        # files turned off: the same
+        self.assertEqual(profit, 0)
+        for name in ("log_file", "ev_log_file", "outlier_log_file", "ev_results_file", "closing_file", "markout_file"):
+            Path(self.files[name]).write_text("")                             # empty
+        Path(self.files["state_dir"]).mkdir()
+        (Path(self.files["state_dir"]) / _arbbot.HELD_FILE).write_text("")
+        self.assertEqual(self.card()[1], text)
+        for name in ("log_file", "ev_results_file", "markout_file"):         # just a header
+            Path(self.files[name]).write_text("first_seen,kind\n")
+        self.assertEqual(self.card()[1], text)
+        import contextlib, io
+        self.bet(1)
+        Path(self.files["markout_file"]).write_bytes(b"first_seen,kind\n\xff\xfe\x00,outlier\n")   # broken
+        Path(self.files["ev_results_file"]).write_text("result,kind\nwin,ev\n")                     # no columns
+        (Path(self.files["state_dir"]) / _arbbot.HELD_FILE).write_text("[not json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            title, broken, _ = self.card()
+        self.assertIn("💰 **Pre-game arbs** · no alerts", broken)               # the other parts still there
+        self.assertIn("📐 CLV (pre-game): avg +3.4%", broken)
+        self.assertIn(f"⚠️ Couldn't read {self.files['ev_results_file']}, {self.files['markout_file']}", broken)
+        self.assertIn("! Weekly report card: couldn't read", err.getvalue())
+
+    def clv(self, n, clv_pct, kind="ev", player="", fair_from="Pinnacle", beat=None):
+        return [{"kind": kind, "player": player, "fair_from": fair_from, "clv_pct": clv_pct,
+                 "beat_close": clv_pct > 0 if beat is None else beat} for _ in range(n)]
+
+    def marks(self, pcts, kind="outlier"):
+        return [{"kind": kind, "live": "True", "player": "", "markout_pct": p, "edge_pct": 22, "markout_secs": 170,
+                 "still_ok": "0"} for p in pcts]
+
+    def test_suggestions_only_when_the_existing_bars_say_so(self):
+        cfg = Config()
+        tips = lambda clv=(), marks=(): _arbbot.weekly_suggestions(cfg, list(clv), list(marks))
+        # Markouts: MARKOUT_VERDICT_BETS (50) live bets, judged by the 📏 tables' ✅ / ⚠️.
+        self.assertEqual(tips(marks=self.marks([-2.0, -1.0] * 24 + [-1.5])),
+                         ["Live outliers: sent +22.0% → -1.5% ~3 min later (still there 0%) → too early to tell (49 bets)"])
+        self.assertEqual(tips(marks=self.marks([-2.0, -1.0] * 30)),
+                         ["Live outliers: 60 bets, sent +22.0% → -1.5% ~3 min later (still there 0%) → "
+                          "consider OUTLIER_LIVE=false"])
+        self.assertTrue(tips(marks=self.marks([2.0, 1.0] * 30))[0].endswith("→ keep"))
+        self.assertTrue(tips(marks=self.marks([5.0, -5.0] * 30))[0].endswith("→ no clear signal yet: keep watching"))
+        self.assertTrue(tips(marks=self.marks([-2.0, -1.0] * 30, kind="ev"))[0].startswith("Live +EV: 60 bets"))
+        self.assertTrue(tips(marks=self.marks([-2.0, -1.0] * 30, kind="ev"))[0].endswith("consider EV_LIVE=false"))
+        # CLV: "keep" from 5 bets beating the close (the daily summary's rule); a change only from 50.
+        self.assertEqual(tips(self.clv(4, 3.0)), ["Pre-game +EV: CLV +3.0%, beat the close 100% → too early to tell (4 bets)"])
+        self.assertEqual(tips(self.clv(5, 3.0)), ["Pre-game +EV: CLV +3.0%, beat the close 100% over 5 bets → keep"])
+        self.assertEqual(tips(self.clv(5, 3.0, beat=False)),
+                         ["Pre-game +EV: CLV +3.0%, beat the close 0% → too early to tell (5 bets)"])
+        self.assertEqual(tips(self.clv(20, -2.0)), ["Pre-game +EV: CLV -2.0%, beat the close 0% → too early to tell (20 bets)"])
+        self.assertEqual(tips(self.clv(60, -2.0)),
+                         ["Pre-game +EV: CLV -2.0%, beat the close 0% over 60 bets → consider raising MIN_EV_PCT (now 4)"])
+        self.assertEqual(tips(self.clv(60, -2.0, beat=True)),
+                         ["Pre-game +EV: CLV -2.0%, beat the close 100% over 60 bets → no clear signal yet: keep watching"])
+        half = lambda pct: self.clv(30, pct, beat=True) + self.clv(30, pct, beat=False)
+        self.assertEqual(tips(half(-1.0)),                                  # exactly half: neither way
+                         ["Pre-game +EV: CLV -1.0%, beat the close 50% over 60 bets → no clear signal yet: keep watching"])
+        self.assertEqual(tips(half(1.0)),
+                         ["Pre-game +EV: CLV +1.0%, beat the close 50% over 60 bets → no clear signal yet: keep watching"])
+        self.assertEqual(tips(self.clv(60, 0.0)),                           # nor an average of exactly 0
+                         ["Pre-game +EV: CLV +0.0%, beat the close 0% over 60 bets → no clear signal yet: keep watching"])
+        self.assertEqual(tips(self.clv(60, -1.0, kind="outlier", fair_from="median of 4 other books")),
+                         ["Pre-game outliers: CLV -1.0%, beat the close 0% over 60 bets → consider raising OUTLIER_MIN_PCT "
+                          "(now 10)"])
+        self.assertEqual(tips(self.clv(22, 3.1, player="LeBron James", fair_from="consensus of DraftKings, FanDuel")),
+                         ["Props with no Pinnacle price: CLV +3.1%, beat the close 100% over 22 bets → keep"])
+        self.assertEqual(tips(self.clv(60, -1.0, player="LeBron James")),
+                         ["Props with a Pinnacle price: CLV -1.0%, beat the close 0% over 60 bets → consider raising "
+                          "PROP_MIN_EV_PCT (now 7)"])
+        self.assertEqual(tips(self.clv(60, -1.0, player="LeBron James", fair_from="consensus of DraftKings, FanDuel")),
+                         ["Props with no Pinnacle price: CLV -1.0%, beat the close 0% over 60 bets → consider raising "
+                          "PROP_MIN_BOOKS (now 4)"])
+
+    def test_goes_out_once_across_restarts_and_processes(self):
+        from arbbot import Results
+        cfg = self.cfg(results_webhook_url="https://results.example")
+        sent = []
+        bot = Results(cfg, dry_run=False)
+        bot.send = lambda payload: sent.append(payload["embeds"][0]["title"]) or True
+        self.assertTrue(bot.weekly_due(self.MONDAY))
+        self.assertEqual(bot.weekly(self.MONDAY), "sent")
+        self.assertEqual(sent, ["📋 Weekly report card · Sep 28 – Oct 4"])
+        restarted = Results(cfg, dry_run=False)
+        self.assertFalse(restarted.weekly_due(self.MONDAY))                 # a restart doesn't send it again
+        nxt = self.MONDAY + timedelta(days=7)
+        self.assertTrue(restarted.weekly_due(nxt))
+        cli = Results(cfg, dry_run=False)                                    # --post-weekly from another process
+        cli.send = lambda payload: True
+        self.assertEqual(cli.weekly(nxt), "sent")
+        bot.weekly_tried = 0
+        self.assertFalse(bot.weekly_due(nxt))                               # the bot sees it went out
+        bot._save()                                                          # and keeps both weeks when it saves
+        import json
+        saved = json.loads((Path(cfg.state_dir) / "results_posted.json").read_text())
+        self.assertEqual(saved["weekly_days"], [self.MONDAY.isoformat(), nxt.isoformat()])
+        # Discord down: not marked, and not retried on every pass (as the daily recap).
+        down = Results(cfg, dry_run=False)
+        down.send = lambda payload: False
+        later = nxt + timedelta(days=7)
+        self.assertEqual(down.weekly(later), "failed")
+        self.assertFalse(down.weekly_due(later))
+        down.weekly_tried -= 3600
+        self.assertTrue(down.weekly_due(later))
+
+    def run_loop(self, day, cfg_changes=None, held=None):
+        """One pass of run()'s loop at 10am New York time on `day` (summary at 9am)."""
+        import argparse, contextlib, io
+        from unittest import mock
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo("America/New_York")
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                t = datetime(day.year, day.month, day.day, 10, 0, tzinfo=ny)
+                return t.astimezone(tz) if tz else t.replace(tzinfo=None)
+
+        class Api:
+            remaining, used = 50000.0, None
+            def __init__(self, cfg):
+                pass
+            def events(self, sport, horizon_hours=26):
+                return []
+        cfg = replace(self.cfg(sports=["basketball_nba"], kalshi_check=False, summary_hour=9, results_minutes=0),
+                      **(cfg_changes or {}))
+        posted = []
+        real_init = _arbbot.HeldTally.__init__
+
+        def seeded(tally, cfg, path):   # what this run of the bot held back so far
+            real_init(tally, cfg, path)
+            tally.days.update(held or {})
+        args = argparse.Namespace(once=False, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        with mock.patch("arbbot.OddsAPI", Api), mock.patch("arbbot.datetime", Clock), \
+                mock.patch.object(_arbbot.Results, "send", lambda res, payload: posted.append(payload) or True), \
+                mock.patch.object(_arbbot.Status, "send_card", lambda status, payload: None), \
+                mock.patch("arbbot.time.sleep", side_effect=StopLoop), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(_arbbot.HeldTally, "__init__", seeded):
+            with self.assertRaises(StopLoop):
+                _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        return [p["embeds"][0]["title"] for p in posted] if not held else posted
+
+    def test_the_bot_posts_it_on_monday_at_summary_time(self):
+        self.assertIn("📋 Weekly report card · Sep 28 – Oct 4", self.run_loop(self.MONDAY))
+        sunday = self.MONDAY - timedelta(days=1)
+        self.assertFalse([t for t in self.run_loop(sunday) if t.startswith("📋 Weekly")])
+        self.assertFalse([t for t in self.run_loop(self.MONDAY, {"summary_hour": -1}) if t.startswith("📋 Weekly")])
+        self.assertFalse([t for t in self.run_loop(self.MONDAY, {"summary_hour": 11}) if t.startswith("📋 Weekly")])
+        # Its own count, so it's there even with STATE_DIR empty (nothing saved).
+        [card] = [p for p in self.run_loop(self.MONDAY, {"state_dir": ""}, {"2026-10-02": {"Outliers": {"capped": 2}}})
+                  if p["embeds"][0]["title"].startswith("📋 Weekly")]
+        self.assertIn("✋ Held back: 2 (2 over the hourly cap)", card["embeds"][0]["description"])
+
+    def main(self, *flags, webhook=None):
+        import os, sys, contextlib, io
+        from unittest import mock
+        env = {k.upper(): v for k, v in self.files.items()}
+        env.update(DISCORD_RESULTS_WEBHOOK_URL="https://results.example", ODDS_API_KEY="")
+        loop = AssertionError("the main loop started")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(sys, "argv", ["arbbot.py", *flags]), \
+                mock.patch("arbbot.load_dotenv"), mock.patch("arbbot._webhook", side_effect=webhook or loop), \
+                mock.patch.object(_arbbot.Scheduler, "refresh_events", side_effect=loop), \
+                mock.patch("arbbot.time.sleep", side_effect=loop), contextlib.redirect_stdout(out):
+            _arbbot.main()
+        return out.getvalue()
+
+    def test_the_command_line_flags(self):
+        import json
+        from zoneinfo import ZoneInfo
+        self.bet(1, day=(datetime.now(ZoneInfo("America/New_York")) - timedelta(days=2)).date().isoformat())
+        text = self.main("--weekly")                                         # free: no key, no grading
+        self.assertIn("📋 Weekly report card · ", text)
+        self.assertIn("📈 +EV · 1-0 · +$24 on $20 staked", text)            # plain text, no Discord bold
+        self.assertFalse((Path(self.files["state_dir"]) / "results_posted.json").exists())
+        posts = []
+        out = self.main("--post-weekly", webhook=lambda url, payload, *a, **k: posts.append((url, payload)) or {"id": "1"})
+        self.assertEqual([u for u, p in posts], ["https://results.example"])
+        self.assertTrue(posts[0][1]["embeds"][0]["title"].startswith("📋 Weekly report card · "))
+        self.assertIn("Posted the weekly report card", out)
+        today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+        saved = json.loads((Path(self.files["state_dir"]) / "results_posted.json").read_text())
+        self.assertEqual(saved["weekly_days"], [today])                      # a Monday one won't go out twice
+
+
+class HeldBackCount(MixFiles):
+    """The weekly card's "held back": each alert the caps or live rules stopped, once a day."""
+
+    def test_counts_each_alert_once_a_day_by_type(self):
+        from arbbot import HeldTally, Arb, Leg
+        path = Path(self.files["state_dir"]) / _arbbot.HELD_FILE
+        tally = HeldTally(Config(), path)
+        ev = ev_leg("g1", {"DK": 2.30})
+        noon = NOW.timestamp()
+        for secs in (0, 60, 905, 1810, 2715, 4 * 3600):                     # checks 15+ min apart, all day
+            tally.add(ev, "capped", noon + secs)
+        tally.add(ev, "live cap", noon)                                     # another reason
+        tally.add(ev, "waiting", noon + 5000)                                # ends up sent or "unconfirmed"
+        outlier = replace(ev, sharp_book="median of 4 other books")              # the same bet, as an outlier
+        prop = replace(ev, line=("LeBron James", 25.5), market="player_points", event_id="g3")
+        arb = Arb("g4", "NBA", "A @ H", "2026-10-03T18:00:00Z", True, "h2h", None, [Leg("H", 2.1, "A")], 0.98)
+        parlay = _arbbot.Parlay("DK", [(ev, 2.3, "")])
+        for item in (outlier, prop, arb, replace(arb, is_live=False, event_id="g5"), parlay):
+            tally.add(item, "capped", noon)
+        self.assertEqual(tally.days, {"2026-10-03": {"+EV": {"capped": 1, "live cap": 1}, "Outliers": {"capped": 1},
+                                                     "Props": {"capped": 1}, "Live arbs": {"capped": 1},
+                                                     "Pre-game arbs": {"capped": 1}, "Parlays": {"capped": 1}}})
+        self.assertFalse(path.exists())
+        tally.save()
+        self.assertEqual(HeldTally(Config(), path).days, tally.days)         # survives a restart
+        self.assertEqual(HeldTally(Config(), None).days, {})                 # --dry-run & co: memory only
+        import contextlib, io
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            tally.add(object(), "capped", noon)                              # a bad item: printed, skipped
+        self.assertIn("Couldn't count a held-back alert", err.getvalue())
+        for junk in ("{oops", "[1, 2]", '{"2026-10-03": 5}'):
+            path.write_text(junk)
+            self.assertEqual(HeldTally(Config(), path).days, {})             # unreadable: start again
+        many = HeldTally(Config(), path)
+        for day in range(20):                                                # 20 days, one alert each
+            many.add(replace(ev, event_id=f"d{day}"), "capped", noon + day * 86400)
+        many.save()
+        self.assertEqual(sorted(_arbbot.read_held(path)), sorted(many.days))
+        self.assertEqual(len(many.days), 15)                                 # the last 15 days are kept
+        self.assertEqual(min(many.days), "2026-10-08")
+
+    def test_once_a_day_by_the_local_day(self):
+        from arbbot import HeldTally
+        tally = HeldTally(Config(), None)
+        ev = ev_leg("g1", {"DK": 2.30})
+        at = lambda day, h, m=0: datetime(2026, 10, day, h, m, tzinfo=timezone.utc).timestamp()
+        tally.add(ev, "capped", at(3, 2))                                   # 10pm Fri Oct 2 in New York
+        self.assertEqual(tally.days, {"2026-10-02": {"+EV": {"capped": 1}}})
+        tally.add(ev, "capped", at(3, 3, 59))                               # 11:59pm: the same day, once
+        for m in (0, 16, 32, 48):                                           # from midnight: a new day
+            tally.add(ev, "capped", at(3, 4, m))
+        tally.add(ev, "capped", at(3, 3, 58))                               # a check from just before midnight
+        tally.add(ev, "capped", at(3, 23, 30))
+        self.assertEqual(tally.days, {"2026-10-02": {"+EV": {"capped": 1}}, "2026-10-03": {"+EV": {"capped": 1}}})
+
+    def test_the_scan_counts_what_the_caps_hold_back_by_the_bet_not_the_alerter(self):
+        cfg = self.cfg(Config(min_ev_pct=3, round_stakes=0, max_ev_per_hour=1, outliers_enabled=False,
+                              kalshi_check=False))
+        t = _arbbot.Trackers(cfg, self.args(dry_run=False))
+        evs = []
+        for gid in ("g1", "g2"):
+            ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+            ev.update(id=gid, sport_key="basketball_nba")
+            evs.append(ev)
+        for mins in (0, 16, 32, 48):                                          # pre-game checks 15+ min apart:
+            fresh = (NOW + timedelta(minutes=mins)).isoformat()             # the 2nd bet is capped on each
+            for ev in evs:
+                for bk in ev["bookmakers"]:
+                    bk["last_update"] = bk["markets"][0]["last_update"] = fresh
+            _arbbot.scan_main(t, evs, ["basketball_nba"], NOW + timedelta(minutes=mins))
+        self.assertEqual(len(t.evs.open), 1)
+        self.assertEqual(t.held.days, {"2026-10-03": {"+EV": {"capped": 1}}})   # but counts once
+        bet = next(op.arb for op in t.evs.open.values())
+        t.outs.note_held(bet, "old price", NOW.timestamp())                  # the live rules note bets on outs
+        self.assertEqual(t.held.days, {"2026-10-03": {"+EV": {"capped": 1, "old price": 1}}})
+        t.held.save()
+        self.assertEqual(_arbbot.read_held(Path(cfg.state_dir) / _arbbot.HELD_FILE), t.held.days)
+        self.assertEqual([a.on_held for a in (*t.singles(), t.parlays)], [t.held.add] * 7)   # every alerter
+        for flags in ({"dry_run": True}, {"once": True, "dry_run": False}, {"demo": True, "dry_run": False}):
+            self.assertIsNone(_arbbot.Trackers(cfg, self.args(**flags)).held.path, flags)   # they write nothing
+
+
+
+class HeldBackSaved(unittest.TestCase):
+    setUp, tearDown, run_bot = Markouts.setUp, Markouts.tearDown, Markouts.run_bot
+
+    def test_the_bot_saves_it_every_pass(self):
+        self.run_bot({"max_arb_per_hour": 1})                                # the prop arb is over the cap
+        today = datetime.now(_arbbot.ZoneInfo("America/New_York")).date().isoformat()
+        self.assertEqual(_arbbot.read_held(self.d / "state" / _arbbot.HELD_FILE),
+                         {today: {"Pre-game arbs": {"capped": 1}}})
+
+    def test_a_dry_run_saves_nothing(self):
+        self.run_bot({"max_arb_per_hour": 1}, dry_run=True)
+        self.assertFalse((self.d / "state" / _arbbot.HELD_FILE).exists())
+
+
+# --------------------------------------------------------------------------- after-tax arb view (TAX_RATE, off by default)
+
+class AfterTax(unittest.TestCase):
+    def arb(self, home, away, **cfg):
+        ev = event({"A": [("h2h", [("Home", home, None), ("Away", away, None)])],
+                    "B": [("h2h", [("Home", away, None), ("Away", home, None)])]})
+        return find_arbs([ev], replace(CFG, **cfg), NOW)
+
+    def test_off_by_default(self):
+        [a] = self.arb(2.10, 1.80)
+        self.assertEqual(a.tax, ())
+        self.assertNotIn("After tax", discord_payload(a)["embeds"][0]["description"])
+
+    def test_the_card_line(self):
+        # $50 + $50 at 2.10: back $105. The winning $50 won $55, the losing $50 is deducted at 90% ($45):
+        # $10 taxed at 33% = $3.30 off the $5 profit.
+        [a] = self.arb(2.10, 1.80, tax_rate=0.33)
+        self.assertAlmostEqual(a.tax[1], 1.70, 6)
+        self.assertIn("\n🧾 After tax (~33%): about +$1.70 per $100 (rough guide, not tax advice)",
+                      discord_payload(a)["embeds"][0]["description"])
+        [thin] = self.arb(2.04, 1.80, tax_rate=0.33)                       # 2%: less than the tax on it
+        self.assertIn("After tax (~33%): about −$0.31 per $100", discord_payload(thin)["embeds"][0]["description"])
+        # Uneven prices: the worse of the two ways it can land (the long shot winning is taxed more).
+        legs = event({"A": [("h2h", [("Home", 3.3, None), ("Away", 1.2, None)])],
+                      "B": [("h2h", [("Home", 1.25, None), ("Away", 1.5, None)])]})
+        [u] = find_arbs([legs], replace(CFG, tax_rate=0.33), NOW)
+        self.assertEqual([l.outcome for l in u.legs], ["Away", "Home"])      # the long shot isn't first
+        self.assertAlmostEqual(u.after_tax_pct(0.33), u.exact_pct - 0.33 * 10, 6)    # Home: $71.88 won - $61.88
+
+    def test_the_floor_only_with_a_tax_rate(self):
+        self.assertEqual(len(self.arb(2.10, 1.80, tax_rate=0.33, min_after_tax_pct=1)), 1)
+        self.assertEqual(self.arb(2.04, 1.80, tax_rate=0.33, min_after_tax_pct=1), [])
+        self.assertEqual(len(self.arb(2.04, 1.80, min_after_tax_pct=3)), 1)          # no TAX_RATE: no floor
+
+    def test_settings(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"TAX_RATE": "0.33", "MIN_AFTER_TAX_PCT": "0.5"}):
+            c = Config.from_env()
+        self.assertEqual((c.tax_rate, c.min_after_tax_pct), (0.33, 0.5))
+        with mock.patch.dict(os.environ, {"TAX_RATE": "33"}), self.assertRaises(ValueError) as e:
+            Config.from_env()
+        self.assertIn("TAX_RATE=33 should be a fraction like 0.33", str(e.exception))
+
+
+# --------------------------------------------------------------------------- no test writes the bot's own files
+
+def _data_files() -> dict:
+    """Every default data file (and the state folder's files, and .env) beside the code and in the folder
+    the tests run from, with (size, modified) for each one there."""
+    from dataclasses import fields
+    d = Config()
+    names = [getattr(d, f.name) for f in fields(Config) if f.name.endswith("_file")] + [d.state_dir, ".env"]
+    out = {}
+    for folder in {Path(_arbbot.HERE).resolve(), Path.cwd().resolve()}:
+        for name in names:
+            p = folder / name
+            for q in ([p] + sorted(p.rglob("*")) if p.is_dir() else [p]):
+                if q.exists():
+                    st = q.stat()
+                    out[str(q)] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+_FILES_BEFORE: dict = {}
+
+
+def setUpModule():
+    _FILES_BEFORE.update(_data_files())
+
+
+def tearDownModule():
+    """The guard: a test that wrote (or changed, or removed) one of the bot's own data files fails the run."""
+    after = _data_files()
+    changed = sorted(p for p in set(_FILES_BEFORE) | set(after) if _FILES_BEFORE.get(p) != after.get(p))
+    if changed:
+        raise AssertionError("tests wrote the bot's own data files (give the test a temporary folder): "
+                             + ", ".join(changed))
 
 
 if __name__ == "__main__":
