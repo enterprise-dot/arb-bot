@@ -4324,6 +4324,22 @@ def mix_event(home, away, sharp=(1.91, 1.91), ev_id="e1", start="2026-10-03T18:0
     return ev
 
 
+def asked(events, markets=None, since=None):
+    """What a fake /odds call answers for these arguments: only the bet types asked for, and with
+    `since` only games starting after it (LIVE_MARKETS: the live and the pre-game checks)."""
+    import copy
+    keep = set(markets.split(",")) if markets else None
+    out = []
+    for ev in events:
+        if since is not None and _parse(ev["commence_time"]) <= since:
+            continue
+        ev = copy.deepcopy(ev)
+        for bm in ev["bookmakers"] if keep is not None else []:
+            bm["markets"] = [m for m in bm["markets"] if m["key"] in keep]
+        out.append(ev)
+    return out
+
+
 def age_book(ev, title, secs, when=NOW):
     """That book's prices were last updated secs before `when`."""
     bm = next(b for b in ev["bookmakers"] if b["title"] == title)
@@ -4345,7 +4361,8 @@ class MixFiles(unittest.TestCase):
         self.files = dict(log_file=str(d / "arbs.csv"), ev_log_file=str(d / "ev.csv"),
                           outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"),
                           markout_file=str(d / "mk.csv"), ev_results_file=str(d / "res.csv"),
-                          parlay_log_file=str(d / "par.csv"), state_dir=str(d / "state"))
+                          parlay_log_file=str(d / "par.csv"), state_dir=str(d / "state"),
+                          score_check_file=str(d / "sc.csv"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -4809,12 +4826,12 @@ class LiveAlertsHoldUp(MixFiles):
             def events(self, sport, horizon_hours=26):
                 return [{"id": "live1", "commence_time": live_start}, {"id": "pre1", "commence_time": pre_start}]
 
-            def odds(self, sport, until):
+            def odds(self, sport, until, markets=None, since=None, kind="odds"):   # (locks: LIVE_MARKETS=h2h)
                 secs = (datetime.now(timezone.utc) - NOW).total_seconds()
                 live = outlier_event(1.85, 1.95, start=live_start)
                 live.update(id="live1", sport_key="basketball_nba")
                 pre = mix_event(2.25, 1.98, ev_id="pre1", start=pre_start)
-                return [stamped(live, secs), stamped(pre, secs)]
+                return asked([stamped(live, secs), stamped(pre, secs)], markets, since)
 
             def event_odds(self, sport, gid, markets):   # a prop arb in the same game
                 prop = priced_prop({"Pinnacle": (2.0, 2.0), "DK": (2.20, 1.80), "FD": (1.80, 2.05)}, start=pre_start)

@@ -34,6 +34,7 @@ import math
 import re
 import os
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -85,6 +86,10 @@ LOCKS = {
     # A live alert pings only when two checks in a row find it, and the price you're told to bet
     # was updated by its book in the last 60 seconds: so it's still there when you tap it.
     "live_confirm": 2, "live_max_age": 60,
+    # Live checks ask for moneylines only (1 credit instead of 3; upcoming games' moneylines still
+    # come with them every minute), and on a tight budget they slow down (up to 3x) before
+    # pre-game checks do. The credits that saves buy faster pre-game checks.
+    "live_markets": "h2h", "live_max_stretch": 3.0,
 }
 
 # An arb whose price that will move is on Kalshi, with every sportsbook bet at or worse than fair,
@@ -226,6 +231,11 @@ class Config:
         "americanfootball_nfl", "basketball_nba", "icehockey_nhl", "baseball_mlb"])
     regions: str = "us"
     markets: str = "h2h,spreads,totals"
+    # Bet types the live check asks for ("" = the mode's choice: locks h2h, otherwise MARKETS). Each
+    # costs a credit per check. With fewer than MARKETS, a sport with a live game gets two checks: the
+    # live one (these bet types for every game, live and upcoming, every POLL_SECONDS) and a pre-game
+    # one for the other bet types of upcoming games (on the pre-game clock).
+    live_markets: str = ""
     # Up to 10 books cost the same as one region. Pinnacle is read only, as the sharp
     # reference for +EV; you never bet there.
     bookmakers: str = "pinnacle,draftkings,fanduel,betmgm,williamhill_us,kalshi,espnbet,betrivers,fanatics,hardrockbet"
@@ -243,6 +253,17 @@ class Config:
     far_minutes: int = 180        # games 24-48h out: main lines this often
     far_max_age_seconds: int = 10800  # early lines can sit unchanged for hours without being stale
     extra_max_stretch: float = 4.0    # on a tight budget, slow early checks up to this much first
+    # On a tight budget, slow LIVE checks up to this much before anything else (0 = the mode's
+    # choice: locks 3, otherwise 1, i.e. live checks are protected).
+    live_max_stretch: float = 0
+    # Spare credits (a day that fits with room left) buy faster pre-game checks, never faster live
+    # ones, down to these floors (minutes; 0 = never faster than the normal rate).
+    pregame_min_minutes: int = 3
+    early_min_minutes: int = 15
+    prop_early_min_minutes: int = 60
+    prop_min_minutes: int = 15
+    far_min_minutes: int = 60
+    spare_use_pct: float = 85         # plan the faster pace to use at most this % of the day's allowance
     # How the month's credits are shared across days of the week (relative weights, local time).
     # Busy days (Sun NFL, Sat college, Mon/Thu night games) get more; quiet midweek days less.
     budget_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_BUDGET_WEIGHTS))
@@ -283,6 +304,10 @@ class Config:
     results_webhook_url: str = ""  # graded bets (what hit); defaults to the health channel
     results_minutes: int = 30     # look for finished games to grade this often (0 = daily only)
     prop_grading: str = "espn"    # grade player props from ESPN box scores ("off" = check them yourself)
+    # Main lines are graded from the Odds API's scores (2 credits per sport). "shadow" also asks
+    # ESPN's free scoreboard and logs whether it agreed (SCORE_CHECK_FILE), to see if it can be
+    # trusted later; "off" doesn't ask ESPN (except to spot rain-shortened MLB games, always).
+    free_scores: str = "shadow"
     low_credits: int = 5000       # warn on Discord below this many credits
     log_file: str = "arbs.csv"    # every arb with how long it lasted ("" = off)
     state_dir: str = "state"      # open alerts survive restarts (no duplicate posts) ("" = off)
@@ -324,6 +349,7 @@ class Config:
     ev_results_file: str = "ev_results.csv"
     closing_file: str = "closing_lines.csv"
     markout_file: str = "markouts.csv"   # every alert's price checked again a few minutes later ("" = off)
+    score_check_file: str = "score_checks.csv"   # FREE_SCORES=shadow: ESPN's finals vs the Odds API's
     # Player props (fetched per game, so they're budgeted separately and checked less often)
     props_enabled: bool = True
     prop_sports: list[str] = field(default_factory=lambda: [
@@ -396,6 +422,7 @@ class Config:
             sports=_csv(e("SPORTS", "")) or d.sports,
             regions=e("REGIONS", d.regions),
             markets=e("MARKETS", d.markets),
+            live_markets=(e("LIVE_MARKETS") or "").strip(),
             bookmakers=e("BOOKMAKERS", d.bookmakers),
             my_books=e("MY_BOOKS", ""),
             kalshi_fee_rate=num("KALSHI_FEE_RATE", d.kalshi_fee_rate, float),
@@ -410,6 +437,18 @@ class Config:
             far_minutes=num("FAR_MINUTES", d.far_minutes, int),
             far_max_age_seconds=num("FAR_MAX_AGE_SECONDS", d.far_max_age_seconds, int),
             extra_max_stretch=num("EXTRA_MAX_STRETCH", d.extra_max_stretch, float),
+            live_max_stretch=num("LIVE_MAX_STRETCH", d.live_max_stretch, float),
+            # (A floor left unset never asks for more than the normal rate: EARLY_MINUTES=10 is fine.)
+            pregame_min_minutes=num("PREGAME_MIN_MINUTES", min(d.pregame_min_minutes, num(
+                "PREGAME_MINUTES", d.pregame_minutes, int)), int),
+            early_min_minutes=num("EARLY_MIN_MINUTES", min(d.early_min_minutes, num(
+                "EARLY_MINUTES", d.early_minutes, int)), int),
+            prop_early_min_minutes=num("PROP_EARLY_MIN_MINUTES", min(d.prop_early_min_minutes, num(
+                "PROP_EARLY_MINUTES", d.prop_early_minutes, int)), int),
+            prop_min_minutes=num("PROP_NEAR_MIN_MINUTES", min(d.prop_min_minutes, num(
+                "PROP_MINUTES", d.prop_minutes, int)), int),
+            far_min_minutes=num("FAR_MIN_MINUTES", min(d.far_min_minutes, num("FAR_MINUTES", d.far_minutes, int)), int),
+            spare_use_pct=num("SPARE_USE_PCT", d.spare_use_pct, float),
             budget_weights={**d.budget_weights,
                             **{k.lower()[:3]: v for k, v in pairs("BUDGET_WEIGHTS", float).items()}},
             monthly_credits=num("MONTHLY_CREDITS", d.monthly_credits, int),
@@ -447,6 +486,7 @@ class Config:
             results_webhook_url=e("DISCORD_RESULTS_WEBHOOK_URL", ""),
             results_minutes=num("RESULTS_MINUTES", d.results_minutes, int),
             prop_grading=(e("PROP_GRADING") or d.prop_grading).strip().lower(),
+            free_scores=(e("FREE_SCORES") or d.free_scores).strip().lower(),
             low_credits=num("LOW_CREDITS", d.low_credits, int),
             log_file=e("LOG_FILE", d.log_file),
             state_dir=e("STATE_DIR", d.state_dir),
@@ -486,6 +526,7 @@ class Config:
             ev_results_file=e("EV_RESULTS_FILE", d.ev_results_file),
             closing_file=e("CLOSING_FILE", d.closing_file),
             markout_file=e("MARKOUT_FILE", d.markout_file),
+            score_check_file=e("SCORE_CHECK_FILE", d.score_check_file),
             props_enabled=e("PROPS_ENABLED", "true").lower() in ("1", "true", "yes"),
             prop_sports=_csv(e("PROP_SPORTS", "")) or d.prop_sports,
             prop_markets={**d.prop_markets, **{k.strip(): v.strip().replace("|", ",") for k, v in
@@ -542,6 +583,26 @@ class Config:
             stakes = []
         if len(stakes) != 3 or not all(math.isfinite(x) and x >= 0 for x in stakes):
             raise ValueError(f"CONFIDENCE_STAKES={self.confidence_stakes} should be 3 numbers, like 1,0.75,0.5")
+        if self.live_markets:
+            extra = set(_csv(self.live_markets)) - set(_csv(self.markets))
+            if extra or not _csv(self.live_markets):
+                raise ValueError(f"LIVE_MARKETS={self.live_markets} should only list bet types that are in MARKETS "
+                                 f"({self.markets})")
+        if self.live_max_stretch and self.live_max_stretch < 1:
+            raise ValueError(f"LIVE_MAX_STRETCH={self.live_max_stretch:g} should be 0 (the mode's choice) or at least 1")
+        for key, floor, base_key, base in (
+                ("PREGAME_MIN_MINUTES", self.pregame_min_minutes, "PREGAME_MINUTES", self.pregame_minutes),
+                ("EARLY_MIN_MINUTES", self.early_min_minutes, "EARLY_MINUTES", self.early_minutes),
+                ("PROP_EARLY_MIN_MINUTES", self.prop_early_min_minutes, "PROP_EARLY_MINUTES", self.prop_early_minutes),
+                ("PROP_NEAR_MIN_MINUTES", self.prop_min_minutes, "PROP_MINUTES", self.prop_minutes),
+                ("FAR_MIN_MINUTES", self.far_min_minutes, "FAR_MINUTES", self.far_minutes)):
+            # A negative or tiny floor would check those games on every pass and burn the plan.
+            if floor and not 1 <= floor <= base:
+                raise ValueError(f"{key}={floor} should be 0 (off) or between 1 and {base_key} ({base})")
+        if not 0 <= self.spare_use_pct <= 95:
+            raise ValueError(f"SPARE_USE_PCT={self.spare_use_pct:g} should be between 0 (off) and 95")
+        if self.free_scores not in ("shadow", "off"):
+            raise ValueError(f"FREE_SCORES={self.free_scores} should be shadow or off")
 
     def with_mode(self) -> "Config":
         """Apply ALERT_MODE. "locks" raises every bar to at least the levels below (your own
@@ -571,6 +632,10 @@ class Config:
             live_per_hour=cap(self.live_per_hour, L["live_per_hour"]),
             live_confirm_checks=max(self.live_confirm_checks, L["live_confirm"]),
             live_max_age_alert=cap(self.live_max_age_alert, L["live_max_age"]),
+            # (Your own LIVE_MARKETS / LIVE_MAX_STRETCH win; no moneylines in MARKETS: no split.)
+            live_markets=self.live_markets or (L["live_markets"] if set(_csv(L["live_markets"])) <= set(
+                _csv(self.markets)) else ""),
+            live_max_stretch=self.live_max_stretch or L["live_max_stretch"],
         )
 
     def bad_webhooks(self) -> list[str]:
@@ -613,16 +678,23 @@ class Config:
             return (ev & mine) or {"(none of EV_BOOKS is in MY_BOOKS)"}
         return ev or mine
 
-    def credits_per_call(self) -> int:
+    def credits_per_call(self, markets: str | None = None) -> int:
         """The Odds API charges markets x regions; every 10 bookmakers count as one region."""
-        n_markets = len(_csv(self.markets))
-        if self.bookmakers:
-            return n_markets * math.ceil(len(_csv(self.bookmakers)) / 10)
-        return n_markets * len(_csv(self.regions))
+        return len(_csv(self.markets if markets is None else markets)) * self.regions_billed()
+
+    def regions_billed(self) -> int:
+        return math.ceil(len(_csv(self.bookmakers)) / 10) if self.bookmakers else len(_csv(self.regions))
+
+    def split_markets(self) -> tuple[str, str] | None:
+        """(live check's bet types, the pre-game check's) when LIVE_MARKETS is narrower than
+        MARKETS, else None (one check per sport asks for everything, live and upcoming)."""
+        live, every = _csv(self.live_markets), _csv(self.markets)
+        if not live or not set(live) < set(every):   # (compared as sets: the order doesn't matter)
+            return None
+        return ",".join(live), ",".join(m for m in every if m not in live)
 
     def prop_credits_per_call(self, sport: str) -> int:
-        regions = math.ceil(len(_csv(self.bookmakers)) / 10) if self.bookmakers else len(_csv(self.regions))
-        return len(_csv(self.prop_markets.get(sport, ""))) * regions
+        return len(_csv(self.prop_markets.get(sport, ""))) * self.regions_billed()
 
     def for_props(self) -> "Config":
         """The same settings with the prop thresholds swapped in (prop markets carry more margin)."""
@@ -771,15 +843,89 @@ def _parse_time(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+PROP_COST_HOURS = (6, 12, 24)   # prop calls' costs are averaged apart by hours to start: up to 6h, 12h, 24h
+
+
+def prop_cost_kind(sport: str, hours: float, near_hours: float) -> str:
+    """The CostBook kind of a prop call for a game this many hours away: "near" (PROP_HOURS),
+    then one bucket per PROP_COST_HOURS (books post more props as kickoff gets closer)."""
+    if hours <= near_hours:
+        return f"props:{sport}:near"
+    edge = next((h for h in PROP_COST_HOURS if hours <= h), None)
+    return f"props:{sport}:{edge}h" if edge else f"props:{sport}:later"
+
+
+class CostBook:
+    """What each kind of Odds API call really costs (the x-requests-last header), as a running
+    average, so the budget forecasts real spending instead of markets x regions. Player props only
+    bill the markets a book actually returned (an empty answer is free), so props far from kickoff
+    usually cost less than the formula says. Thread-safe: odds and props are fetched in parallel."""
+    PRIOR = 3      # the formula counts as this many calls until real ones outweigh it
+    ALPHA = 0.1    # after the first 10 calls, recent calls weigh more
+
+    def __init__(self, path: Path | None = None):
+        self.path = path
+        self.stats: dict[str, list[float]] = {}   # "kind@formula" -> [calls, average, credits]
+        self.today: dict[str, float] = {}         # kind -> credits since the last daily summary
+        self.lock = threading.Lock()
+        self.dirty = False
+        if path and path.exists():
+            try:
+                saved = json.loads(path.read_text())
+                self.stats = {str(k): [float(x) for x in v][:3] for k, v in saved.items() if len(v) >= 3}
+            except (OSError, ValueError, TypeError, AttributeError):
+                self.stats = {}   # unreadable: start again from the formula
+
+    def add(self, kind: str, cost: float | None, formula: float) -> None:
+        """One call's cost. A missing or nonsense header (negative, or over 10x the formula) is
+        ignored, so the formula stands. Averages are kept per formula: changing MARKETS or
+        PROP_MARKETS starts that kind's average again."""
+        if cost is None or not math.isfinite(cost) or cost < 0 or (formula and cost > 10 * formula):
+            return
+        with self.lock:
+            n, avg, total = self.stats.get(f"{kind}@{formula:g}", [0, 0.0, 0.0])
+            n += 1
+            avg += (cost - avg) * max(self.ALPHA, 1 / n)
+            self.stats[f"{kind}@{formula:g}"] = [n, avg, total + cost]
+            self.today[kind] = self.today.get(kind, 0.0) + cost
+            self.dirty = True
+
+    def estimate(self, kind: str, formula: float) -> float:
+        """Credits a call of this kind will cost: the formula at first, the measured average once
+        there are calls (the formula weighs as PRIOR calls, so a few can't swing it)."""
+        n, avg, _ = self.stats.get(f"{kind}@{formula:g}", [0, 0.0, 0.0])
+        return (n * avg + self.PRIOR * formula) / (n + self.PRIOR)
+
+    def calls(self, kind: str, formula: float) -> int:
+        return int(self.stats.get(f"{kind}@{formula:g}", [0])[0])
+
+    def take_today(self) -> dict[str, float]:
+        """Credits by kind since the last call (for the daily summary), then start again."""
+        with self.lock:
+            out, self.today = self.today, {}
+        return out
+
+    def save(self) -> None:
+        if not (self.path and self.dirty):
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            with self.lock:
+                tmp.write_text(json.dumps(self.stats))
+                self.dirty = False
+            tmp.replace(self.path)
+        except OSError as e:
+            print(f"  ! Couldn't save call costs: {e}", file=sys.stderr)
+
+
 class OddsAPI:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.remaining: float | None = None
         self.used: float | None = None
         self._warned_events_cost = False
-
-    def _get(self, path: str, params: dict) -> list | dict:
-        return self._request(path, params)[0]
+        self.costs = CostBook(data_path(cfg.state_dir) / "call_costs.json" if cfg.state_dir else None)
 
     def _request(self, path: str, params: dict) -> tuple[list | dict, float | None]:
         """(the JSON, what this one call cost in credits if the API said)."""
@@ -816,7 +962,8 @@ class OddsAPI:
         return data
 
     def event_odds(self, sport: str, event_id: str, markets: str) -> dict:
-        """One game's odds for the given markets (used for player props). Costs markets x regions."""
+        """One game's odds for the given markets (used for player props). Costs the markets
+        returned x regions (nothing when no book has any yet)."""
         params = {"markets": markets, "oddsFormat": "decimal", "dateFormat": "iso"}
         if self.cfg.bookmakers:
             params["bookmakers"] = self.cfg.bookmakers
@@ -824,27 +971,43 @@ class OddsAPI:
             params["regions"] = self.cfg.regions
         if self.cfg.include_links:
             params["includeLinks"] = "true"
-        return self._get(f"/sports/{sport}/events/{event_id}/odds", params)
+        data, cost = self._request(f"/sports/{sport}/events/{event_id}/odds", params)
+        try:   # (an empty answer still says when the game starts)
+            hours = (_parse_time(data["commence_time"]) - datetime.now(timezone.utc)).total_seconds() / 3600
+        except (KeyError, TypeError, ValueError, AttributeError):
+            hours = 0.0
+        self.costs.add(prop_cost_kind(sport, hours, self.cfg.prop_hours), cost,
+                       len(_csv(markets)) * self.cfg.regions_billed())
+        return data
 
     def scores(self, sport: str, days_from: int = 3) -> list[dict]:
         """Final scores for recent games. Costs 2 credits."""
-        return self._get(f"/sports/{sport}/scores", {"daysFrom": days_from, "dateFormat": "iso"})
+        data, cost = self._request(f"/sports/{sport}/scores", {"daysFrom": days_from, "dateFormat": "iso"})
+        self.costs.add("scores", cost, 2 if days_from else 1)
+        return data
 
-    def odds(self, sport: str, until: datetime) -> list[dict]:
-        """Odds for every game starting before `until` (and all live ones). Costs credits."""
+    def odds(self, sport: str, until: datetime, markets: str | None = None, since: datetime | None = None,
+             kind: str = "odds") -> list[dict]:
+        """Odds for every game starting before `until` (and all live ones; with `since`, only games
+        starting after it). Costs markets x regions, however many games come back."""
+        markets = markets or self.cfg.markets
         params = {
-            "markets": self.cfg.markets,
+            "markets": markets,
             "oddsFormat": "decimal",
             "dateFormat": "iso",
             "commenceTimeTo": _iso(until),  # trims the payload; same credit cost
         }
+        if since is not None:
+            params["commenceTimeFrom"] = _iso(since)
         if self.cfg.bookmakers:
             params["bookmakers"] = self.cfg.bookmakers
         else:
             params["regions"] = self.cfg.regions
         if self.cfg.include_links:
             params["includeLinks"] = "true"
-        return self._get(f"/sports/{sport}/odds", params)
+        data, cost = self._request(f"/sports/{sport}/odds", params)
+        self.costs.add(kind, cost, self.cfg.credits_per_call(markets))
+        return data
 
 
 # --------------------------------------------------------------------------- detection
@@ -1363,6 +1526,42 @@ class HourlyCap:
         return self.limit - len(self.times) if self.limit else math.inf
 
 
+class Scope:
+    """What one pass's main-line checks looked at, when LIVE_MARKETS splits a sport's checks in two
+    (each on its own clock). An alert counts as looked for, so it closes if it wasn't found, only
+    when a check this pass asked for its bet type and its game."""
+
+    def __init__(self):
+        self.sports: set[str] = set()   # one check asked for every bet type of every game in these
+        # (sport, bet types, games starting after `since` (None = any), and up to `until`)
+        self.looks: list[tuple[str, frozenset, datetime | None, datetime]] = []
+
+    def add(self, sport: str, markets, since: datetime | None, until: datetime) -> None:
+        self.looks.append((sport, frozenset(_csv(markets) if isinstance(markets, str) else markets), since, until))
+
+    def covers(self, sport_key: str, event_id: str = "", market: str = "", commence_time: str = "") -> bool:
+        if sport_key in self.sports:
+            return True
+        try:
+            start = _parse_time(commence_time) if commence_time else None
+        except (TypeError, ValueError):
+            start = None
+        for sport, markets, since, until in self.looks:
+            if sport != sport_key or (market and market not in markets):
+                continue   # (an alert saved before the bet type was remembered: any check of its game)
+            if start is None or ((since is None or start > since) and start <= until):
+                return True
+        return False
+
+
+def looked_at(checked, sport_key: str, event_id: str, market: str = "", commence_time: str = "") -> bool:
+    """Did this check look at that line? checked: sport keys and event ids (every bet type of those
+    sports or games was checked), or a Scope (LIVE_MARKETS: some bet types of some games)."""
+    if isinstance(checked, Scope):
+        return checked.covers(sport_key, event_id, market, commence_time)
+    return sport_key in checked or event_id in checked
+
+
 class Alerter:
     """Tracks arbs from first sighting until they close.
 
@@ -1426,6 +1625,7 @@ class Alerter:
                     "spotted": op.spotted,
                     "label": self.label(op.arb), "sport_key": op.arb.sport_key,
                     "event_id": op.arb.event_id, "commence_time": getattr(op.arb, "commence_time", ""),
+                    "market": getattr(op.arb, "market", ""),
                     **self.extra_state(op.arb)}
                 for k, op in self.open.items() if op.message_id}
         data.update(self.restored)
@@ -1626,9 +1826,10 @@ class Alerter:
             return message_id
 
     def handle(self, arbs: list[Arb], checked_sports: list[str] | None = None,
-               now: float | None = None, checked_events: set[str] | None = None) -> int:
+               now: float | None = None, checked_events: "set[str] | Scope | None" = None) -> int:
         """Process one scan's arbs. checked_sports = sports whose odds were just fetched;
-        open arbs in those sports that weren't found again are closed."""
+        open arbs in those sports that weren't found again are closed. checked_events narrows that
+        to the games (event ids) or, as a Scope, the bet types and games that were checked."""
         now = now or time.time()
         new = 0
         seen = set()
@@ -1718,8 +1919,9 @@ class Alerter:
             op = self.open[key]
             if key in seen or (checked is not None and op.arb.sport_key not in checked):
                 continue
-            if checked_events is not None and op.arb.event_id not in checked_events:
-                continue  # that game wasn't re-checked this round
+            if checked_events is not None and not looked_at(checked_events, op.arb.sport_key, op.arb.event_id,
+                                                            op.arb.market, op.arb.commence_time):
+                continue  # that game (or bet type) wasn't re-checked this round
             self._close(key, now)
         # Alerts saved before a restart that this check looked for and didn't find.
         if self.scoped and (checked is not None or checked_events is not None):
@@ -1728,7 +1930,9 @@ class Alerter:
                     continue   # saved by an older version: the grace period decides
                 if checked is not None and saved["sport_key"] not in checked:
                     continue
-                if checked_events is not None and saved.get("event_id") not in checked_events:
+                if checked_events is not None and not looked_at(checked_events, saved["sport_key"],
+                                                                saved.get("event_id", ""), saved.get("market", ""),
+                                                                saved.get("commence_time", "")):
                     continue
                 self._drop_restored(key, "Ignore this one. The prices moved while the bot was restarting.")
         self.handed.clear()
@@ -3058,6 +3262,81 @@ def check_kalshi(cfg: Config, api: "OddsAPI", now: datetime | None = None) -> No
                   + "; ".join(f"{t} ({' / '.join(v)})" for t, v in list(lost.items())[:6]))
         print()
 
+def check_upcoming(cfg: Config, api: "OddsAPI", now: datetime | None = None) -> dict:
+    """One-time probe of the combined "upcoming" odds call (every sport's live games, plus the next
+    few games, in one request): what it really costs (x-requests-last) and whether it has every live
+    game and book that each sport's own live call has. Costs one call (LIVE_MARKETS x regions) plus
+    one per sport with a live game, for the comparison. Changes nothing: it only reports."""
+    now = now or datetime.now(timezone.utc)
+    sched = Scheduler(cfg, api)
+    sched.refresh_events(force=True)
+    live = {sport: set(sched.live_games(sport, now)) for sport in cfg.sports if sched.wants_live(sport)}
+    live = {k: v for k, v in live.items() if v}
+    markets = (sched.split or (cfg.markets,))[0]
+    formula = cfg.credits_per_call(markets)
+    params = {"markets": markets, "oddsFormat": "decimal", "dateFormat": "iso",
+              "commenceTimeTo": _iso(now + timedelta(minutes=1))}
+    if cfg.bookmakers:
+        params["bookmakers"] = cfg.bookmakers
+    else:
+        params["regions"] = cfg.regions
+    report = {"cost": None, "formula": formula, "events": 0, "not_live": 0, "missing": {}, "fewer_books": {},
+              "schedule_only": {}, "per_sport_cost": 0.0}
+    if not live:
+        print("No game in your sports is live right now (by the free schedule), so there's nothing to compare. "
+              "Run this again while two or more sports have games on. No credits used.")
+        return report
+    combined, cost = api._request("/sports/upcoming/odds", params)
+    combined = combined if isinstance(combined, list) else []
+    got = {ev.get("id"): ev for ev in combined}
+    later = [ev for ev in combined if _parse_time(ev["commence_time"]) > now + timedelta(minutes=1)]
+    report.update(cost=cost, events=len(combined), not_live=len(later))
+    print(f"Combined call: {len(combined)} games across {len({ev.get('sport_key') for ev in combined})} sports, "
+          f"cost {cost if cost is not None else '?'} credits (x-requests-last; markets x regions = {formula}).")
+    if later:
+        print(f"  {len(later)} games that haven't started came back too (the combined call adds the next few "
+              f"games); a real switch would drop them.")
+    for sport, ids in sorted(live.items()):
+        try:
+            own, own_cost = api._request(f"/sports/{sport}/odds", params)
+        except Exception as e:  # noqa: BLE001
+            print(f"  {short(sport)}: couldn't load its own live call to compare ({e!r:.100})")
+            continue
+        own = own if isinstance(own, list) else []
+        report["per_sport_cost"] += own_cost or 0
+        listed = {ev["id"] for ev in own if ev.get("bookmakers")}
+        # Missing = a game the sport's own call has odds for and the combined call doesn't. A game only
+        # the schedule still calls live (it ended early, or a rain delay) isn't the combined call's fault.
+        missing = sorted(listed - set(got))
+        fewer = []
+        for ev in own:
+            mine = {bm["key"] for bm in ev.get("bookmakers", [])}
+            theirs = {bm["key"] for bm in got.get(ev["id"], {}).get("bookmakers", [])}
+            if ev["id"] in got and mine - theirs:
+                fewer.append(f"{ev['away_team']} @ {ev['home_team']}: no {', '.join(sorted(mine - theirs))}")
+        report["missing"][sport], report["fewer_books"][sport] = missing, fewer
+        report["schedule_only"][sport] = sorted(ids - listed - set(got))
+        ok = "✅" if not missing and not fewer else "⚠️"
+        print(f"  {ok} {short(sport)}: {len(listed) - len(missing)} of {len(listed)} games with live odds are in the "
+              f"combined call (its own call cost {own_cost if own_cost is not None else '?'})")
+        for gid in missing:
+            print(f"     missing: {gid}")
+        for line in fewer[:5]:
+            print(f"     fewer books: {line}")
+        if report["schedule_only"][sport]:
+            print(f"     (for information: {len(report['schedule_only'][sport])} game(s) the schedule still calls live "
+                  f"have no odds in either call; they probably just ended)")
+    good = not any(report["missing"].values()) and not any(report["fewer_books"].values())
+    if not good:
+        print("→ Don't switch: the combined call misses games or books that the sports' own calls have.")
+    elif cost is not None and report["per_sport_cost"] > cost:
+        print(f"→ Looks good: the combined call had every live game for {cost:g} credits instead of "
+              f"{report['per_sport_cost']:g}. Run this 2-3 times on busy nights before trusting it.")
+    else:
+        print("→ No saving this time (only one sport live, or the costs didn't say). Try again with more sports on.")
+    return report
+
+
 # --------------------------------------------------------------------------- outliers
 
 def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
@@ -3236,7 +3515,7 @@ def note_related(groups: list[tuple[list[EVBet], "Alerter", set[str]]], now: flo
     together, so they aren't independent bets).
 
     groups: (bets about to be handled, their alerter, what this scan re-checked: sport keys or
-    event ids). Only alerts that will exist after this scan count: a bet the hourly cap will
+    event ids, or a Scope). Only alerts that will exist after this scan count: a bet the hourly cap will
     skip was never sent, and an open alert that was re-checked but not found is about to close.
     """
     now = now or time.time()
@@ -3259,11 +3538,13 @@ def note_related(groups: list[tuple[list[EVBet], "Alerter", set[str]]], now: flo
                 if live:
                     live_left[id(cap)] -= 1
         for k, op in a.open.items():
-            if k not in pool and op.arb.sport_key not in checked and op.arb.event_id not in checked:
+            if k not in pool and not looked_at(checked, op.arb.sport_key, op.arb.event_id, op.arb.market,
+                                               op.arb.commence_time):
                 pool[k] = op.arb  # not looked at this scan, so it stays open
         for k, saved in a.restored.items():   # saved before a restart and not looked at yet
-            if (k not in pool and saved.get("pick") and saved.get("sport_key") not in checked
-                    and saved.get("event_id") not in checked):
+            if (k not in pool and saved.get("pick")
+                    and not looked_at(checked, saved.get("sport_key"), saved.get("event_id"),
+                                      saved.get("market", ""), saved.get("commence_time", ""))):
                 pool[k] = SimpleNamespace(key=k, event_id=saved.get("event_id"), pick=saved["pick"])
     by_game: dict[str, list[EVBet]] = {}
     for b in pool.values():
@@ -3676,10 +3957,11 @@ def gradable(r: dict) -> bool:
 
 
 def settle_parlay(r: dict, finals: dict[str, dict[str, float]],
-                  known: dict[str, str] | None = None) -> tuple[str, float] | None:
+                  known: dict[str, str] | None = None, hold: set[str] = frozenset()) -> tuple[str, float] | None:
     """Grade a parlay from the legs' results (known = results of the legs' own alerts, by bet
     id) or final scores. One losing leg loses it (even before the other games end, and even if
-    another leg is a prop); a pushed leg drops out, like at the books. None = not decided yet."""
+    another leg is a prop); a pushed leg drops out, like at the books. None = not decided yet.
+    hold = games whose run lines and totals can't be graded from the score (rain-shortened MLB)."""
     known = known or {}
     results = []
     for leg in r["_legs"]:
@@ -3687,7 +3969,8 @@ def settle_parlay(r: dict, finals: dict[str, dict[str, float]],
             results.append(known[_bet_id(leg)])
             continue
         pts = finals.get(leg["event_id"])
-        if leg.get("player") or not pts or leg["home_team"] not in pts or leg["away_team"] not in pts:
+        if (leg.get("player") or not pts or leg["home_team"] not in pts or leg["away_team"] not in pts
+                or (leg["event_id"] in hold and leg.get("market") in ("spreads", "totals"))):
             results.append(None)
             continue
         results.append(settle({**leg, "stake": 1, "price": leg["price"]},
@@ -3725,6 +4008,8 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
         return t <= now and (recent_hours is None or now - t <= timedelta(hours=recent_hours))
 
     sports = set()
+    need: dict[str, dict] = {}         # event id -> a leg that needs that game's final score
+    kinds: dict[str, set[str]] = {}    # event id -> the bet types waiting on it
     for r in pending.values():
         legs = _legs(r)
         if r["kind"] == "parlay" and "loss" in (known.get(_bet_id(l)) for l in legs):
@@ -3735,6 +4020,8 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
                 continue
             if recent(end(leg)) or (end(leg) <= now and recent(last)):
                 sports.add(leg["sport_key"])
+                need.setdefault(leg["event_id"], leg)
+                kinds.setdefault(leg["event_id"], set()).add(leg.get("market", ""))
     finals: dict[str, dict[str, float]] = {}
     for sport in sorted(sports):
         try:
@@ -3743,6 +4030,9 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
                     finals[g["id"]] = {x["name"]: float(x["score"]) for x in g["scores"]}
         except Exception as e:  # noqa: BLE001
             print(f"! Couldn't load {sport} scores: {e}", file=sys.stderr)
+    # Free: rain-shortened MLB games keep their run lines and totals out of grading (every mode),
+    # and FREE_SCORES=shadow logs whether ESPN's finals agree with these.
+    hold = espn_checks(cfg, need, kinds, finals, now)
     graded = []
     for r in pending.values():
         extra = {}
@@ -3755,10 +4045,11 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
                 continue
             extra = {"actual": said}
         elif r["kind"] == "parlay":
-            res = settle_parlay(r, finals, known)
+            res = settle_parlay(r, finals, known, hold)
             if res is None:
                 continue
-            if any(_bet_id(l) not in known and (l.get("player") or l["event_id"] not in finals)
+            if any(_bet_id(l) not in known and (l.get("player") or l["event_id"] not in finals
+                                                 or (l["event_id"] in hold and l.get("market") in ("spreads", "totals")))
                    for l in r["_legs"]):
                 extra["manual_legs"] = 1   # lost on one leg while another can't be graded: it stays
                                            # out of the record (its wins couldn't be counted either)
@@ -3766,6 +4057,8 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
             pts = finals.get(r["event_id"])
             if not pts or r["home_team"] not in pts or r["away_team"] not in pts:
                 continue
+            if r["event_id"] in hold and r["market"] in ("spreads", "totals"):
+                continue   # a rain-shortened MLB game: books void these; it's left for you to check
             res = settle(r, pts[r["home_team"]], pts[r["away_team"]])
             if res[0] == "unknown":
                 continue
@@ -3973,12 +4266,38 @@ def _team_match(odds_name: str, team: dict) -> int:
 
 def espn_event_id(sport_key: str, home: str, away: str, commence: str) -> str | None:
     """The ESPN game for an Odds API game: both teams match, within 12 hours of the start."""
+    ev = _espn_game(sport_key, home, away, commence)
+    return ev["id"] if ev else None
+
+
+ESPN_FAIL_SECONDS = 300   # a scoreboard page that just failed isn't asked again for this long (grading)
+ESPN_PASS_SECONDS = 15    # a grading pass stops asking ESPN about more games after this long
+_ESPN_FAILED: dict[str, float] = {}
+
+
+def _espn_quick(path: str, ttl: float = 300) -> dict:
+    """_espn, but a page that just failed isn't asked again for ESPN_FAIL_SECONDS: an ESPN outage
+    mustn't cost every grading pass a 20-second timeout per game while the checks wait."""
+    if time.time() - _ESPN_FAILED.get(path, 0.0) < ESPN_FAIL_SECONDS:
+        raise OSError("ESPN didn't answer a few minutes ago; not asking again yet")
+    try:
+        return _espn(path, ttl)
+    except Exception:
+        _ESPN_FAILED[path] = time.time()
+        raise
+
+
+def _espn_game(sport_key: str, home: str, away: str, commence: str, fetch=None) -> dict | None:
+    """The one ESPN scoreboard event for an Odds API game (both teams match, within 12 hours of
+    the start), or None: none, or two that fit equally (nickname-only matches, doubleheaders)."""
+    fetch = fetch or _espn
     league, extra = ESPN_LEAGUES[sport_key]
     start = _parse_time(commence)
     days = sorted({start.astimezone(ZoneInfo("America/New_York")).date(), start.date()})
     found: list[tuple[int, str]] = []
+    by_id: dict[str, dict] = {}
     for d in days:
-        sb = _espn(f"{league}/scoreboard?dates={d:%Y%m%d}" + (f"&{extra}" if extra else ""))
+        sb = fetch(f"{league}/scoreboard?dates={d:%Y%m%d}" + (f"&{extra}" if extra else ""))
         for ev in sb.get("events", []):
             try:
                 comp = ev["competitions"][0]
@@ -3993,8 +4312,143 @@ def espn_event_id(sport_key: str, home: str, away: str, commence: str) -> str | 
                         min(_team_match(home, b), _team_match(away, a)))   # neutral sites
             if score:
                 found.append((score, ev["id"]))
+                by_id[ev["id"]] = ev
     best = [eid for sc, eid in set(found) if sc == max((x for x, _ in found), default=0)]
-    return best[0] if len(best) == 1 else None   # nickname-only matches must be unambiguous
+    return by_id[best[0]] if len(best) == 1 else None   # nickname-only matches must be unambiguous
+
+
+ESPN_FINAL = {"STATUS_FINAL", "STATUS_FINAL_OT", "STATUS_FULL_TIME"}   # any other status isn't a final here
+ESPN_OFF = {"STATUS_POSTPONED", "STATUS_CANCELED", "STATUS_CANCELLED", "STATUS_SUSPENDED", "STATUS_FORFEIT",
+            "STATUS_ABANDONED", "STATUS_DELAYED"}
+NO_TIES = {"icehockey", "basketball", "baseball"}   # a tied final here means the feed is wrong
+
+
+def espn_final(sport_key: str, home: str, away: str, commence: str) -> tuple[dict[str, float] | None, str]:
+    """({home: score, away: score}, "") once ESPN's free scoreboard calls the game final and it
+    checks out, else (None, why). A wrong grade is worse than none, so anything unexpected is None:
+
+    - final: completed, state "post" and a final status (an unknown status isn't one; the reason
+      names it, so it can be added);
+    - both teams match one way round only (neutral sites are fine, a swap is not);
+    - each team's periods add up to its score (not hockey: a shootout adds a goal);
+    - no tied final in hockey, basketball or baseball; hockey needs ESPN's winner flag, and the
+      flag must agree with the score wherever it's given;
+    - baseball: the away team batted fewer than 9 innings = "shortened game" (rain): books void run
+      lines and totals then, so those are checked by hand."""
+    ev = _espn_game(sport_key, home, away, commence, fetch=_espn_quick)
+    if ev is None:
+        return None, "not found"
+    comp = (ev.get("competitions") or [{}])[0]
+    st = (comp.get("status") or ev.get("status") or {}).get("type") or {}
+    name = str(st.get("name") or "?")
+    if name in ESPN_OFF:
+        return None, f"postponed: {name}"
+    if not (st.get("completed") is True and st.get("state") == "post" and name in ESPN_FINAL):
+        return None, f"not final: {name}"
+    sides = comp.get("competitors") or []
+    if len(sides) != 2:
+        return None, "not two teams"
+    a, b = sides
+    straight = min(_team_match(home, a.get("team", {})), _team_match(away, b.get("team", {})))
+    swapped = min(_team_match(home, b.get("team", {})), _team_match(away, a.get("team", {})))
+    if straight == swapped:
+        return None, "can't tell which team is which"
+    h, w = (a, b) if straight > swapped else (b, a)
+    fam = _family(sport_key)
+    out: dict[str, float] = {}
+    innings = 0
+    for team, c in ((home, h), (away, w)):
+        pts = _num(str(c.get("score", "")))
+        if pts is None or pts < 0:
+            return None, "no score"
+        periods = [_num(str(x.get("value", ""))) for x in c.get("linescores") or []]
+        if periods and None not in periods and sum(periods) != pts and fam != "icehockey":
+            return None, f"{team}: periods add up to {sum(periods):g}, not {pts:g}"
+        if team == away:
+            innings = len(periods)
+        out[team] = pts
+    if out[home] == out[away] and fam in NO_TIES:
+        return None, "tied score"
+    if fam == "icehockey" and "winner" not in (h if out[home] > out[away] else w):
+        return None, "no winner flag"
+    for c, won in ((h, out[home] > out[away]), (w, out[away] > out[home])):
+        if "winner" in c and out[home] != out[away] and bool(c["winner"]) != won:
+            return None, "ESPN's winner flag disagrees with the score"
+    if fam == "baseball" and 0 < innings < 9:
+        return None, "shortened game"
+    return out, ""
+
+
+SCORE_CHECK_FIELDS = ["checked_at", "event_id", "sport_key", "matchup", "odds_api", "espn", "verdict"]
+
+
+def espn_checks(cfg: Config, need: dict[str, dict], kinds: dict[str, set[str]],
+                finals: dict[str, dict[str, float]], now: datetime) -> set[str]:
+    """Ask ESPN's free scoreboard about games the Odds API has a final for. Returns the games whose
+    run lines and totals must not be graded now: MLB games that ended before the 9th (books void
+    those bets; the moneyline still stands), and any ESPN couldn't be asked about in time (next pass).
+
+    FREE_SCORES=shadow also logs, once per game, whether ESPN's final agrees with the Odds API's
+    (SCORE_CHECK_FILE; a disagreement is printed too). Grading still uses the Odds API's scores."""
+    logged = None
+    if cfg.free_scores == "shadow" and cfg.score_check_file:
+        try:
+            logged = {r.get("event_id") for r in _read_csv(cfg.score_check_file)}
+        except (OSError, csv.Error, UnicodeDecodeError) as e:
+            print(f"  ! Couldn't read {cfg.score_check_file}: {e!r:.100}", file=sys.stderr)
+    ask = []
+    for gid, leg in need.items():
+        if gid not in finals or leg.get("sport_key") not in ESPN_LEAGUES:
+            continue
+        rain = _family(leg["sport_key"]) == "baseball" and bool(kinds.get(gid, set()) & {"spreads", "totals"})
+        shadow = logged is not None and gid not in logged
+        if rain or shadow:
+            ask.append((not rain, gid, leg, shadow))
+    ask.sort(key=lambda x: x[0])   # rain checks first: they change what gets graded
+    hold: set[str] = set()
+    t0, failed = time.monotonic(), False
+    for i, (no_rain, gid, leg, shadow) in enumerate(ask):
+        if time.monotonic() - t0 > ESPN_PASS_SECONDS:
+            hold |= {g for nr, g, _, _ in ask[i:] if not nr}   # unchecked run lines and totals wait
+            break
+        try:
+            pts, why = espn_final(leg["sport_key"], leg["home_team"], leg["away_team"], leg["commence_time"])
+        except Exception as e:  # noqa: BLE001 - ESPN down or changed: grade from the Odds API as before
+            if not failed:   # (once a pass)
+                print(f"  ! ESPN scoreboard: {e!r:.120}", file=sys.stderr)
+            failed = True
+            continue   # (no row: an outage says nothing about ESPN's finals)
+        if why == "shortened game":
+            hold.add(gid)
+            print(f"  ⚾ {leg['away_team']} @ {leg['home_team']} ended before the 9th: run lines and totals "
+                  f"on it are left for you to check (books usually void them).", flush=True)
+        if not shadow:
+            continue
+        api = finals[gid]
+        verdict = ("agree" if pts and all(api.get(t) == v for t, v in pts.items())
+                   else "disagree" if pts else f"espn: {why}")
+        append_csv(cfg.score_check_file, SCORE_CHECK_FIELDS, {
+            "checked_at": now.isoformat(timespec="seconds"), "event_id": gid, "sport_key": leg["sport_key"],
+            "matchup": f"{leg['away_team']} @ {leg['home_team']}", "odds_api": json.dumps(api),
+            "espn": json.dumps(pts or {}), "verdict": verdict})
+        if verdict == "disagree":
+            print(f"! ESPN and the Odds API disagree on {leg['away_team']} @ {leg['home_team']}: "
+                  f"ESPN {pts}, Odds API {api} (graded from the Odds API)", file=sys.stderr)
+    return hold
+
+
+def score_check_line(cfg: Config) -> str:
+    """'ESPN agreed on 48 of 50 finals (0 disagreements, ...)' from SCORE_CHECK_FILE ('' if none)."""
+    try:
+        rows = _read_csv(cfg.score_check_file) if cfg.score_check_file else []
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return ""
+    if not rows:
+        return ""
+    agree = sum(r.get("verdict") == "agree" for r in rows)
+    disagree = sum(r.get("verdict") == "disagree" for r in rows)
+    return (f"ESPN's free scoreboard agreed on {agree} of {len(rows)} finals ({disagree} disagreement"
+            f"{'' if disagree == 1 else 's'}; the rest it couldn't grade). Details: {cfg.score_check_file}")
 
 
 def _num(raw: str, part=None) -> float | None:
@@ -5667,8 +6121,36 @@ def next_reset(cfg: Config, now: datetime) -> datetime:
 
 
 LIVE, PREGAME, EARLY, FAR = "live", "pregame", "early", "far"
+PROP_NEAR, PROP_EARLY = "prop_near", "prop_early"   # prop checks near kickoff / further out
 CORE = {LIVE, PREGAME}   # protected on a tight budget; EARLY/FAR stretch first
 STEP = 300  # seconds per slice when forecasting the next 24h
+# Spare credits buy faster pre-game checks in this order, each down to its floor: near kickoff
+# first (the bets most worth acting on, and the pre-game checks of sports with a live game), then
+# later today, early props, props near kickoff, and 1-2 days out last (rarely a locks alert).
+SPARE_ORDER = (PREGAME, EARLY, PROP_EARLY, PROP_NEAR, FAR)
+LANE_KINDS = {"live": "odds:live", "pre": "odds:pre", "all": "odds"}   # CostBook kinds of the checks
+
+
+def merge_events(events: list[dict]) -> list[dict]:
+    """One event per game: a live check and a pre-game check of the same game in one pass (each
+    with its own bet types) become one event with every bet type."""
+    out: list[dict] = []
+    by_id: dict[str, dict] = {}
+    for ev in events:
+        have = by_id.get(ev.get("id"))
+        if have is None:
+            by_id[ev.get("id")] = ev
+            out.append(ev)
+            continue
+        books = {bm.get("key"): bm for bm in have.setdefault("bookmakers", [])}
+        for bm in ev.get("bookmakers", []):
+            mine = books.get(bm.get("key"))
+            if mine is None:
+                have["bookmakers"].append(bm)
+                continue
+            keys = {m.get("key") for m in mine.setdefault("markets", [])}
+            mine["markets"].extend(m for m in bm.get("markets", []) if m.get("key") not in keys)
+    return out
 
 
 class Scheduler:
@@ -5678,9 +6160,13 @@ class Scheduler:
         self.cfg = cfg
         self.api = api
         self.cost = cfg.credits_per_call()
+        # LIVE_MARKETS narrower than MARKETS: (live check's bet types, pre-game check's), else None.
+        self.split = cfg.split_markets()
         self.games: dict[str, list[tuple[str, datetime]]] = {s: [] for s in cfg.sports}
         self.events_at: dict[str, float] = {s: 0.0 for s in cfg.sports}
-        self.last_odds: dict[str, float] = {s: 0.0 for s in cfg.sports}
+        self.last_odds: dict[str, float] = {s: 0.0 for s in cfg.sports}   # "all" and "pre" checks
+        self.last_live: dict[str, float] = {s: 0.0 for s in cfg.sports}   # "live" checks (LIVE_MARKETS)
+        self.market_ok: dict[str, dict[str, float]] = {s: {} for s in cfg.sports}  # bet type -> last good look
         self.misses: dict[str, int] = {}
         self.ended: set[str] = set()
         self.need_close: set[str] = set()  # event ids wanting a last pre-kickoff check (CLV)
@@ -5691,29 +6177,55 @@ class Scheduler:
         self.bad_prop_sports: set[str] = set()  # sports whose prop request the API rejected
         self.scale = 1.0         # slow-down for live and near-kickoff checks
         self.extra_scale = 1.0   # slow-down for early/far-out checks (stretched first)
+        self.live_scale = 1.0    # extra slow-down for live checks alone (LIVE_MAX_STRETCH: before the rest)
+        self.speed: dict[str, float] = {}   # tier -> how much faster than normal (spare credits)
+        self.spare = 0.0         # credits the faster pre-game pace plans to spend in the next 24h
+        self.demand: dict[str, float] = {}  # tier -> credits in the next 24h at full speed
         self.forecast = 0.0      # credits the next 24h would cost at full speed
         self.allowance = 0.0     # credits we can afford per day
         self.budget_at = 0.0
+        self.scope: Scope | None = None   # what the last fetch looked at (LIVE_MARKETS split only)
+        self._due_lanes: dict[str, list[tuple[str, str]]] = {}
 
     # ---- game state
 
+    def wants_live(self, sport: str) -> bool:
+        """Is anything live wanted from this sport? (If not, games in progress aren't paid for.)"""
+        cfg = self.cfg
+        return bool((cfg.arb_live or (cfg.ev_enabled and cfg.ev_live) or (cfg.outliers_enabled and cfg.outlier_live))
+                    and (not cfg.live_sports or sport in cfg.live_sports))
+
+    def live_games(self, sport: str, now: datetime) -> list[str]:
+        dur = timedelta(minutes=self.cfg.minutes_for(sport))
+        return [gid for gid, start in self.games[sport] if gid not in self.ended and start <= now < start + dur]
+
     def state(self, sport: str, now: datetime) -> str | None:
         """The most urgent reason to check this sport: a live game, then the soonest kickoff."""
+        if self.wants_live(sport) and self.live_games(sport, now):
+            return LIVE
+        return self.pre_state(sport, now)
+
+    def lanes(self, sport: str, now: datetime) -> list[tuple[str, str]]:
+        """The checks this sport wants now, as (check, tier). One "all" check asks for every bet type
+        of every game, live and upcoming. With LIVE_MARKETS, a sport with a live game gets a "live"
+        check (LIVE_MARKETS, every game: upcoming games' moneylines come along for the same credit)
+        and a "pre" check (the other bet types, games that haven't started), each on its own clock."""
+        if self.split and self.wants_live(sport) and self.live_games(sport, now):
+            pre = self.pre_state(sport, now)
+            return [("live", LIVE)] + ([("pre", pre)] if pre else [])
+        st = self.state(sport, now)
+        return [("all", st)] if st else []
+
+    def lane_markets(self, lane: str) -> str:
+        if self.split and lane in ("live", "pre"):
+            return self.split[0 if lane == "live" else 1]
+        return self.cfg.markets
+
+    def pre_state(self, sport: str, now: datetime) -> str | None:
+        """How soon the next game that hasn't started is: PREGAME, EARLY, FAR or None."""
         cfg = self.cfg
-        dur = timedelta(minutes=cfg.minutes_for(sport))
-        want_live = ((cfg.arb_live or (cfg.ev_enabled and cfg.ev_live)
-                      or (cfg.outliers_enabled and cfg.outlier_live))
-                     and (not cfg.live_sports or sport in cfg.live_sports))
-        soonest = None
-        for gid, start in self.games[sport]:
-            if gid in self.ended:
-                continue
-            if start <= now < start + dur:
-                if want_live:
-                    return LIVE
-                continue  # nothing live is wanted: don't pay to check games in progress
-            if start > now and (soonest is None or start < soonest):
-                soonest = start
+        soonest = min((start for gid, start in self.games[sport] if gid not in self.ended and start > now),
+                      default=None)
         if soonest is None or cfg.live_only:   # LIVE_ONLY: pre-game checks would be thrown away
             return None
         ahead = soonest - now
@@ -5730,7 +6242,33 @@ class Scheduler:
                 EARLY: self.cfg.early_minutes * 60, FAR: self.cfg.far_minutes * 60}[st]
 
     def interval(self, st: str) -> float:
-        return self.base_interval(st) * (self.scale if st in CORE else self.extra_scale)
+        if st == LIVE:   # slowed, never sped up: live checks are never faster than POLL_SECONDS
+            return self.base_interval(st) * self.scale * self.live_scale
+        return self.base_interval(st) * (self.scale if st in CORE else self.extra_scale) / self.speed.get(st, 1.0)
+
+    def call_cost(self, kind: str, markets: str) -> float:
+        """Credits one call of this kind costs: the measured average (x-requests-last), or markets x
+        regions until there are calls to go on."""
+        formula = self.cfg.credits_per_call(markets)
+        book = getattr(self.api, "costs", None)   # (test fakes have none: the formula)
+        return book.estimate(kind, formula) if book else formula
+
+    def lane_cost(self, lane: str) -> float:
+        return self.call_cost(LANE_KINDS[lane], self.lane_markets(lane))
+
+    def prop_cost(self, sport: str, hours: float, today: bool = False) -> float:
+        """Credits one prop check of a game this many hours away costs (measured per hours-to-start
+        bucket). For today's games it's never put below the near-kickoff cost: books post the day's
+        props by game-day morning, so overnight's free empty answers say little about the afternoon."""
+        formula = self.cfg.prop_credits_per_call(sport)
+        book = getattr(self.api, "costs", None)
+        if not book:
+            return formula
+        near = book.estimate(f"props:{sport}:near", formula)
+        if hours <= self.cfg.prop_hours:
+            return near
+        est = book.estimate(prop_cost_kind(sport, hours, self.cfg.prop_hours), formula)
+        return max(est, near) if today else est
 
     def refresh_events(self, force: bool = False) -> None:
         now = time.time()
@@ -5768,34 +6306,46 @@ class Scheduler:
     # ---- budget
 
     def update_budget(self, now: datetime) -> None:
-        """Pick the smallest slow-down that makes credits last until the plan resets."""
-        remaining = self.api.remaining if self.api.remaining is not None else self.cfg.monthly_credits
+        """Pick the smallest slow-down that makes credits last until the plan resets: live checks
+        first (up to LIVE_MAX_STRETCH), then early checks, then the rest. On a day with room to spare,
+        spend the spare on faster pre-game checks (SPARE_ORDER), never on faster live ones."""
+        cfg = self.cfg
+        remaining = self.api.remaining if self.api.remaining is not None else cfg.monthly_credits
         reserve = 0.02 * remaining  # small cushion for forecast misses
         self.allowance = max(0.0, remaining - reserve) * self.next24_share(now)
 
-        core = extra = 0.0
+        cost = {lane: self.lane_cost(lane) for lane in LANE_KINDS}
+        demand = dict.fromkeys((LIVE, PREGAME, EARLY, FAR, PROP_NEAR, PROP_EARLY), 0.0)
         for step in range(0, 86400, STEP):
             t = now + timedelta(seconds=step)
-            if seconds_until_active(self.cfg, t):
+            if seconds_until_active(cfg, t):
                 continue
-            for sport in self.cfg.sports:
-                st = self.state(sport, t)
-                if st:
-                    rate = STEP * self.cost / self.base_interval(st)
-                    if st in CORE:
-                        core += rate
-                    else:
-                        extra += rate
+            for sport in cfg.sports:
+                for lane, st in self.lanes(sport, t):
+                    demand[st] += STEP * cost[lane] / self.base_interval(st)
             near, early = self._prop_rates(t)
-            core += STEP * near
-            extra += STEP * early
+            demand[PROP_NEAR] += STEP * near
+            demand[PROP_EARLY] += STEP * early
+        self.demand = demand
+        live = demand[LIVE]
+        core = live + demand[PREGAME] + demand[PROP_NEAR]
+        extra = demand[EARLY] + demand[FAR] + demand[PROP_EARLY]
         self.forecast = core + extra
+        a, cap = self.allowance, max(1.0, cfg.extra_max_stretch)
+        self.live_scale, self.speed, self.spare = 1.0, {}, 0.0
+        stretch = max(1.0, cfg.live_max_stretch or 1.0)
+        if a > 0 and core + extra > a and live and stretch > 1:
+            # Short: pre-game checks come first, so live checks slow down (up to LIVE_MAX_STRETCH)
+            # before anything else does.
+            fits = live - (core + extra - a)
+            self.live_scale = min(stretch, live / fits) if fits > 0 else stretch
+            core -= live - live / self.live_scale
         self.core_demand, self.extra_demand = core, extra
-        a, cap = self.allowance, max(1.0, self.cfg.extra_max_stretch)
         if a <= 0:
             self.scale = self.extra_scale = math.inf
         elif core + extra <= a:
             self.scale = self.extra_scale = 1.0
+            self._spend_spare(a * cfg.spare_use_pct / 100 - (core + extra))
         elif core + extra / cap <= a:
             self.scale, self.extra_scale = 1.0, extra / (a - core)   # only early checks slow down
         else:
@@ -5806,31 +6356,59 @@ class Scheduler:
             self.scale = max(1.0, core / room) if room > 0 else 1.0
         self.budget_at = time.time()
 
-    def _prop_tiers(self, now: datetime) -> list[tuple[str, str, bool]]:
-        """(sport, event id, near_kickoff) for games inside a props window."""
+    def _spend_spare(self, budget: float) -> None:
+        """Credits the day can spare go to faster pre-game checks, in SPARE_ORDER, each tier down to
+        its floor (*_MIN_MINUTES) before the next one gets any."""
+        cfg = self.cfg
+        rates = {PREGAME: (cfg.pregame_minutes, cfg.pregame_min_minutes),
+                 EARLY: (cfg.early_minutes, cfg.early_min_minutes),
+                 PROP_EARLY: (cfg.prop_early_minutes, cfg.prop_early_min_minutes),
+                 PROP_NEAR: (cfg.prop_minutes, cfg.prop_min_minutes),
+                 FAR: (cfg.far_minutes, cfg.far_min_minutes)}
+        for tier in SPARE_ORDER:
+            base, floor = rates[tier]
+            d = self.demand.get(tier, 0.0)
+            if budget <= 0:
+                break
+            if not d or floor <= 0 or floor >= base:
+                continue
+            x = min(base / floor, 1 + budget / d)
+            self.speed[tier] = x
+            budget -= d * (x - 1)
+            self.spare += d * (x - 1)
+
+    def _prop_slots(self, now: datetime) -> list[tuple[str, str, datetime]]:
+        """(sport, event id, start) for games inside a props window."""
         cfg = self.cfg
         if not cfg.props_enabled or cfg.live_only:   # props are pre-game only
             return []
-        near = timedelta(hours=cfg.prop_hours)
         early = timedelta(hours=max(cfg.prop_hours, cfg.prop_early_hours if cfg.prop_early_minutes else 0))
-        return [(sport, gid, start - now <= near) for sport in cfg.prop_sports if sport in self.games
+        return [(sport, gid, start) for sport in cfg.prop_sports if sport in self.games
                 and cfg.prop_markets.get(sport) and sport not in self.bad_prop_sports
                 for gid, start in self.games[sport] if now < start <= now + early]
+
+    def _prop_tiers(self, now: datetime) -> list[tuple[str, str, bool]]:
+        """(sport, event id, near_kickoff) for games inside a props window."""
+        near = timedelta(hours=self.cfg.prop_hours)
+        return [(sport, gid, start - now <= near) for sport, gid, start in self._prop_slots(now)]
 
     def _prop_games(self, now: datetime) -> list[tuple[str, str]]:
         return [(sport, gid) for sport, gid, _ in self._prop_tiers(now)]
 
     def _prop_every(self, near: bool) -> float:
         if near:
-            return self.cfg.prop_minutes * 60 * self.scale
-        return self.cfg.prop_early_minutes * 60 * self.extra_scale
+            return self.cfg.prop_minutes * 60 * self.scale / self.speed.get(PROP_NEAR, 1.0)
+        return self.cfg.prop_early_minutes * 60 * self.extra_scale / self.speed.get(PROP_EARLY, 1.0)
 
     def _prop_rates(self, t: datetime) -> tuple[float, float]:
         """Credits per second on props at time t at full speed: (near kickoff, early)."""
         near = early = 0.0
-        for sport, _, is_near in self._prop_tiers(t):
-            cost = self.cfg.prop_credits_per_call(sport)
-            if is_near:
+        tz = ZoneInfo(self.cfg.timezone)
+        day = t.astimezone(tz).date()
+        for sport, _, start in self._prop_slots(t):
+            hours = (start - t).total_seconds() / 3600
+            cost = self.prop_cost(sport, hours, start.astimezone(tz).date() == day)
+            if start - t <= timedelta(hours=self.cfg.prop_hours):
                 near += cost / (self.cfg.prop_minutes * 60)
             else:
                 early += cost / (self.cfg.prop_early_minutes * 60)
@@ -5905,49 +6483,85 @@ class Scheduler:
 
     # ---- polling
 
+    def _last(self, sport: str, lane: str) -> float:
+        return self.last_live[sport] if lane == "live" else self.last_odds[sport]
+
+    def closing_lanes(self, sport: str, now: datetime) -> list[str]:
+        """The checks a game with a logged bet still needs before it starts (within CLOSING_MINUTES,
+        no good look at its bet types since): its closing line needs every bet type."""
+        cfg = self.cfg
+        if not cfg.closing_minutes or not self.need_close or cfg.live_only:
+            return []
+        window = timedelta(minutes=cfg.closing_minutes)
+        opens = [(start - window).timestamp() for gid, start in self.games[sport]
+                 if gid in self.need_close and now < start <= now + window]
+        if not opens:
+            return []
+        ts = time.time()   # (a failed look is retried each minute)
+        if self.split and self.wants_live(sport) and self.live_games(sport, now):
+            out = []
+            for lane in ("live", "pre"):
+                ok = min(self.market_ok[sport].get(m, 0.0) for m in _csv(self.lane_markets(lane)))
+                if ts - self._last(sport, lane) >= 60 and any(ok < t for t in opens):
+                    out.append(lane)
+            return out
+        return ["all"] if ts - self.last_odds[sport] >= 60 and any(self.odds_ok[sport] < t for t in opens) else []
+
     def closing_due(self, sport: str, now: datetime) -> bool:
         """A game with a logged bet starts within CLOSING_MINUTES and we haven't looked since."""
-        if not self.cfg.closing_minutes or not self.need_close or self.cfg.live_only:
-            return False
-        window = timedelta(minutes=self.cfg.closing_minutes)
-        return (time.time() - self.last_odds[sport] >= 60      # a failed look is retried each minute
-                and any(gid in self.need_close and now < start <= now + window
-                        and self.odds_ok[sport] < (start - window).timestamp()
-                        for gid, start in self.games[sport]))
+        return bool(self.closing_lanes(sport, now))
 
     def due(self, now: datetime) -> list[str]:
         ts = time.time()
-        out = []
+        self._due_lanes = {}
         for sport in self.cfg.sports:
-            st = self.state(sport, now)
-            if (st and ts - self.last_odds[sport] >= self.interval(st)) or self.closing_due(sport, now):
-                out.append(sport)
-        return out
+            lanes = [(lane, st) for lane, st in self.lanes(sport, now) if ts - self._last(sport, lane) >= self.interval(st)]
+            for lane in self.closing_lanes(sport, now):
+                if all(lane != have for have, _ in lanes):
+                    lanes.append((lane, PREGAME))
+            if lanes:
+                self._due_lanes[sport] = lanes
+        return list(self._due_lanes)
 
     def seconds_to_next(self, now: datetime) -> float:
         ts = time.time()
-        waits = [self.last_odds[s] + self.interval(st) - ts
-                 for s in self.cfg.sports if (st := self.state(s, now))]
+        waits = [self._last(s, lane) + self.interval(st) - ts for s in self.cfg.sports for lane, st in self.lanes(s, now)]
         waits += [self.last_props.get(gid, 0) + self._prop_every(near) - ts
                   for _, gid, near in self._prop_tiers(now)]
         return min([15.0] + waits)
 
     def fetch(self, sports: list[str], now: datetime) -> tuple[list[dict], set[str]]:
-        """Odds for these sports, plus the sports whose request worked."""
-        ahead = max(self.cfg.pregame_hours if self.cfg.pregame_minutes else 0, self.cfg.lookahead_hours)
+        """Odds for these sports, plus the sports whose request worked. With LIVE_MARKETS split
+        off, self.scope says which bet types of which games were looked at."""
+        cfg = self.cfg
+        ahead = max(cfg.pregame_hours if cfg.pregame_minutes else 0, cfg.lookahead_hours)
         until = now + timedelta(hours=ahead, minutes=1)
+        due, self._due_lanes = self._due_lanes, {}
+        jobs = [(sport, lane) for sport in sports
+                for lane, _ in (due.get(sport) or self.lanes(sport, now) or [("all", None)])]
 
-        def one(sport: str) -> tuple[str, list[dict] | Exception]:
+        def one(job: tuple[str, str]) -> tuple[tuple[str, str], list[dict] | Exception]:
+            sport, lane = job
             try:
-                return sport, self.api.odds(sport, until)
+                if lane == "live":   # LIVE_MARKETS for every game: live ones, and upcoming ones for free
+                    return job, self.api.odds(sport, until, markets=self.lane_markets(lane), kind=LANE_KINDS[lane])
+                if lane == "pre":    # the other bet types, games that haven't started
+                    return job, self.api.odds(sport, until, markets=self.lane_markets(lane), since=now,
+                                              kind=LANE_KINDS[lane])
+                return job, self.api.odds(sport, until)
             except Exception as e:  # noqa: BLE001 - reported below
-                return sport, e
+                return job, e
 
         events: list[dict] = []
         ok: set[str] = set()
-        with ThreadPoolExecutor(max_workers=len(sports)) as pool:
-            for sport, result in pool.map(one, sports):
-                self.last_odds[sport] = time.time()
+        self.scope = scope = Scope() if self.split else None
+        with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as pool:
+            for (sport, lane), result in pool.map(one, jobs):
+                ts = time.time()
+                if lane == "live":
+                    self.last_live[sport] = ts
+                else:
+                    self.last_odds[sport] = ts
                 if isinstance(result, urllib.error.HTTPError):
                     if result.code in (401, 429):
                         raise result
@@ -5956,10 +6570,31 @@ class Scheduler:
                     print(f"! Odds error for {sport}: {result!r:.200}", file=sys.stderr)
                 else:
                     ok.add(sport)
-                    self.odds_ok[sport] = time.time()
-                    apply_fees(result, self.cfg)
-                    self.note_feed(sport, result, now)
+                    apply_fees(result, cfg)
+                    if lane != "pre":
+                        self.note_feed(sport, result, now)   # (a pre-game check never lists live games)
+                    markets = self.lane_markets(lane)
+                    for m in _csv(markets):
+                        self.market_ok[sport][m] = ts
+                    self.odds_ok[sport] = min(self.market_ok[sport].get(m, 0.0) for m in _csv(cfg.markets))
+                    if scope is not None:
+                        if lane == "all":
+                            scope.sports.add(sport)
+                        elif lane == "live":
+                            scope.add(sport, markets, None, until)
+                            # Games under way: only LIVE_MARKETS is checked live, so an alert on any
+                            # other bet type of a started game is gone (its line came down at kickoff).
+                            scope.add(sport, cfg.markets, None, now)
+                        else:
+                            scope.add(sport, markets, now, until)
                     events.extend(result)
+        if scope is not None:
+            # Sports with no live check now (LIVE_SPORTS leaves them out, nothing live is wanted, or
+            # their games ended): no check will see their started games again, so close those alerts.
+            for sport in cfg.sports:
+                if not (self.wants_live(sport) and self.live_games(sport, now)):
+                    scope.add(sport, cfg.markets, None, now)
+            events = merge_events(events)
         return events, ok
 
 
@@ -6026,8 +6661,21 @@ As games finish, the bot posts what hit: ✅ won, ❌ lost, ➖ push, with the p
 5. Books sometimes cancel bets on obvious mistakes and refund the money. With an arb, the other bet still stands, so you're left with one normal bet."""
 
 
-def summary_payload(cfg: Config, sections: list[tuple[str, str]], credits_left: float | None) -> dict:
-    """The daily summary card: what was found, whether the bets are good (CLV), credits."""
+def spent_line(spent: dict[str, float]) -> str:
+    """'Used since the last summary: 410 on live checks, ...' from CostBook.take_today()."""
+    groups = {"live checks": 0.0, "pre-game checks": 0.0, "props": 0.0, "scores": 0.0}
+    for kind, n in spent.items():
+        group = ("live checks" if kind == "odds:live" else "props" if kind.startswith("props:")
+                 else "scores" if kind == "scores" else "pre-game checks" if kind == "odds:pre" else "main-line checks")
+        groups[group] = groups.get(group, 0.0) + n
+    parts = [f"{n:,.0f} on {g}" for g, n in groups.items() if n]
+    return f"Used since the last summary: {', '.join(parts)}" if parts else ""
+
+
+def summary_payload(cfg: Config, sections: list[tuple[str, str]], credits_left: float | None,
+                    spent: dict[str, float] | None = None) -> dict:
+    """The daily summary card: what was found, whether the bets are good (CLV), credits (and
+    where they went, from the measured cost of each call)."""
     lines = [f"{title}\n{body}" for title, body in sections if body]
     week, ever = clv_rows(cfg, 7), clv_rows(cfg)
     if ever:
@@ -6047,8 +6695,9 @@ def summary_payload(cfg: Config, sections: list[tuple[str, str]], credits_left: 
         lines.append(marks)
     left = f"{credits_left:,.0f}" if credits_left is not None else "?"
     days = max(1.0, (next_reset(cfg, datetime.now(timezone.utc)) - datetime.now(timezone.utc)).total_seconds() / 86400)
+    used = spent_line(spent or {})
     lines.append(f"💳 **Credits**\n{left} left · about {float(credits_left or 0) / days:,.0f}/day until "
-                 f"{next_reset(cfg, datetime.now(timezone.utc)):%b %d}")
+                 f"{next_reset(cfg, datetime.now(timezone.utc)):%b %d}" + (f"\n{used}" if used else ""))
     return _card("📊 Daily summary (last 24h)", "\n\n".join(lines), 0x5865F2,
                  footer="Full breakdown on the server: arbbot.py --results")
 
@@ -6103,12 +6752,13 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
     sched.update_budget(now)
     tz = ZoneInfo(cfg.timezone)
     print("\n" + mode_line(cfg))
-    print(f"\nCredits per check: {sched.cost} ({cfg.markets} × "
-          f"{'bookmakers' if cfg.bookmakers else cfg.regions})")
+    print("\nCredits per check (" + ("10 bookmakers count as 1 region" if cfg.bookmakers else f"regions: {cfg.regions}")
+          + "):\n  " + "\n  ".join(cost_lines(cfg, sched)))
     print(f"Credits left: {sched.api.remaining if sched.api.remaining is not None else '?'} "
           f"| plan resets {next_reset(cfg, now):%b %d} (UTC)")
+    live_note = f" ({sched.split[0]} only; the rest at the pre-game pace)" if sched.split else ""
     print("\nNext 24h, when each sport will be checked:\n"
-          f"  L = live every {cfg.poll_seconds}s · p = near kickoff every {cfg.pregame_minutes}m · "
+          f"  L = live every {cfg.poll_seconds}s{live_note} · p = near kickoff every {cfg.pregame_minutes}m · "
           f"e = upcoming every {cfg.early_minutes}m · f = 1-2 days out every {cfg.far_minutes}m")
     hours = [now + timedelta(hours=h) for h in range(24)]
     print("            " + "".join(f"{h.astimezone(tz):%H}"[0] for h in hours))
@@ -6133,13 +6783,75 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
           f"(BUDGET_WEIGHTS; busy days get more, quiet weekdays less).")
     print(f"\nFull speed would use {sched.forecast:,.0f} credits in the next 24h; "
           f"you can afford {sched.allowance:,.0f}/day.")
-    if sched.scale > 1 or sched.extra_scale > 1:
-        print(f"→ Upcoming-game checks slowed {sched.extra_scale:.1f}× first "
-              f"(every {sched.interval(EARLY) / 60:.0f}m instead of {cfg.early_minutes}m).")
-        print(f"→ Live checks every {sched.interval(LIVE):.0f}s"
-              + (f" instead of {cfg.poll_seconds}s." if sched.scale > 1 else " (full speed)."))
+    print("\n".join(pace_lines(cfg, sched)))
+
+
+SPEED_NAMES = {PREGAME: ("near kickoff", "pregame_minutes"), EARLY: ("upcoming games", "early_minutes"),
+               PROP_EARLY: ("early props", "prop_early_minutes"), PROP_NEAR: ("props near kickoff", "prop_minutes"),
+               FAR: ("1-2 days out", "far_minutes")}
+
+
+def pace_lines(cfg: Config, sched: Scheduler) -> list[str]:
+    """What the budget did to the check rates (for --plan and the "Budget:" log line): live checks
+    slowed first, early checks slowed, everything slowed, or spare credits spent on pre-game."""
+    if sched.scale == math.inf:
+        return ["→ No credits for the next 24h: checks are paused."]
+    lines = []
+    if sched.live_scale > 1.01:
+        lines.append(f"→ Live checks slowed first: every {sched.interval(LIVE):.0f}s instead of {cfg.poll_seconds}s "
+                     f"(LIVE_MAX_STRETCH), so pre-game checks keep their pace.")
+    if sched.extra_scale > 1.01:
+        lines.append(f"→ Upcoming-game checks slowed {sched.extra_scale:.1f}× "
+                     f"(every {sched.interval(EARLY) / 60:.0f}m instead of {cfg.early_minutes}m).")
+    if sched.scale > 1.01:
+        lines.append(f"→ Live checks every {sched.interval(LIVE):.0f}s instead of {cfg.poll_seconds}s, near-kickoff "
+                     f"checks every {sched.interval(PREGAME) / 60:.0f}m instead of {cfg.pregame_minutes}m.")
+    faster = [f"{name} every {getattr(cfg, attr) / sched.speed[t]:.0f}m (from {getattr(cfg, attr)}m)"
+              for t, (name, attr) in SPEED_NAMES.items() if sched.speed.get(t, 1.0) > 1.01]
+    if faster:
+        lines.append(f"→ Spare credits (~{sched.spare:,.0f} in the next 24h) buy faster pre-game checks: "
+                     f"{', '.join(faster)}. Live checks never go faster than {cfg.poll_seconds}s.")
+    return lines or [f"→ Fits the budget at full speed (live checks every {cfg.poll_seconds}s)."]
+
+
+def pace_changed(old: tuple, sched: Scheduler) -> bool:
+    """Did update_budget change any check rate noticeably? old = (scale, extra_scale, live_scale, speed)."""
+    scale, extra, live, speed = old
+    if any(abs(a - b) > 0.05 for a, b in ((scale, sched.scale), (extra, sched.extra_scale), (live, sched.live_scale))
+           if math.isfinite(a) or math.isfinite(b)):
+        return True
+    return any(abs(speed.get(k, 1.0) - sched.speed.get(k, 1.0)) > 0.05 for k in set(speed) | set(sched.speed))
+
+
+def cost_lines(cfg: Config, sched: Scheduler) -> list[str]:
+    """What each kind of check costs: measured (x-requests-last) once there are calls to go on."""
+    book = getattr(sched.api, "costs", None)
+
+    def one(kind: str, formula: float) -> str:
+        n = book.calls(kind, formula) if book else 0
+        est = book.estimate(kind, formula) if book else formula
+        return f"{est:.1f}" + (f" (measured over {n} calls; formula {formula:g})" if n else " (formula)")
+    if sched.split:
+        live, pre = sched.split
+        lines = [f"Sports with a live game: {one('odds:live', cfg.credits_per_call(live))} for the live check "
+                 f"({live}: live games and upcoming ones, every {cfg.poll_seconds}s) + "
+                 f"{one('odds:pre', cfg.credits_per_call(pre))} for the pre-game check ({pre}, upcoming games)",
+                 f"Other sports: {one('odds', cfg.credits_per_call())} per check ({cfg.markets})"]
     else:
-        print(f"→ Fits the budget at full speed (live checks every {cfg.poll_seconds}s).")
+        lines = [f"Each check: {one('odds', cfg.credits_per_call())} ({cfg.markets})"]
+    if cfg.props_enabled:
+        for sport in cfg.prop_sports:
+            f = cfg.prop_credits_per_call(sport)
+            if not f:
+                continue
+            buckets = [("near kickoff", "near")] + [(f"up to {h}h out", f"{h}h") for h in PROP_COST_HOURS
+                                                     if h > cfg.prop_hours]
+            if book and any(book.calls(f"props:{sport}:{b}", f) for _, b in buckets):
+                lines.append(f"{short(sport)} props per game: "
+                             + ", ".join(f"{one(f'props:{sport}:{b}', f)} {label}" for label, b in buckets))
+            else:
+                lines.append(f"{short(sport)} props per game: {f} (formula; measured once props are checked)")
+    return lines
 
 
 def close_started(now: datetime, *alerters: Alerter) -> set[str]:
@@ -6176,8 +6888,9 @@ class LiveConfirm:
         self.dropped: list[tuple[object, float, int]] = []   # ended unconfirmed: (item, first seen, checks)
 
     def filter(self, items: list, checked: set[str], now: float, alerters=()) -> list:
-        """The items that may go to handle() now. checked = the sports (or games) this check looked
-        at; alerters = the ones whose open, restored and handed-over alerts are exempt."""
+        """The items that may go to handle() now. checked = the sports (or games, or a Scope: the bet
+        types and games) this check looked at; alerters = the ones whose open, restored and
+        handed-over alerts are exempt."""
         self.held, self.dropped = [], []
         exempt = {k for a in alerters for k in (*a.open, *a.restored, *a.handed)}
         out, found, stale = [], set(), set()
@@ -6205,7 +6918,7 @@ class LiveConfirm:
         for k, (n, first, last, it) in list(self.streak.items()):
             if k in found:
                 continue
-            if it.sport_key in checked or it.event_id in checked or now - last > self.window:
+            if looked_at(checked, it.sport_key, it.event_id, it.market, it.commence_time) or now - last > self.window:
                 del self.streak[k]   # looked for and not found (or too long ago): start over
                 if n < self.checks and k not in stale:
                     self.dropped.append((it, first, n))
@@ -6304,19 +7017,26 @@ def held_text(held: dict[str, int]) -> str:
 
 
 def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: datetime | None = None,
-              kalshi: bool = True) -> SimpleNamespace:
+              kalshi: bool = True, scope: Scope | None = None) -> SimpleNamespace:
     """One main-line check through every alert type: arbs first (they post before Kalshi is asked,
     which can take seconds), then outliers and +EV. Each step reads the clock as it goes, unless
-    `now` fixes it (tests, the demo). Returns what the console line reports."""
-    cfg, scope = t.cfg, set(checked_sports)
+    `now` fixes it (tests, the demo). Returns what the console line reports.
+
+    What was looked at (so only those alerts close, and only those live streaks end when not found):
+    the whole of checked_sports, or with LIVE_MARKETS the Scope's bet types and games (the live and
+    pre-game checks run on their own clocks, so one pass may have only one of them)."""
+    cfg = t.cfg
+    if scope is None:
+        scope, close = set(checked_sports), {"checked_sports": checked_sports}
+    else:
+        close = {"checked_events": scope}
 
     def clock() -> datetime:
         return now or datetime.now(timezone.utc)
     take_held(t.arbs, t.outs, t.evs)
     at = clock()
     arbs = find_arbs(events, cfg, at)
-    sent = t.arbs.handle(t.screen(t.arb_live, arbs, scope, at.timestamp(), (t.arbs,)),
-                         checked_sports=checked_sports, now=at.timestamp())
+    sent = t.arbs.handle(t.screen(t.arb_live, arbs, scope, at.timestamp(), (t.arbs,)), now=at.timestamp(), **close)
     kq = kalshi_fair(events, cfg, clock()) if kalshi else {}   # free: Kalshi's own prices as a second opinion
     at = clock()
     outs = find_outliers(events, cfg, at, history=t.price_history, kalshi=kq)
@@ -6328,8 +7048,8 @@ def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: d
                   ([], t.prop_evs, set())], at.timestamp())
     t.sharp_history.prune(at)
     t.price_history.prune(at)
-    out_sent = t.outs.handle(post_outs, checked_sports=checked_sports, now=at.timestamp())
-    ev_sent = t.evs.handle(post_evs, checked_sports=checked_sports, now=at.timestamp())
+    out_sent = t.outs.handle(post_outs, now=at.timestamp(), **close)
+    ev_sent = t.evs.handle(post_evs, now=at.timestamp(), **close)
     t.closing.observe(events, at)
     t.closing.finalize(clock())
     return SimpleNamespace(arbs=arbs, sent=sent, outs=outs, out_sent=out_sent, evs=evs, ev_sent=ev_sent,
@@ -6427,6 +7147,10 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         check_kalshi(cfg, api)
         return
 
+    if getattr(args, "check_upcoming", False):   # (getattr: tests build args without it)
+        check_upcoming(cfg, api)
+        return
+
     if args.results or args.post_results:
         tz = ZoneInfo(cfg.timezone)
         which = args.post_results or args.results
@@ -6450,6 +7174,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 sys.exit("Couldn't post to Discord (see the error above). Try again in a minute.")
             return
         print_day(cfg, day)
+        if line := score_check_line(cfg):
+            print(line)
         board = scoreboard_text(cfg).split("\n\n", 1)[1]     # the day itself is printed above
         print("\n" + re.sub(r"__|\*\*|```\n?", "", board))
         if report := _safely("--results", markout_report, cfg):
@@ -6457,8 +7183,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         return
 
     mode = "dry run (console only)" if alerter.dry_run else "sending to Discord"
-    print(f"Arb bot started: {', '.join(short(s) for s in cfg.sports)} | {cfg.markets} | "
-          f"{sched.cost} credits/check | {mode}")
+    checks = (f"live games: {sched.split[0]} ({cfg.credits_per_call(sched.split[0])} credits/check), the rest "
+              f"before kickoff ({cfg.credits_per_call(sched.split[1])})" if sched.split else f"{sched.cost} credits/check")
+    print(f"Arb bot started: {', '.join(short(s) for s in cfg.sports)} | {cfg.markets} | {checks} | {mode}")
     print(mode_line(cfg))
     if cfg.active_hours:
         print(f"Active hours: {cfg.active_hours} ({cfg.timezone})")
@@ -6491,7 +7218,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                                  f"{ev_record(cfg, 7, kinds=('outlier',))}"))
             if cfg.parlays_enabled:
                 sections.append(("📦 **Parlays**", parlay_alerter.summary()))
-            status.send_card(summary_payload(cfg, sections, api.remaining))
+            book = getattr(api, "costs", None)
+            status.send_card(summary_payload(cfg, sections, api.remaining, book.take_today() if book else None))
             for a in (alerter, ev_alerter, out_alerter, parlay_alerter, prop_arbs, prop_evs, prop_outs):
                 a.reset_stats()
 
@@ -6506,8 +7234,10 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         refreshed = any(time.time() - t >= cfg.events_refresh_minutes * 60 for t in sched.events_at.values())
         sched.refresh_events()
         if refreshed or time.time() - sched.budget_at > 300:
-            old, old_extra = sched.scale, sched.extra_scale
+            old = (sched.scale, sched.extra_scale, sched.live_scale, dict(sched.speed))
             sched.update_budget(now)
+            if not (args.once or args.dry_run) and (book := getattr(api, "costs", None)):
+                book.save()   # measured call costs survive a restart (and show in --plan)
             if sched.scale == math.inf:
                 broke = api.remaining is not None and api.remaining <= 0
                 if args.once:
@@ -6520,11 +7250,13 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 time.sleep(3600)
                 continue
             status.budget_warned = False
-            if abs(sched.scale - old) > 0.05 or abs(sched.extra_scale - old_extra) > 0.05:
+            if pace_changed(old, sched):
                 print(f"Budget: {sched.allowance:,.0f} credits/day, next 24h needs "
                       f"{sched.forecast:,.0f} at full speed → live checks every "
                       f"{sched.interval(LIVE):.0f}s, upcoming games every "
-                      f"{sched.interval(EARLY) / 60:.0f}m", flush=True)
+                      f"{sched.interval(EARLY) / 60:.0f}m"
+                      + "".join(f"\n  {line}" for line in pace_lines(cfg, sched) if "full speed" not in line),
+                      flush=True)
 
         due = [s for s in cfg.sports if sched.state(s, now)] if args.once else sched.due(now)
         prop_games = sched._prop_games(now) if args.once else sched.props_due(now)
@@ -6543,7 +7275,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             t0 = time.time()
             events = main_events
             t.set_live_interval(sched.interval(LIVE))
-            res = scan_main(t, events, checked_sports)
+            res = scan_main(t, events, checked_sports, scope=sched.scope)
             status.check_credits(api.remaining)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             ev_note = f" | {len(res.evs)} +EV, {res.ev_sent} new" if cfg.ev_enabled else ""
@@ -6625,6 +7357,9 @@ def main() -> None:
                    help="check that Kalshi's prices are read and matched to games (free, no credits)")
     p.add_argument("--check-props", action="store_true",
                    help="check that player props can be graded from ESPN box scores (free, no credits)")
+    p.add_argument("--check-upcoming", action="store_true",
+                   help="one-time check of the combined live odds call: its real cost and whether it lists every "
+                        "live game (about 1 credit plus 1 per sport with a live game)")
     p.add_argument("--post-results", nargs="?", const="today", metavar="DAY",
                    help="post a day's results card to the results channel (today, yesterday or YYYY-MM-DD)")
     p.add_argument("--results", nargs="?", const="today", metavar="DAY",
@@ -6663,7 +7398,7 @@ def main() -> None:
         url = next((u for u in (os.environ.get("DISCORD_STATUS_WEBHOOK_URL", ""), os.environ.get("DISCORD_WEBHOOK_URL", ""))
                     if u.startswith("https://")), "")   # a placeholder status URL falls back, like Status
         interactive = (args.dry_run, args.demo, args.once, args.plan, args.results, args.test_discord,
-                       args.post_guide, args.post_results, args.check_kalshi, args.check_props)
+                       args.post_guide, args.post_results, args.check_kalshi, args.check_props, args.check_upcoming)
         if url.startswith("https://") and not any(interactive):   # the service: say why it stopped
             try:
                 _webhook(url, {"username": "Arb Bot", "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
@@ -6717,7 +7452,7 @@ def main() -> None:
 
     bad = cfg.bad_webhooks()
     status = Status(cfg, dry_run=args.dry_run or args.demo or args.plan or args.once or bool(args.results)
-                    or bool(args.post_results) or args.check_kalshi)
+                    or bool(args.post_results) or args.check_kalshi or args.check_upcoming)
     if bad:
         status.send(f"⚠️ {', '.join(bad)} in .env isn't a Discord webhook URL, so those alerts are going "
                     f"to this channel for now. Fix it with: nano /opt/arb-bot/.env")
