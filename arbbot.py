@@ -1844,6 +1844,11 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
 
         for (k, name), lst in offers.items():
             lst.sort(key=lambda o: (-o[0], o[1]))   # best price; ties by book name, so it's stable
+            kq = kalshi.get(ev["id"], {}).get(name) if kalshi and k[0] == "h2h" else None
+            if kq is not None:   # a Kalshi price its own order book no longer has isn't an offer
+                lst = [o for o in lst if o[4] != "kalshi" or kalshi_still_there(kq, o[0], cfg)]
+                if not lst:
+                    continue
             price, book, link, point, book_key = lst[0]
             bet = EVBet(
                 event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
@@ -1873,12 +1878,9 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
             # Kalshi's exchange price is a second opinion on moneylines: if it disagrees with the
             # sharp book by more than KALSHI_MAX_GAP points, or says the price isn't good, skip it.
             kgap = None
-            if k[0] == "h2h" and kalshi and name in kalshi.get(ev["id"], {}):
-                bet.kalshi = kalshi[ev["id"]][name]
-                if book_key == "kalshi":
-                    if not kalshi_still_there(bet.kalshi, price, cfg):
-                        continue   # Kalshi's own order book no longer has this price
-                else:
+            if kq is not None:
+                bet.kalshi = kq
+                if book_key != "kalshi":   # (for a bet at Kalshi, its quote only confirmed the price above)
                     kgap = round(abs(bet.kalshi[0] - bet.fair_prob) * 100, 6)
                     if kgap > kalshi_gap_limit(cfg, ev.get("sport_key", ""), hours):
                         continue
@@ -2061,7 +2063,9 @@ KALSHI_ALIASES = {   # Kalshi team labels the usual name matching can't read -> 
     "chicagows": "Chicago White Sox", "as": "Athletics", "miamifl": "Miami Hurricanes",
     "umass": "Massachusetts Minutemen", "connecticut": "UConn Huskies", "fiu": "Florida International Panthers",
     "floridaintl": "Florida International Panthers", "appst": "Appalachian State Mountaineers",
-    "ulmonroe": "Louisiana Monroe Warhawks",
+    "ulmonroe": "Louisiana Monroe Warhawks", "samhouston": "Sam Houston State Bearkats",
+    "centralconnecticut": "Central Connecticut State Blue Devils", "nicholls": "Nicholls State Colonels",
+    "grambling": "Grambling State Tigers",
 }
 KALSHI_MIN_GAP = 0.2            # seconds between Kalshi calls (at most 5 a second)
 KALSHI_TIMEOUT = 5              # seconds to wait for Kalshi before giving up on it for this scan
@@ -2071,8 +2075,9 @@ COLLEGE_QUALIFIERS = {   # "Texas" mustn't claim "Texas Southern" / "Texas A&M" 
     "state", "st", "tech", "am", "at", "southern", "northern", "eastern", "western", "central", "pine",
     "valley", "international", "intl", "atlantic", "gulf", "christian", "baptist", "oh", "fl", "city",
     "upstate", "monroe", "lafayette", "poly", "wesleyan", "methodist", "little", "el", "rio", "san",
-    "arlington", "martin", "chattanooga", "commerce", "corpus", "coast", "mountain",
+    "arlington", "martin", "chattanooga", "commerce", "corpus", "coast",
 }
+KALSHI_PAGE_ERRORS = (400, 404, 410)   # errors about the page asked for (e.g. an unknown series), not Kalshi
 KALSHI_MAX_ASK_SUM = 1.10       # both teams' asks together above this: not a real market yet
 KALSHI_MID_SUM = (0.96, 1.04)   # both teams' middle prices should add up to about 100%
 _KALSHI_STATE = {"host": 0, "last": 0.0, "pause_until": 0.0, "fails": 0}
@@ -2206,8 +2211,9 @@ def _kalshi_fetch(url: str) -> dict:
 def _kalshi_get(query: str) -> dict:
     """GET a Kalshi market-data page (public, no key; cached 30 s). Starts with the address that
     worked last time and tries the other if it fails (but not when Kalshi asked to slow down).
-    When neither address answers (down, timing out, blocked), Kalshi is left alone for a minute,
-    then 5, then 15, so an outage never slows the scans down."""
+    When neither address gives data (down, timing out, refusing with 401/403), Kalshi is left alone
+    for a minute, then 5, then 15, so an outage never slows the scans down. Only an error about the
+    page itself (KALSHI_PAGE_ERRORS, e.g. a series name Kalshi doesn't know) doesn't count."""
     def fetch() -> dict:
         if time.time() < _KALSHI_STATE["pause_until"]:
             raise RuntimeError(f"Kalshi paused until {datetime.fromtimestamp(_KALSHI_STATE['pause_until']):%H:%M:%S} "
@@ -2215,15 +2221,17 @@ def _kalshi_get(query: str) -> dict:
         bases = list(dict.fromkeys(KALSHI_APIS))
         first = _KALSHI_STATE["host"] % len(bases)
         last: Exception | None = None
-        unreachable = True
+        page_error: Exception | None = None
         for base in bases[first:] + bases[:first]:
             try:
                 data = _kalshi_fetch(f"{base}/{query}")
             except urllib.error.HTTPError as e:
                 if e.code == 429:
                     raise
-                unreachable = unreachable and e.code >= 500   # a 4xx is about this page, not Kalshi
-                last = e
+                if e.code in KALSHI_PAGE_ERRORS:
+                    page_error = e
+                else:
+                    last = e
                 continue
             except Exception as e:  # noqa: BLE001 - timeouts, refused connections, bad JSON
                 last = e
@@ -2234,10 +2242,11 @@ def _kalshi_get(query: str) -> dict:
             _KALSHI_STATE["host"] = bases.index(base)
             _KALSHI_STATE["fails"] = 0
             return data
-        if unreachable:
-            wait = KALSHI_COOLDOWNS[min(_KALSHI_STATE["fails"], len(KALSHI_COOLDOWNS) - 1)]
-            _KALSHI_STATE["fails"] += 1
-            _KALSHI_STATE["pause_until"] = time.time() + wait
+        if last is None and page_error is not None:
+            raise page_error   # every address said the page doesn't exist: not an outage
+        wait = KALSHI_COOLDOWNS[min(_KALSHI_STATE["fails"], len(KALSHI_COOLDOWNS) - 1)]
+        _KALSHI_STATE["fails"] += 1
+        _KALSHI_STATE["pause_until"] = time.time() + wait
         raise last or RuntimeError("no Kalshi address to try")
     return _cached("kalshi:" + query, fetch, ttl=30)
 
@@ -2256,7 +2265,7 @@ def kalshi_markets(sport_key: str) -> list[dict]:
                 if not cursor:
                     break
         except urllib.error.HTTPError as e:
-            if not 400 <= e.code < 500 or e.code == 429:
+            if e.code not in KALSHI_PAGE_ERRORS:
                 raise
             continue
         if out:
@@ -2367,7 +2376,10 @@ def _kalshi_match(pool: list[dict], use: set[str], markets: list[dict], sport: s
     for ev in pool:
         start = _parse_time(ev["commence_time"])
         fits: list[tuple[int, str, dict, dict]] = []
-        for day in dict.fromkeys((start.astimezone(tz).date(), start.date())):
+        # A started game only holds the Kalshi game on its own Eastern date (its market may have
+        # closed already, and the UTC date could be tomorrow's rematch).
+        days = (start.astimezone(tz).date(),) + ((start.date(),) if ev["id"] in use else ())
+        for day in dict.fromkeys(days):
             for ticker, ms in games.items():
                 if len(ms) != 2 or _kalshi_day(ticker) != day:
                     continue

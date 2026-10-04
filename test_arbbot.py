@@ -3018,9 +3018,10 @@ class KalshiCrossCheck(unittest.TestCase):
         mock.patch.object(_arbbot, "KALSHI_MIN_GAP", 0).start()
         self.sleeps = []
         mock.patch("arbbot.time.sleep", side_effect=self.sleeps.append).start()
+        mock.patch.dict(_arbbot._KALSHI_STATE, {"host": 0, "last": 0.0, "pause_until": 0.0, "fails": 0}).start()
+        mock.patch.dict(_arbbot._KALSHI_WARNED, clear=True).start()
         self.addCleanup(mock.patch.stopall)
         _arbbot._ESPN_CACHE.clear()
-        _arbbot._KALSHI_STATE.update(host=0, last=0.0, pause_until=0.0)
 
     def game(self, start="2026-10-04T17:00:00Z", home="New York Jets", away="Buffalo Bills", gid="nfl1",
              sport="americanfootball_nfl"):
@@ -3186,6 +3187,19 @@ class KalshiCrossCheck(unittest.TestCase):
         self.assertTrue(_kalshi_label_match("Texas Southern Tigers", "Texas Southern", college=True))
         self.assertTrue(_kalshi_label_match("Arkansas State Red Wolves", "Arkansas St.", college=True))
         self.assertTrue(_kalshi_label_match("Texas Longhorns", "Texas", college=True))
+        self.assertTrue(_kalshi_label_match("Lehigh Mountain Hawks", "Lehigh", college=True))   # a nickname
+        from arbbot import _kalshi_strength
+        self.assertGreater(_kalshi_strength("Sam Houston State Bearkats", {"yes_sub_title": "Sam Houston"}, False), 0)
+
+    def test_last_nights_game_doesnt_block_tonights_rematch(self):
+        # Saturday 8 PM Eastern (Sunday 00:00 UTC) is over and its market gone; Sunday's rematch is listed.
+        self.markets["KXNHLGAME"] = [kalshi_market("KXNHLGAME-26OCT04TBFLA", "TB", "Tampa Bay", 0.38, 0.39),
+                                     kalshi_market("KXNHLGAME-26OCT04TBFLA", "FLA", "Florida", 0.61, 0.62)]
+        sat = self.game("2026-10-04T00:00:00Z", home="Florida Panthers", away="Tampa Bay Lightning", gid="sat",
+                        sport="icehockey_nhl")
+        sun = dict(sat, id="sun", commence_time="2026-10-04T21:00:00Z")
+        f = self.fair([sat, sun], now=datetime(2026, 10, 4, 2, 40, tzinfo=timezone.utc))
+        self.assertAlmostEqual(f["sun"]["Tampa Bay Lightning"][0], 0.385)
 
     def test_doubleheaders_use_the_start_time(self):
         self.markets["KXMLBGAME"] = [
@@ -3329,6 +3343,30 @@ class KalshiCrossCheck(unittest.TestCase):
         [o] = find_outliers([out], Config(), NOW, kalshi={"e1": {"Home": (0.515, 0.51, 0.52)}})
         self.assertEqual(o.book, "Kalshi")
         self.assertEqual(find_outliers([out], Config(), NOW, kalshi={"e1": {"Home": (0.555, 0.55, 0.56)}}), [])
+
+    def test_a_stale_kalshi_price_doesnt_hide_other_books(self):
+        cfg = Config(min_ev_pct=3, round_stakes=0)
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"Kalshi": [("Home", 2.1398, None)], "DK": [("Home", 2.10, None)], "FD": [("Home", 2.08, None)]})
+        [b] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": (0.485, 0.48, 0.49)}})   # Kalshi now 49¢
+        self.assertEqual((b.book, b.price), ("DK", 2.10))
+        self.assertEqual([bk for bk, _ in b.also], ["FD"])
+
+    def test_blocked_counts_as_an_outage_a_missing_page_doesnt(self):
+        from unittest import mock
+        def err(code):
+            return urllib.error.HTTPError("u", code, "x", {}, None)
+        for side_effect, paused in (([err(403), err(403)], True), ([err(401), err(401)], True),
+                                    ([TimeoutError(), err(404)], True), ([err(404), TimeoutError()], True),
+                                    ([err(404), err(404)], False)):
+            _arbbot._KALSHI_STATE.update(pause_until=0.0, fails=0)
+            _arbbot._ESPN_CACHE.clear()
+            with mock.patch("arbbot._get_json", side_effect=side_effect + [err(404)] * 4):
+                report = {}
+                self.assertEqual(self.fair([self.game()], report=report), {})
+            self.assertEqual(_arbbot._KALSHI_STATE["pause_until"] > 0, paused, side_effect)
+            if paused:
+                self.assertIn("couldn't reach Kalshi", report["nfl1"][1])
 
     def test_depth_must_be_shown(self):
         report = {}
