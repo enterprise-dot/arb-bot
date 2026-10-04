@@ -121,11 +121,40 @@ the more likely that is. Bet fast, and expect the occasional void.
 ## Locks mode (default)
 
 The bot only sends alerts worth acting on: arbs that lock in **2%+** ($2 per $100, **5%+ when
-live**), +EV bets of **5%+ at high confidence**, props at **8%+**, outliers at **15%+** (**20%+
-when live**), and 2-leg parlays at **15%+**. At most 4 arb, 6 +EV, 6 prop, 6 outlier and 2 parlay
-alerts go out an hour, and **3 live alerts an hour in all**. Your own stricter settings in `.env`
-still win. Set `ALERT_MODE=balanced` to use your own thresholds instead (that's also the way to
-loosen any of these).
+live**), +EV bets of **5%+ at high confidence** (before the game **3.5%+** when two sharp sources
+agree, see below), props at **8%+**, outliers at **15%+** (**20%+ when live**), and 2-leg parlays at
+**15%+**. At most 4 arb, 6 +EV, 6 prop, 6 outlier and 2 parlay alerts go out an hour, and **3 live
+alerts an hour in all**. Your own stricter settings in `.env` still win. Set `ALERT_MODE=balanced`
+to use your own thresholds instead (that's also the way to loosen any of these).
+
+**Pre-game bets from 3.5% when two sharp books agree.** Lines before the game are efficient, so few
+bets get to 5% against Pinnacle. A moneyline, spread or total for a game that starts within 24 hours
+(`CONFIDENT_HOURS`) can go out from **3.5%** (college games **4.5%**) when a second sharp source puts
+the fair odds where Pinnacle does:
+
+- **Moneylines:** Kalshi's chance to win is within 1.5 points of Pinnacle's (`KALSHI_CONFIRM_PTS`).
+  No usable Kalshi price, or a bet at Kalshi itself, means no.
+- **Spreads and totals:** the middle price of at least 4 other sportsbooks is within 1.5 points of
+  Pinnacle's (`CONSENSUS_CONFIRM_PTS`). The book you'd bet at, exchanges like Kalshi and a second
+  sister book (BetOnline.ag and LowVig.ag count as one) don't count toward the 4.
+
+Nothing else gets easier. It still has to be **high confidence** (never medium, even if you set
+`MIN_CONFIDENCE` lower), Pinnacle's line can't be moving against it (1.5+ points in the last hour),
+and every other check stays: Kalshi's usual check, your books (`MY_BOOKS`), New York's rules, price
+age, `MAX_EV_PCT`, `EV_MAX_ODDS` and the +EV hourly cap (5%+ bets go first). Props, outliers and
+parlays don't get the lower edge (and these bets are never a parlay leg). The card says **✅✅ Two
+sharp books agree: Pinnacle and Kalshi** (or "Pinnacle and the other books") with a line on why the
+smaller edge is fine. The stake is the usual Kelly stake, so the smaller edge already makes it
+smaller. A bet that clears 5% anyway is a normal bet.
+
+`PREGAME_CONFIRMED_EV_PCT` sets that edge: empty means 3.5 in locks mode and off in the other modes,
+0 turns it off. In locks mode your own value is used only when it's stricter: a higher edge, or 0.
+`KALSHI_CONFIRM_PTS` and `CONSENSUS_CONFIRM_PTS` work the same way (a smaller number is stricter).
+`ev_bets.csv` and `markouts.csv` mark these bets `tier=confirmed`, the CLV tables and the weekly
+report card show them as their own group, "Confirmed pre-game (3.5%+)", and the card suggests
+`PREGAME_CONFIRMED_EV_PCT=0` if 50+ of them lose to the closing line. The console line after each
+check says how many went out and why the near misses didn't, e.g. `✅✅ confirmed pre-game: 1 sent,
+3 near misses (2 no Kalshi price, 1 not high confidence)`.
 
 **Props Pinnacle doesn't price can be locks too.** Their fair odds are the median of the other
 books, so the bot checks how much those books agree instead of Pinnacle's margin. A lock needs all
@@ -200,7 +229,8 @@ The console line after each check says what was held back and why, e.g.
   under 60 seconds old (see "Alert mix" above).
 - **CLV tracking** shows whether the bets beat the closing line, broken down by bet type, market,
   book, sport, confidence and where the fair price came from (`--results`, and the daily summary
-  card). `ev_bets.csv` and `outliers.csv` say whose fair odds each bet used (`fair_from`). A prop's
+  card). `ev_bets.csv` and `outliers.csv` say whose fair odds each bet used (`fair_from`), and
+  `tier=confirmed` marks a confirmed pre-game bet (see "Locks mode"). A prop's
   closing line follows the same rules as its alert, with the alerted book left out.
 - **Restarts don't repeat alerts**: open alerts are remembered, so an update edits the existing
   cards instead of posting them again.
@@ -303,17 +333,18 @@ python arbbot.py --post-weekly          # post it to the results channel now
 
 **📋 Weekly report card (Mondays).** Every Monday at the daily summary time (`SUMMARY_HOUR`; -1 turns
 it off too) the results channel (or the health channel, without one) gets the last 7 days for each
-alert type: pre-game arbs, live arbs, +EV, outliers, props and parlays. For each: the record and
-profit at the stakes shown (arbs: what they locked in at `BANKROLL`, each arb once a day, as in the
-daily recaps), ROI, CLV for pre-game bets, whether the edge held a few minutes later (📏 markouts and
-how often the price was still there), and how many alerts the hourly caps and live rules held back
-(each alert once a day, however many checks held it back). Then suggestions in plain English, for
-example:
+alert type: pre-game arbs, live arbs, +EV (with confirmed pre-game bets on a line of their own),
+outliers, props and parlays. For each: the record and profit at the stakes shown (arbs: what they
+locked in at `BANKROLL`, each arb once a day, as in the daily recaps), ROI, CLV for pre-game bets,
+whether the edge held a few minutes later (📏 markouts and how often the price was still there), and
+how many alerts the hourly caps and live rules held back (each alert once a day, however many checks
+held it back). Then suggestions in plain English, for example:
 
 ```
 • Live outliers: 64 bets, sent +22.0% → -1.1% ~3 min later (still there 38%) → consider OUTLIER_LIVE=false
 • Props with no Pinnacle price: CLV +3.1%, beat the close 68% over 22 bets → keep
 • Pre-game outliers: CLV +0.4%, beat the close 50% → too early to tell (12 bets)
+• Confirmed pre-game (3.5%+): CLV -0.8%, beat the close 41% over 56 bets → consider PREGAME_CONFIRMED_EV_PCT=0
 ```
 
 A change is only suggested on enough bets, by the rules the bot already uses: live alert types by

@@ -5857,7 +5857,9 @@ class PropsInLocks(MixFiles):
                      now=NOW.timestamp() + 1860 * i)
         self.assertEqual([m for m, *_ in sent], ["POST"])
         del sent[:]
-        again = self.alerter(sent, cfg)                                            # restart: a fresh price history
+        from unittest import mock
+        with mock.patch("arbbot.time.time", return_value=NOW.timestamp() + 1860 * 2):   # (saved state is kept a day)
+            again = self.alerter(sent, cfg)                                        # restart: a fresh price history
         self.assertEqual(len(again.restored), 1)
         bets = find_evs([keyed_prop(LOCK_SIX)], cfg, at(1860 * 2), prices=_arbbot.PriceHistory(),
                         keep=set(again.open) | set(again.restored))
@@ -8129,6 +8131,392 @@ class AfterTax(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TAX_RATE": "33"}), self.assertRaises(ValueError) as e:
             Config.from_env()
         self.assertIn("TAX_RATE=33 should be a fraction like 0.33", str(e.exception))
+
+
+# --------------------------------------------------------------------------- confirmed pre-game bets
+
+AGREE = {"e1": {"Home": (0.505, 0.50, 0.51)}}   # Kalshi: Home 50.5% to win (Pinnacle's no-vig: 50.0%)
+
+
+def confirm_event(bet=2.08, market="h2h", others=("C", "D", "E", "F"), other=(1.95, 1.95), pin=(1.95, 1.95),
+                  start="2026-10-03T18:00:00Z", sport="icehockey_nhl", extra=None, gid="e1"):
+    """Pinnacle (key 'pinnacle') at pin: a 50/50 game. Book B has the first side at `bet` (2.08: +4.0%),
+    the other books are at `other` (extra: {title: prices} on top). A moneyline, a spread (Home -3.5)
+    or a total (Over 5.5), six hours before the game (NOW)."""
+    pt = {"h2h": (None, None), "spreads": (-3.5, 3.5), "totals": (5.5, 5.5)}[market]
+    names = ("Over", "Under") if market == "totals" else ("Home", "Away")
+    outs = lambda h, a: [(names[0], h, pt[0]), (names[1], a, pt[1])]
+    books = {"Pinnacle": [(market, outs(*pin))], "B": [(market, outs(bet, 1.80))]}
+    books.update({t: [(market, outs(*p))] for t, p in {**{t: other for t in others}, **(extra or {})}.items()})
+    ev = event(books, start=start)
+    ev["bookmakers"][0]["key"] = "pinnacle"
+    ev.update(sport_key=sport, id=gid)
+    return ev
+
+
+class ConfirmedPreGame(MixFiles):
+    """Locks: a pre-game moneyline, spread or total under 5% (down to 3.5%, college 4.5%) goes out only when
+    a second sharp source agrees with Pinnacle's fair price, at high confidence, with every other check
+    as it was. One over 5% is a normal bet, exactly as before."""
+
+    def locks(self, base=None, **kw):
+        return self.cfg(base or Config(round_stakes=0), **kw).with_mode()
+
+    def evs(self, ev, cfg=None, kalshi=None, history=None):
+        """(find_evs's bets, the near misses it counted)."""
+        misses = {}
+        bets = find_evs([ev], cfg or self.locks(), NOW, history=history, kalshi=kalshi, confirm_misses=misses)
+        return bets, misses
+
+    # ---- settings
+    def test_locks_values_and_yours_win_only_when_stricter(self):
+        import os
+        from unittest import mock
+        c = Config().with_mode()
+        self.assertEqual((c.pregame_confirmed_ev_pct, c.kalshi_confirm_pts, c.consensus_confirm_pts), (3.5, 1.5, 1.5))
+        self.assertEqual((c.confirmed_floor("icehockey_nhl"), c.confirmed_floor("americanfootball_ncaaf"),
+                          c.confirmed_floor("basketball_ncaab")), (3.5, 4.5, 4.5))
+        for mine, used in ((None, 3.5), (0, 0), (2.5, 3.5), (4.0, 4.0)):              # a higher edge, or 0 (off)
+            self.assertEqual(Config(pregame_confirmed_ev_pct=mine).with_mode().pregame_confirmed_ev_pct, used, mine)
+        self.assertEqual(Config(pregame_confirmed_ev_pct=0).with_mode().confirmed_floor("americanfootball_ncaaf"), 0)
+        tight = Config(kalshi_confirm_pts=1.0, consensus_confirm_pts=1.25).with_mode()      # fewer points: stricter
+        self.assertEqual((tight.kalshi_confirm_pts, tight.consensus_confirm_pts), (1.0, 1.25))
+        loose = Config(kalshi_confirm_pts=3.0, consensus_confirm_pts=2.5).with_mode()
+        self.assertEqual((loose.kalshi_confirm_pts, loose.consensus_confirm_pts), (1.5, 1.5))
+        plain = Config(alert_mode="balanced", consensus_confirm_pts=3.0).with_mode()
+        self.assertEqual((plain.pregame_confirmed_ev_pct, plain.consensus_confirm_pts), (0, 3.0))   # off outside locks
+        self.assertEqual(plain.confirmed_floor("icehockey_nhl"), 0)
+        self.assertEqual(Config(alert_mode="balanced", pregame_confirmed_ev_pct=3).with_mode().pregame_confirmed_ev_pct, 3)
+        env = {"ALERT_MODE": "locks", "PREGAME_CONFIRMED_EV_PCT": "", "KALSHI_CONFIRM_PTS": "1", "CONSENSUS_CONFIRM_PTS": ""}
+        with mock.patch.dict(os.environ, env):
+            e = Config.from_env()
+        self.assertEqual((e.pregame_confirmed_ev_pct, e.kalshi_confirm_pts, e.consensus_confirm_pts), (3.5, 1.0, 1.5))
+        with mock.patch.dict(os.environ, {**env, "CONSENSUS_CONFIRM_PTS": "1.25"}):
+            self.assertEqual(Config.from_env().consensus_confirm_pts, 1.25)
+        with mock.patch.dict(os.environ, {**env, "PREGAME_CONFIRMED_EV_PCT": "4.25"}):
+            self.assertEqual(Config.from_env().pregame_confirmed_ev_pct, 4.25)
+        with mock.patch.dict(os.environ, {**env, "ALERT_MODE": "balanced"}):
+            self.assertEqual(Config.from_env().pregame_confirmed_ev_pct, 0)
+        for key, bad, says in (("PREGAME_CONFIRMED_EV_PCT", "-1", "should be 0 (off) or an edge like 3.5"),
+                               ("KALSHI_CONFIRM_PTS", "-0.5", "should be 0 or more"),
+                               ("CONSENSUS_CONFIRM_PTS", "-2", "should be 0 or more")):
+            with mock.patch.dict(os.environ, {key: bad}), self.assertRaises(ValueError) as ex:
+                Config.from_env()
+            self.assertIn(f"{key}={bad} {says}", str(ex.exception))
+        self.assertIn("+EV 5%+ high-confidence only (pre-game 3.5%+ when Kalshi or 4+ other books agree with "
+                      "Pinnacle), props", _arbbot.mode_line(c))
+        self.assertIn("+EV 5%+ high-confidence only, props",
+                      _arbbot.mode_line(Config(pregame_confirmed_ev_pct=0).with_mode()))
+
+    # ---- moneylines: Kalshi must agree
+    def test_a_4_pct_moneyline_with_kalshi_agreeing_alerts_in_locks(self):
+        [b], misses = self.evs(confirm_event(), kalshi=AGREE)
+        self.assertEqual((b.book, b.pick, round(b.ev_pct, 2), b.confidence), ("B", "Home ML", 4.0, "high"))
+        self.assertEqual((b.tier, b.confirm, misses), ("confirmed", ("Kalshi", 0.505, 5.0), {}))
+        self.assertEqual(b.stake, kelly_stake(0.5, 2.08, self.locks()))     # normal Kelly: the smaller edge makes it
+        self.assertEqual(b.stake, 9.0)                                       # smaller (a 5.5% bet: $12)
+        card = ev_payload(b)["embeds"][0]
+        self.assertEqual(card["title"], "📈 +EV 4.0% ✅✅ · Home ML +108 at B")
+        self.assertIn("Confidence: **🟢 High** · tight sharp market (2.6% margin), other books agree, Kalshi agrees\n\n"
+                      "**✅✅ Two sharp books agree: Pinnacle and Kalshi**\n"
+                      "A smaller edge than the usual 5% is OK here: both give it almost the same chance to win "
+                      "(Pinnacle 50.0%, Kalshi 50.5%).", card["description"])
+        self.assertIn("\n  ✅✅ Two sharp books agree: Pinnacle and Kalshi. A smaller edge than the usual 5%",
+                      _arbbot.format_ev_text(b))
+        self.assertEqual(self.evs(confirm_event(), self.locks(my_books="c,d"), kalshi=AGREE), ([], {}))  # still your books only
+        # Just 1.5 points apart is close enough.
+        self.assertEqual(self.evs(confirm_event(), kalshi={"e1": {"Home": (0.515, 0.51, 0.52)}})[0][0].tier, "confirmed")
+
+    def test_kalshi_2_5_points_off_does_not_alert(self):
+        off = {"e1": {"Home": (0.525, 0.52, 0.53)}}                    # the usual Kalshi check allows 3 points
+        self.assertEqual(self.evs(confirm_event(), kalshi=off), ([], {"Kalshi too far off": 1}))
+        self.assertEqual(self.evs(confirm_event(), kalshi={"e1": {"Home": (0.535, 0.53, 0.54)}}),
+                         ([], {"Kalshi too far off": 1}))               # (past the usual check: counted the same)
+        self.assertEqual(self.evs(confirm_event(), kalshi={"e1": {"Home": (0.475, 0.47, 0.48)}}),
+                         ([], {"Kalshi says the price isn't good": 1}))
+        self.assertEqual(self.evs(confirm_event(), self.locks(kalshi_confirm_pts=1.0),
+                                  kalshi={"e1": {"Home": (0.515, 0.51, 0.52)}}), ([], {"Kalshi too far off": 1}))
+        loose = self.cfg(Config(alert_mode="balanced", min_ev_pct=5, pregame_confirmed_ev_pct=3.5, kalshi_confirm_pts=3,
+                                min_confidence="high", round_stakes=0)).with_mode()
+        self.assertEqual(self.evs(confirm_event(), loose, kalshi=off)[0][0].tier, "confirmed")   # KALSHI_CONFIRM_PTS=3
+
+    def test_no_kalshi_price_does_not_alert(self):
+        self.assertEqual(self.evs(confirm_event()), ([], {"no Kalshi price": 1}))
+        self.assertEqual(self.evs(confirm_event(), kalshi={"e1": {"Away": (0.495, 0.49, 0.50)}}),
+                         ([], {"no Kalshi price": 1}))
+        at_kalshi = confirm_event()
+        at_kalshi["bookmakers"][1].update(key="kalshi", title="Kalshi")      # Kalshi's own quote can't confirm it
+        self.assertEqual(self.evs(at_kalshi, kalshi={"e1": {"Home": (0.455, 0.45, 0.46)}}), ([], {"bet is at Kalshi": 1}))
+
+    # ---- spreads and totals: 4+ other sportsbooks must agree
+    def test_a_4_pct_spread_with_a_tight_4_book_consensus_alerts(self):
+        [b], misses = self.evs(confirm_event(market="spreads"))
+        self.assertEqual((b.pick, b.tier, b.confirm, b.confidence, misses),
+                         ("Home -3.5", "confirmed", ("the other books", 0.5, 5.0), "high", {}))
+        self.assertIn("**✅✅ Two sharp books agree: Pinnacle and the other books**\nA smaller edge than the usual 5% "
+                      "is OK here: both give it almost the same chance to win (Pinnacle 50.0%, the other books 50.0%).",
+                      ev_payload(b)["embeds"][0]["description"])
+        [t], _ = self.evs(confirm_event(market="totals"))
+        self.assertEqual((t.pick, t.tier), ("Over 5.5", "confirmed"))
+        both = confirm_event(market="spreads", others=("C", "D", "E", "betonlineag", "lowvig"))
+        self.assertEqual(self.evs(both)[0][0].tier, "confirmed")          # BetOnline.ag and LowVig.ag: one of four
+
+    def test_a_3_book_consensus_does_not_alert(self):
+        three = confirm_event(market="spreads", others=("C", "D", "E"))
+        self.assertEqual(self.evs(three), ([], {"under 4 other sportsbooks": 1}))    # B itself never counts
+        for others in (("C", "D", "E", "novig"),                     # an exchange isn't a sportsbook
+                       ("C", "D", "betonlineag", "lowvig")):         # sister books are one
+            self.assertEqual(self.evs(confirm_event(market="spreads", others=others)),
+                             ([], {"under 4 other sportsbooks": 1}), others)
+        far = confirm_event(market="spreads", other=(1.88, 2.02))         # four, but 1.9 points from Pinnacle
+        self.assertEqual(self.evs(far), ([], {"other books too far off": 1}))
+        loose = self.cfg(Config(alert_mode="balanced", min_ev_pct=5, pregame_confirmed_ev_pct=3.5,
+                                consensus_confirm_pts=2, min_confidence="high", round_stakes=0)).with_mode()
+        self.assertEqual(self.evs(far, loose)[0][0].tier, "confirmed")     # CONSENSUS_CONFIRM_PTS=2
+
+    # ---- the game: before it starts, within a day
+    def test_a_live_game_does_not_alert(self):
+        cfg = self.locks(ev_live=True)
+        self.assertEqual(self.evs(confirm_event(market="spreads", start=STARTED), cfg), ([], {}))
+        [five], _ = self.evs(confirm_event(market="spreads", start=STARTED, bet=2.11), cfg)   # 5.5%: as before
+        self.assertEqual((five.tier, five.is_live), ("", True))
+
+    def test_a_game_30_hours_out_does_not_alert(self):
+        far = "2026-10-04T18:00:00Z"
+        self.assertEqual(self.evs(confirm_event(market="spreads", start=far)), ([], {}))
+        [five], _ = self.evs(confirm_event(market="spreads", start=far, bet=2.11))           # high even so
+        self.assertEqual((five.tier, five.confidence), ("", "high"))
+        [near], _ = self.evs(confirm_event(market="spreads", start="2026-10-04T11:00:00Z"))  # 23 hours: fine
+        self.assertEqual(near.tier, "confirmed")
+        self.assertEqual(self.evs(confirm_event(market="spreads", start="2026-10-04T11:00:00Z"),
+                                  self.locks(confident_hours=12)), ([], {}))                 # CONFIDENT_HOURS
+
+    def test_a_sharp_line_moving_against_it_does_not_alert(self):
+        h = _arbbot.SharpHistory(60)
+        h.record(("e1", "h2h", None, "Home"), NOW - timedelta(minutes=20), 0.52)   # Pinnacle had Home at 52%
+        self.assertEqual(self.evs(confirm_event(), kalshi=AGREE, history=h), ([], {"sharp line moving against it": 1}))
+        toward = _arbbot.SharpHistory(60)
+        toward.record(("e1", "h2h", None, "Home"), NOW - timedelta(minutes=20), 0.48)
+        [b], _ = self.evs(confirm_event(), kalshi=AGREE, history=toward)            # toward the bet: fine
+        self.assertEqual((b.tier, b.confidence_notes[0]), ("confirmed", "sharp line moving this way (+2.0 pts)"))
+        small = _arbbot.SharpHistory(60)
+        small.record(("e1", "h2h", None, "Home"), NOW - timedelta(minutes=20), 0.51)   # 1 point: not a move
+        self.assertEqual(self.evs(confirm_event(), kalshi=AGREE, history=small)[0][0].tier, "confirmed")
+
+    def test_college_needs_4_5(self):
+        ncaa = lambda bet: confirm_event(bet=bet, sport="americanfootball_ncaaf")
+        self.assertEqual(self.evs(ncaa(2.08), kalshi=AGREE), ([], {}))                     # 4.0%
+        [b], _ = self.evs(ncaa(2.094), kalshi=AGREE)                                      # 4.7%
+        self.assertEqual((b.tier, b.confirm), ("confirmed", ("Kalshi", 0.505, 6.0)))
+        self.assertIn("A smaller edge than the usual 6% is OK here", ev_payload(b)["embeds"][0]["description"])
+
+    def test_props_and_outliers_are_unaffected(self):
+        def prop(bet):
+            ev = prop_event({"Pinnacle": (1.95, 1.95), "B": (bet, 1.80), "C": (1.95, 1.95), "D": (1.95, 1.95),
+                             "E": (1.95, 1.95), "F": (1.95, 1.95)})
+            ev["bookmakers"][0]["key"] = "pinnacle"
+            return ev
+        self.assertEqual(self.evs(prop(2.08)), ([], {}))                        # 4%, four books agree: no
+        [five], _ = self.evs(prop(2.11))
+        self.assertEqual((five.pick, five.tier), ("LeBron James Over 25.5 Points", ""))
+        self.assertEqual(self.evs(prop(2.08), self.locks().for_props()), ([], {}))
+        alt = confirm_event(market="spreads")
+        for bm in alt["bookmakers"]:
+            bm["markets"][0]["key"] = "alternate_spreads"                        # main lines only
+        self.assertEqual(self.evs(alt), ([], {}))
+        for start in ("2026-10-03T11:00:00Z", "2026-10-03T18:00:00Z"):
+            ev = outlier_event(1.85, 1.95, start=start)
+            self.assertEqual([(o.book, o.price) for o in find_outliers([ev], self.locks(), NOW)],
+                             [(o.book, o.price) for o in find_outliers([ev], self.locks(pregame_confirmed_ev_pct=0), NOW)])
+        self.assertEqual(find_outliers([confirm_event(market="spreads")], self.locks(), NOW), [])
+
+    def test_a_medium_confidence_4_pct_bet_never_alerts(self):
+        medium = confirm_event(pin=(1.87, 1.87), other=(1.75, 2.0))      # a wide Pinnacle market, the books 3.5 pts off
+        self.assertEqual(self.evs(medium, kalshi=AGREE), ([], {"not high confidence": 1}))
+        loose = self.cfg(Config(alert_mode="balanced", min_ev_pct=5, pregame_confirmed_ev_pct=3.5,
+                                round_stakes=0)).with_mode()                # MIN_CONFIDENCE=low
+        self.assertEqual(self.evs(medium, loose, kalshi=AGREE), ([], {"not high confidence": 1}))
+        [five], _ = self.evs(confirm_event(pin=(1.87, 1.87), other=(1.75, 2.0), bet=2.11), loose, kalshi=AGREE)
+        self.assertEqual((five.tier, five.confidence), ("", "medium"))       # a normal bet: MIN_CONFIDENCE decides
+
+    def test_the_5_pct_path_is_unchanged(self):
+        ev = confirm_event(bet=2.11, extra={"G": (2.08, 1.80)})              # B: 5.5%, G: 4.0%
+        off = {"e1": {"Home": (0.525, 0.52, 0.53)}}                          # Kalshi 2.5 points away: no matter
+        [b], misses = self.evs(ev, kalshi=off)
+        self.assertEqual((b.book, b.tier, b.confirm, b.also, misses), ("B", "", (), [], {}))   # G's 4% isn't listed
+        [before] = find_evs([ev], self.locks(pregame_confirmed_ev_pct=0), NOW, kalshi=off)
+        card = lambda x: {k: v for k, v in ev_payload(x)["embeds"][0].items() if k != "timestamp"}
+        self.assertEqual(card(b), card(before))
+        self.assertEqual(_arbbot.format_ev_text(b), _arbbot.format_ev_text(before))
+        self.assertNotIn("✅✅", str(ev_payload(b)))
+        [c], misses = self.evs(ev)                                             # no Kalshi price at all
+        self.assertEqual((c.tier, misses), ("", {}))
+        [d], _ = self.evs(confirm_event(bet=2.11), kalshi=AGREE)              # agreeing too: still a normal bet
+        self.assertEqual((d.tier, d.stake), ("", 12.0))
+
+    def test_off_and_outside_locks(self):
+        self.assertEqual(self.evs(confirm_event(), self.locks(pregame_confirmed_ev_pct=0), kalshi=AGREE), ([], {}))
+        self.assertEqual(self.evs(confirm_event(), self.locks(pregame_confirmed_ev_pct=4.5), kalshi=AGREE), ([], {}))
+        over = self.locks(pregame_confirmed_ev_pct=6)                           # over MIN_EV_PCT: nothing changes
+        self.assertEqual(self.evs(confirm_event(), over, kalshi=AGREE), ([], {}))
+        self.assertEqual(self.evs(confirm_event(bet=2.11), over)[0][0].tier, "")
+        plain = self.cfg(Config(alert_mode="balanced", min_ev_pct=5, min_confidence="high", round_stakes=0)).with_mode()
+        self.assertEqual(self.evs(confirm_event(), plain, kalshi=AGREE), ([], {}))
+        self.assertEqual(self.evs(confirm_event(), replace(plain, pregame_confirmed_ev_pct=3.5), kalshi=AGREE)[0][0].tier,
+                         "confirmed")
+        self.assertEqual(find_evs([confirm_event()], Config(min_ev_pct=5), NOW, kalshi=AGREE), [])   # no mode applied
+
+    # ---- the caps, the logs and the reports
+    def test_it_counts_toward_the_hourly_cap_after_the_5_pct_ones(self):
+        a = EVAlerter(self.locks(), dry_run=True)
+        a.max_per_hour = 1
+        [four], _ = self.evs(confirm_event(), kalshi=AGREE)
+        [five], _ = self.evs(confirm_event(bet=2.11, gid="e2"))
+        self.assertEqual(a.handle([four, five], now=1000), 1)
+        self.assertEqual([op.arb.event_id for op in a.open.values()], ["e2"])
+        self.assertEqual(a.held_counts, {"capped": 1})
+
+    def test_logged_with_its_tier_and_followed_by_markouts(self):
+        from arbbot import EV_LOG_FIELDS, MarkoutTracker
+        cfg = self.locks()
+        old = {f: "" for f in EV_LOG_FIELDS[:-1]}
+        append_csv(cfg.ev_log_file, EV_LOG_FIELDS[:-1], {**old, "event_id": "old", "market": "h2h"})   # before `tier`
+        a = EVAlerter(cfg, dry_run=True)
+        [four], _ = self.evs(confirm_event(), kalshi=AGREE)
+        [five], _ = self.evs(confirm_event(bet=2.11, gid="e2"))
+        a.handle([four, five], now=1000)
+        rows = _read(cfg.ev_log_file)
+        self.assertEqual(list(rows[0])[-1], "tier")
+        self.assertEqual([(r["event_id"], r["tier"]) for r in rows], [("old", ""), ("e2", ""), ("e1", "confirmed")])
+        mk = MarkoutTracker(cfg)
+        mk.add(four, NOW.timestamp(), "ev")
+        mk.add(five, NOW.timestamp(), "ev")
+        self.assertEqual(mk.finalize(datetime(2026, 10, 3, 18, 1, tzinfo=timezone.utc)), 2)   # the game started
+        self.assertEqual([(r["bet_id"], r["tier"]) for r in _read(cfg.markout_file)],
+                         [("e1|h2h|Home|", "confirmed"), ("e2|h2h|Home|", "")])
+
+    def logged(self, i, tier, close=0.49, start="2026-10-03T18:00:00Z"):
+        from arbbot import EV_LOG_FIELDS, CLOSING_FIELDS
+        r = {"first_seen": "2026-10-03T12:00:00+00:00", "event_id": f"g{i}", "sport": "NHL",
+             "sport_key": "icehockey_nhl", "matchup": "A @ H", "home_team": "H", "away_team": "A",
+             "commence_time": start, "live": False, "market": "h2h", "outcome": "H", "point": "", "n_outcomes": 2,
+             "book": "DraftKings", "price": 2.08, "fair_odds": 2.0, "best_ev_pct": 4, "stake": 10, "player": "",
+             "confidence": "high", "fair_from": "Pinnacle", "tier": tier}
+        append_csv(self.files["ev_log_file"], EV_LOG_FIELDS, r)
+        append_csv(self.files["closing_file"], CLOSING_FIELDS,
+                   {"bet_id": _arbbot._bet_id(r), "closing_fair_prob": close, "closing_fair_odds": 1 / close})
+        return r
+
+    def test_clv_shows_them_as_their_own_group(self):
+        for i, tier in enumerate(["confirmed", "confirmed", ""]):
+            self.logged(i, tier)
+        cfg = self.locks()
+        self.assertEqual([(name, n) for name, n, *_ in _arbbot.clv_breakdown(cfg)["Bet type"]],
+                         [("Confirmed pre-game (3.5%+)", 2), ("+EV", 1)])
+        self.assertIn("    Confirmed pre-game (3.5%+)    2 bets   CLV  +1.9%   beat close 100%", _arbbot.clv_report(cfg))
+        self.assertEqual(_arbbot.clv_breakdown(self.locks(pregame_confirmed_ev_pct=4))["Bet type"][0][0],
+                         "Confirmed pre-game (4%+)")
+        board = _arbbot.scoreboard_text(cfg, NOW)
+        self.assertIn("\n  Confirmed pre-game (3.5%+)   2   +1.9%  100%\n", board)             # not cut short
+        self.assertIn(f"```\n{'':30}bets   CLV  beat\nBet type\n", board)
+        self.assertNotIn("Confirmed pre-ga\n", board)
+
+    def week_bet(self, i, tier="", result="win", close=0.51):
+        from arbbot import RESULT_FIELDS
+        r = self.logged(i, tier, close, start="2026-10-01T23:00:00Z")
+        append_csv(self.files["ev_results_file"], RESULT_FIELDS,
+                   {**r, "kind": "ev", "result": result, "profit": 10.8 if result == "win" else -10})
+
+    def test_the_weekly_card_shows_them_with_their_own_suggestion(self):
+        for i, (tier, result) in enumerate([("confirmed", "win"), ("confirmed", "loss"), ("confirmed", "win"),
+                                            ("", "win")]):
+            self.week_bet(i, tier, result)
+        title, text, _ = _arbbot.weekly_text(self.locks(), datetime(2026, 10, 5).date(), {})
+        self.assertIn("📈 **+EV** · 3-1 · +$22.40 on $40 staked (ROI +56.0%)\n"
+                      "📐 CLV (pre-game): avg +6.1%, beat the close on 100% of 4 bets\n"
+                      "✅✅ Confirmed pre-game (3.5%+): 2-1 · +$11.60 on $30 staked (ROI +38.7%) · "
+                      "CLV avg +6.1%, beat the close on 100% of 3 bets\n📏", text)
+        self.assertIn("• Pre-game +EV: CLV +6.1%, beat the close 100% → too early to tell (1 bet)\n"
+                      "• Confirmed pre-game (3.5%+): CLV +6.1%, beat the close 100% → too early to tell (3 bets)", text)
+        tips = lambda clv: _arbbot.weekly_suggestions(self.locks(), clv, [])
+        row = lambda tier, pct: {"kind": "ev", "player": "", "fair_from": "Pinnacle", "tier": tier, "clv_pct": pct,
+                                 "beat_close": pct > 0}
+        self.assertEqual(tips([row("confirmed", -2.0)] * 60 + [row("", 3.0)] * 5),
+                         ["Pre-game +EV: CLV +3.0%, beat the close 100% over 5 bets → keep",
+                          "Confirmed pre-game (3.5%+): CLV -2.0%, beat the close 0% over 60 bets → consider "
+                          "PREGAME_CONFIRMED_EV_PCT=0"])
+        self.assertEqual(tips([row("confirmed", -2.0)] * 49),
+                         ["Confirmed pre-game (3.5%+): CLV -2.0%, beat the close 0% → too early to tell (49 bets)"])
+        self.assertEqual(tips([row("confirmed", 1.0)] * 60),
+                         ["Confirmed pre-game (3.5%+): CLV +1.0%, beat the close 100% over 60 bets → keep"])
+
+    def test_the_console_says_what_went_out_and_what_missed(self):
+        self.assertEqual(_arbbot.confirmed_text(0, {}), "")
+        self.assertEqual(_arbbot.confirmed_text(1, {}), " | ✅✅ confirmed pre-game: 1 sent")
+        self.assertEqual(_arbbot.confirmed_text(0, {"no Kalshi price": 2, "not high confidence": 3, "Kalshi too far off": 2}),
+                         " | ✅✅ confirmed pre-game: 0 sent, 7 near misses (3 not high confidence, 2 Kalshi too far off, "
+                         "2 no Kalshi price)")
+        t = _arbbot.Trackers(self.locks(), self.args())
+        games = [confirm_event(market="spreads"), confirm_event(gid="e2"), confirm_event(bet=2.11, gid="e3")]
+        res = _arbbot.scan_main(t, games, ["icehockey_nhl"], NOW, kalshi=False)
+        self.assertEqual((res.ev_sent, res.confirmed_sent, res.confirm_misses), (2, 1, {"no Kalshi price": 1}))
+        again = _arbbot.scan_main(t, games, ["icehockey_nhl"], NOW + timedelta(minutes=15), kalshi=False)
+        self.assertEqual((again.ev_sent, again.confirmed_sent), (0, 0))       # already up: not sent again
+
+    def test_run_prints_it_on_the_check_line(self):
+        import argparse, contextlib, io
+        from unittest import mock
+        real = datetime.now(timezone.utc)
+        start = (real + timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        secs = (real - NOW).total_seconds()
+
+        class Api:
+            remaining, used = 50000.0, None
+
+            def __init__(self, cfg):
+                pass
+
+            def events(self, sport, horizon_hours=26):
+                return [{"id": "e1", "commence_time": start}, {"id": "e2", "commence_time": start}]
+
+            def odds(self, sport, until, markets=None, since=None, kind="odds"):
+                games = [confirm_event(market="spreads", start=start), confirm_event(start=start, gid="e2")]
+                return asked([stamped(g, secs) for g in games], markets, since)
+
+        cfg = self.locks(sports=["icehockey_nhl"], props_enabled=False, kalshi_check=False)
+        args = argparse.Namespace(once=True, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        with mock.patch("arbbot.OddsAPI", Api), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        self.assertIn(" | 1 +EV, 1 new | ✅✅ confirmed pre-game: 1 sent, 1 near miss (1 no Kalshi price) | ",
+                      out.getvalue())
+
+    def test_the_demo_shows_its_near_miss(self):
+        import contextlib, io
+        from unittest import mock
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch("arbbot.kalshi_fair", side_effect=AssertionError("network")):
+            _arbbot.run(self.locks(), SimpleNamespace(demo=True, dry_run=True), None)
+        self.assertIn("[demo] 1 arb(s), 0 +EV bet(s), 1 outlier(s) in sample data (2 checks: live alerts go out once 2 "
+                      "checks in a row find them) | ✅✅ confirmed pre-game: 0 sent, 1 near miss (1 no Kalshi price)\n",
+                      out.getvalue())                                     # (the demo doesn't ask Kalshi)
+        self.assertEqual(list(Path(self.d).iterdir()), [])
+
+    def test_the_pinned_guide_explains_the_card(self):
+        g = _arbbot.guide_payload()["embeds"][0]["description"]
+        self.assertIn("✅✅ **Two sharp books agree** means Pinnacle and Kalshi (or Pinnacle and 4+ other books) give "
+                      "almost the same chance to win, so a smaller edge (from 3.5%) is still a lock.", g)
+        self.assertLessEqual(len(g), 4096)                                   # a Discord card's limit
+
+    def test_parlays_are_built_as_before(self):
+        cfg = self.locks()
+        [four], _ = self.evs(confirm_event(), kalshi=AGREE)
+        [big], _ = self.evs(confirm_event(bet=2.30, gid="e2"))                # 15% at the same book
+        self.assertEqual(find_parlays([four, big], cfg, now=NOW), [])           # a confirmed bet is never a leg
+        self.assertEqual(len(find_parlays([replace(four, tier=""), big], cfg, now=NOW)), 1)   # (a normal one would be)
+        self.assertEqual(find_parlays([four, big], cfg, keep={find_parlays([replace(four, tier=""), big], cfg,
+                                                                           now=NOW)[0].key}, now=NOW), [])
 
 
 # --------------------------------------------------------------------------- no test writes the bot's own files
