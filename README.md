@@ -174,7 +174,8 @@ Check it against real games any time with `python arbbot.py --check-props`. `PRO
 turns it off.
 
 **Scoreboard:** one message at the top of the results channel that the bot keeps editing: today,
-the last 7 days and all time, by bet type and live vs pre-game, plus bet quality (CLV). Pin it.
+the last 7 days and all time, by bet type and live vs pre-game, plus bet quality (CLV) and whether
+alert prices held up (📏 markouts, below). Pin it.
 
 Make a `#results` channel and connect it: `python arbbot.py --set-webhook results`. Without it,
 results go to the bot health channel. On the command line:
@@ -197,6 +198,21 @@ CLV, all time: avg +2.4%, beat the close on 68% of 54 bets      (example)
 
 This assumes you bet every alert at the alerted price. Give it a few hundred bets before judging;
 50 bets is mostly luck.
+
+**Markouts (📏 did the edge hold?)** CLV needs a closing line, so it can't judge live bets (most
+outliers), and win/loss takes thousands of bets to mean anything. So the bot also looks at every
+alert's price again on its next checks of that game: the next check, about 3 minutes later and
+about 10 minutes later (it keeps the real time, since checks slow down on a tight budget). It
+measures your price against the same fair odds the alert used: Pinnacle for +EV, the other books
+for outliers. "Sent +12% → later +3%" means the card said +12% and, a few minutes later, that price
+was still worth 3% more than fair. It also notes whether the book still had the price (at or above
+the skip line) on the next check, and who moved: the book fixing its price (it was slow: a real
+edge) or the other books moving to it (it was just fast: no edge). Saved in `markouts.csv`; shown on
+the scoreboard, in the daily summary and in `--results`, by alert type, book and sport, with a 95%
+range. Each bet counts once, like everywhere else. ✅ = 50+ live bets and above 0 even at the low
+end; ⚠️ = below 0 even at the high end: review that alert type. Pre-game alerts and props get no
+✅/⚠️: they're re-checked only every 15-60 minutes, so CLV is the better test for them. No extra
+credits, no extra pings. `MARKOUT_FILE=` (empty) turns it off.
 
 **Good to know:**
 - **Pre-game only by default.** Live +EV is mostly the feeds updating at different times,

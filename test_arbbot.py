@@ -3,6 +3,7 @@ import time
 import unittest
 import urllib.error
 from dataclasses import replace
+from types import SimpleNamespace
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -642,7 +643,8 @@ class EVLifecycle(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         d = Path(self.tmp.name)
         self.cfg = Config(min_ev_pct=3, ev_log_file=str(d / "ev.csv"), ev_results_file=str(d / "res.csv"),
-                          outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"))
+                          outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"),
+                          markout_file=str(d / "mk.csv"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -767,6 +769,7 @@ class CLV(unittest.TestCase):
         d = Path(self.tmp.name)
         self.cfg = Config(min_ev_pct=3, ev_log_file=str(d / "ev.csv"), ev_results_file=str(d / "res.csv"),
                           outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"),
+                          markout_file=str(d / "mk.csv"),
                           pregame_max_age_seconds=10**9)
 
     def tearDown(self):
@@ -1569,7 +1572,7 @@ class PropClosingLines(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         d = Path(self.tmp.name)
         self.cfg = Config(ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
-                          closing_file=str(d / "close.csv"), pregame_max_age_seconds=10**9)
+                          closing_file=str(d / "close.csv"), markout_file=str(d / "mk.csv"), pregame_max_age_seconds=10**9)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -1661,7 +1664,7 @@ class BetResults(unittest.TestCase):
                           results_webhook_url="https://results", log_file=str(d / "arbs.csv"),
                           ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
                           parlay_log_file=str(d / "par.csv"), ev_results_file=str(d / "res.csv"),
-                          closing_file=str(d / "close.csv"), pregame_max_age_seconds=10**9)
+                          closing_file=str(d / "close.csv"), markout_file=str(d / "mk.csv"), pregame_max_age_seconds=10**9)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -1831,7 +1834,7 @@ class ReviewFixes(unittest.TestCase):
         self.d = d
         self.cfg = Config(webhook_url="https://main", state_dir=str(d / "state"), log_file="", min_ev_pct=3,
                           round_stakes=0, ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
-                          closing_file=str(d / "close.csv"), pregame_max_age_seconds=10**9)
+                          closing_file=str(d / "close.csv"), markout_file=str(d / "mk.csv"), pregame_max_age_seconds=10**9)
         self.sent = []
 
     def tearDown(self):
@@ -2308,7 +2311,8 @@ class PropGrading(unittest.TestCase):
         d = Path(self.tmp.name)
         self.cfg = Config(min_ev_pct=3, round_stakes=0, ev_log_file=str(d / "ev.csv"),
                           outlier_log_file=str(d / "out.csv"), parlay_log_file=str(d / "par.csv"),
-                          ev_results_file=str(d / "res.csv"), closing_file=str(d / "close.csv"), log_file="")
+                          ev_results_file=str(d / "res.csv"), closing_file=str(d / "close.csv"),
+                          markout_file=str(d / "mk.csv"), log_file="")
         self.games = [nhl_game()]
         mock.patch("arbbot._espn_get", side_effect=lambda path: espn_fake(self.games)(path)).start()
         self.addCleanup(mock.patch.stopall)
@@ -2842,7 +2846,7 @@ class LeagueStatsSites(unittest.TestCase):
         d = Path(tempfile.mkdtemp())
         cfg = Config(prop_sports=["icehockey_nhl", "baseball_mlb"], ev_log_file=str(d / "ev.csv"),
                      outlier_log_file=str(d / "out.csv"), parlay_log_file=str(d / "par.csv"),
-                     ev_results_file=str(d / "res.csv"), closing_file=str(d / "close.csv"))
+                     ev_results_file=str(d / "res.csv"), closing_file=str(d / "close.csv"), markout_file=str(d / "mk.csv"))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             check_props(cfg, datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc))
@@ -3485,6 +3489,609 @@ class KalshiCrossCheck(unittest.TestCase):
         self.assertIn("Kalshi games not placed (1): KXNFLGAME-26OCT04XXXYYY (Nowhere / Elsewhere)", text)
         self.assertIn("fields: ", text)
         self.assertIn("EPL: Kalshi has no game markets", text)
+
+
+# --------------------------------------------------------------------------- markouts: did the edge hold?
+
+def at(secs):
+    return NOW + timedelta(seconds=secs)
+
+
+def stamped(ev, secs):
+    """The same prices, quoted secs after NOW (live quotes go stale after MAX_AGE_SECONDS)."""
+    ts = at(secs).isoformat().replace("+00:00", "Z")
+    for bm in ev["bookmakers"]:
+        bm["last_update"] = ts
+        for m in bm["markets"]:
+            m["last_update"] = ts
+    return ev
+
+
+def moved_event(home_prices, start="2026-10-03T11:00:00Z", stale=(1.85, 1.95)):
+    """outlier_event with the four in-line books (Pinnacle too) at home_prices=(home, away)."""
+    ev = outlier_event(*stale, start=start)
+    for bm in ev["bookmakers"]:
+        if bm["title"] != "Stale":
+            bm["markets"][0]["outcomes"] = [{"name": "Home", "price": home_prices[0]},
+                                            {"name": "Away", "price": home_prices[1]}]
+    return ev
+
+
+PROP_BOOKS = {"Pinnacle": (1.91, 1.91), "DK": (1.90, 1.92), "FD": (1.91, 1.91), "MGM": (1.92, 1.90),
+              "Stale": (2.60, 1.45)}
+
+
+def priced_prop(books=PROP_BOOKS, **kw):
+    ev = prop_event(books, **kw)
+    for bm in ev["bookmakers"]:
+        if bm["title"] == "Pinnacle":
+            bm["key"] = "pinnacle"
+    return ev
+
+
+class StopLoop(Exception):
+    pass
+
+
+class Markouts(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.d = Path(self.tmp.name)
+        self.cfg = Config(markout_file=str(d / "mk.csv"), state_dir=str(d / "state"),
+                          ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
+                          closing_file=str(d / "close.csv"), log_file=str(d / "arbs.csv"),
+                          ev_results_file=str(d / "res.csv"), parlay_log_file=str(d / "par.csv"),
+                          pregame_max_age_seconds=10**9)
+        self.state = d / "state" / "markouts_pending.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def wired(self, alerter, tr):
+        """An alerter whose new alerts this tracker follows, the way make_markouts wires them."""
+        kind = "outlier" if isinstance(alerter, OutlierAlerter) else "ev" if isinstance(alerter, EVAlerter) else "arb"
+        alerter.on_open = lambda item, first: tr.add(item, first, kind)
+        return alerter
+
+    @staticmethod
+    def args(**flags):
+        return SimpleNamespace(**{"once": False, "demo": False, "dry_run": False, **flags})
+
+    def live_outlier(self, tr):
+        a = self.wired(OutlierAlerter(self.cfg, dry_run=True), tr)
+        ev = outlier_event(1.85, 1.95)                       # live (started 11:00), Stale far off on Home
+        [o] = find_outliers([ev], self.cfg, NOW)
+        a.handle([o], now=NOW.timestamp())
+        return a, o
+
+    def prop_outlier(self, tr):
+        a = self.wired(OutlierAlerter(self.cfg, dry_run=True, noun="prop outliers"), tr)
+        [o] = find_outliers([priced_prop()], self.cfg, NOW)
+        a.handle([o], now=NOW.timestamp())
+        return o
+
+    # --- following every new alert
+    def test_each_new_alert_is_followed_once(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        a, o = self.live_outlier(tr)
+        a.handle([o], now=NOW.timestamp() + 60)                     # same alert, next check: not again
+        self.assertEqual(len(tr.pending), 1)
+        m = tr.pending[0]
+        self.assertEqual((m.kind, m.book, m.price, m.live, m.ref), ("outlier", "Stale", 1.85, True, "median"))
+        self.assertAlmostEqual(m.skip, o.worst_ok_price())
+        self.assertEqual((m.fair0, m.edge), (o.fair_prob, o.ev_pct))   # the card's own fair price and edge
+
+    def test_handed_over_and_capped_alerts_are_not_followed_again(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        cfg = replace(self.cfg, min_ev_pct=3)
+        ev_alr = self.wired(EVAlerter(cfg, dry_run=True), tr)
+        out_alr = self.wired(OutlierAlerter(cfg, dry_run=True), tr)
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [b] = find_evs([ev], cfg, NOW)
+        ev_alr.handle([b], now=1000)
+        _arbbot.hand_over([], [b], ev_alr, out_alr)
+        out_alr.handle([b], now=1100)
+        self.assertEqual([m.kind for m in tr.pending], ["ev"])       # one bet, followed as it first went out
+        capped = self.wired(EVAlerter(cfg, dry_run=True, noun="capped"), tr)
+        capped.max_per_hour, capped.posted_at = 1, [time.time()]
+        capped.handle([b], now=time.time())
+        self.assertEqual(len(tr.pending), 1)                         # never sent: nothing to follow
+
+    def test_arb_is_followed_leg_by_leg(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        a = self.wired(Alerter(self.cfg, dry_run=True), tr)
+        [arb] = find_arbs(demo_events(), Config())
+        a.handle([arb], now=1000)
+        self.assertEqual([m.book for m in tr.pending], [l.book for l in arb.legs])
+        self.assertEqual({(m.kind, m.ref, m.edge) for m in tr.pending}, {("arb", "arb", arb.profit_pct)})
+        self.assertEqual(len({m.arb_id for m in tr.pending}), 1)
+        self.assertEqual([m.skip for m in tr.pending], [arb.worst_ok_price(i) for i in range(len(arb.legs))])
+
+    def test_spread_arb_legs_name_their_own_point(self):
+        ev = event({"A": [("spreads", [("Home", 2.10, -3.5), ("Away", 1.75, 3.5)])],
+                    "B": [("spreads", [("Home", 1.75, -3.5), ("Away", 2.10, 3.5)])]})
+        [arb] = find_arbs([ev], Config(min_profit_pct=0), NOW)
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        tr.add(arb, NOW.timestamp(), "arb")
+        self.assertEqual([m.pick for m in tr.pending], ["Away +3.5", "Home -3.5"])   # not both "-3.5"
+        rows = [_arbbot.markout_row(m) for m in tr.pending]
+        self.assertEqual(rows[0]["bet_id"], "e1|spreads|Away|3.5")                  # the bet id +EV logs use
+        for r in rows:
+            self.assertEqual(_arbbot._row_line({**r, "home_team": "Home"}), arb.line)
+
+    # --- one yardstick: the card's own fair price
+    def test_later_uses_the_same_fair_odds_as_the_card(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        _, o = self.live_outlier(tr)                                   # outlier: median of the other books
+        ev_cfg = replace(self.cfg, min_ev_pct=3)
+        pre = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [b] = find_evs([pre], ev_cfg, NOW)                             # +EV: Pinnacle's no-vig price
+        tr.add(b, NOW.timestamp(), "ev")
+        cons = prop_event({"A": (1.87, 1.95), "B": (1.91, 1.91), "C": (1.95, 1.87), "D": (1.89, 1.93),
+                           "E": (2.20, 1.68)})                         # no Pinnacle: the median of 4+ books
+        [p] = find_evs([cons], self.cfg.for_props(), NOW)
+        tr.add(p, NOW.timestamp(), "ev")
+        self.assertEqual([m.ref for m in tr.pending], ["median", "sharp", "consensus"])
+        for m, ev, item, live in zip(tr.pending, (outlier_event(1.85, 1.95), pre, cons), (o, b, p), (True, False, False)):
+            self.assertAlmostEqual(_arbbot._markout_fair(m, ev, self.cfg, NOW, live, {}), item.fair_prob, places=9)
+        self.assertNotAlmostEqual(devig([1.25, 4.10], "power")[0], o.fair_prob, places=3)   # (not Pinnacle's)
+
+    def test_stale_book_fixes_its_price(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        _, o = self.live_outlier(tr)
+        fixed = outlier_event(1.26, 3.90)                    # Stale caught up; the other books held
+        for s in (70, 200, 600):
+            tr.observe([stamped(fixed, s)], at(s))
+        self.assertEqual(tr.finalize(at(601)), 1)                    # every slot in: written right away
+        [row] = _read(self.cfg.markout_file)
+        self.assertEqual((row["next_secs"], row["3m_secs"], row["10m_secs"]), ("70", "200", "600"))
+        self.assertAlmostEqual(float(row["markout_pct"]), o.ev_pct, places=1)   # the whole edge held
+        self.assertAlmostEqual(float(row["edge_pct"]), o.ev_pct, places=1)      # = what the card said
+        self.assertEqual(row["markout_secs"], "200")                  # ~3 min reading is the headline
+        self.assertEqual((row["moved"], row["fair_source"]), ("book", "median"))
+        self.assertEqual(row["still_ok"], "0")                        # 1.26 is under the skip price
+        self.assertEqual((row["bet_id"], row["outcome"], row["point"]), ("e1|h2h|Home|", "Home", ""))
+        self.assertEqual(tr.pending, [])
+
+    def test_fast_book_market_moves_to_it(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        self.live_outlier(tr)
+        caught = moved_event((1.85, 1.95))                   # everyone moved to Stale's price
+        tr.observe([stamped(caught, 65)], at(65))
+        tr.observe([stamped(caught, 190)], at(190))
+        tr.finalize(at(1300))
+        [row] = _read(self.cfg.markout_file)
+        self.assertEqual(row["moved"], "market")
+        self.assertLess(float(row["markout_pct"]), 0)                 # no edge left (its price has vig)
+        self.assertEqual(row["still_ok"], "1")                        # still bettable, just not good
+        self.assertEqual(row["10m_secs"], "")                         # no check in the 10-minute window
+
+    def test_pulled_price_counts_as_pulled_and_not_still_there(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        self.live_outlier(tr)
+        gone = outlier_event(1.85, 1.95)
+        gone["bookmakers"] = [bm for bm in gone["bookmakers"] if bm["title"] != "Stale"]
+        tr.observe([stamped(gone, 200)], at(200))
+        tr.finalize(at(1300))
+        [row] = _read(self.cfg.markout_file)
+        self.assertEqual((row["moved"], row["still_ok"], row["3m_price"]), ("pulled", "0", ""))
+        self.assertNotEqual(row["markout_pct"], "")                   # the price is still measured
+        self.assertIn("pulled 100%", _arbbot.markout_report(self.cfg))
+
+    def test_slots_keep_the_real_time_when_checks_slow_down(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        self.live_outlier(tr)
+        same = outlier_event(1.85, 1.95)
+        tr.observe([stamped(same, 400)], at(400))                     # budget slowed live checks
+        tr.observe([stamped(same, 900)], at(900))
+        tr.finalize(at(1201))
+        [row] = _read(self.cfg.markout_file)
+        self.assertEqual((row["next_secs"], row["3m_secs"], row["10m_secs"]), ("400", "", "900"))
+        self.assertEqual(row["markout_secs"], "900")                  # no ~3 min reading: the ~10 min one
+
+    def test_pre_game_bet_stops_at_kickoff_and_counts_as_not_measured(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        a = self.wired(OutlierAlerter(self.cfg, dry_run=True), tr)
+        ev = outlier_event(1.85, 1.95, start="2026-10-03T12:05:00Z")    # starts in 5 minutes
+        [o] = find_outliers([ev], self.cfg, NOW)
+        a.handle([o], now=NOW.timestamp())
+        tr.observe([stamped(outlier_event(1.26, 3.90, start="2026-10-03T12:05:00Z"), 360)], at(360))   # live now
+        self.assertEqual(tr.pending[0].readings, {})                   # CLV takes over at kickoff
+        self.assertEqual(tr.finalize(at(360)), 1)                     # written, with no reading
+        self.assertEqual(tr.pending, [])
+        [row] = _read(self.cfg.markout_file)
+        self.assertEqual((row["markout_pct"], row["still_ok"]), ("", ""))
+        self.assertEqual(_arbbot.markout_coverage(self.cfg), (0, 1))  # "measured 0 of 1"
+
+    def test_fair_source_never_swaps(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        cfg = replace(self.cfg, min_ev_pct=3)
+        pre = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                       {"B": [("Home", 2.20, None)], "C": [("Home", 1.91, None), ("Away", 1.91, None)],
+                        "D": [("Home", 1.90, None), ("Away", 1.92, None)], "F": [("Home", 1.92, None), ("Away", 1.90, None)]})
+        [b] = find_evs([pre], cfg, NOW)
+        tr.add(b, NOW.timestamp(), "ev")                               # priced by Pinnacle
+        pre["bookmakers"] = [bm for bm in pre["bookmakers"] if bm["key"] != "pinnacle"]
+        tr.observe([pre], at(200))
+        self.assertEqual(tr.pending[0].readings, {})                   # never swaps in the other books
+        # An outlier was priced against the other books, so it doesn't need Pinnacle later.
+        _, o = self.live_outlier(tr)
+        no_pin = outlier_event(1.85, 1.95)
+        no_pin["bookmakers"] = [bm for bm in no_pin["bookmakers"] if bm["key"] != "pinnacle"]
+        tr.observe([stamped(no_pin, 200)], at(200))
+        self.assertIn("3m", tr.pending[1].readings)
+
+    def test_prop_alert_ignores_main_line_checks(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        self.prop_outlier(tr)
+        main = ev_event([("Lakers", 1.91, None), ("Celtics", 1.91, None)], {"DK": [("Lakers", 1.95, None)]})
+        main["id"] = "p1"
+        tr.observe([main], at(200))                                   # same game, no prop lines in it
+        self.assertEqual(tr.pending[0].readings, {})
+        tr.observe([priced_prop()], at(200))
+        self.assertIn("3m", tr.pending[0].readings)
+        self.assertEqual(tr.pending[0].player, "LeBron James")
+
+    # --- restarts
+    def test_restart_keeps_alerts_being_followed_props_too(self):
+        import json
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        o = self.prop_outlier(tr)
+        tr.finalize(NOW)                                               # saves the alert being followed
+        saved = json.loads(self.state.read_text())
+        self.assertEqual(saved[0]["line"], ["LeBron James", 25.5])    # JSON has no tuples
+        self.state.write_text(json.dumps(saved + [{"bogus": 1}]))     # one damaged entry: skipped
+        again = _arbbot.MarkoutTracker(self.cfg)
+        [m] = again.pending
+        self.assertEqual((m.line, m.fair0), (("LeBron James", 25.5), o.fair_prob))
+        again.observe([priced_prop()], at(200))                       # a prop line after a restart
+        self.assertIn("3m", m.readings)
+        self.assertEqual(again.finalize(at(4000)), 1)                 # nothing measured is lost
+        self.assertEqual(_read(self.cfg.markout_file)[0]["markout_secs"], "200")
+        self.assertEqual(json.loads(self.state.read_text()), [])
+
+    # --- wiring: what run() calls
+    def test_make_markouts_follows_each_alerter_as_its_kind(self):
+        a_arb, a_ev, a_out = Alerter(self.cfg, True), EVAlerter(self.cfg, True), OutlierAlerter(self.cfg, True)
+        p_arb = Alerter(self.cfg, True, noun="prop arbs")
+        p_ev, p_out = EVAlerter(self.cfg, True, noun="+EV props"), OutlierAlerter(self.cfg, True, noun="prop outliers")
+        parlays = ParlayAlerter(self.cfg, True)
+        tr = _arbbot.make_markouts(self.cfg, self.args(), [a_arb, a_ev, a_out, p_arb, p_ev, p_out, parlays])
+        [arb] = find_arbs(demo_events(), Config())
+        cfg = replace(self.cfg, min_ev_pct=3)
+        [b] = find_evs([ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})], cfg, NOW)
+        [o] = find_outliers([outlier_event(1.85, 1.95)], self.cfg, NOW)
+        [po] = find_outliers([priced_prop()], self.cfg, NOW)
+        for a, item in ((a_arb, arb), (a_ev, b), (a_out, o), (p_arb, arb), (p_ev, b), (p_out, po)):
+            a.handle([item], now=NOW.timestamp())
+        self.assertEqual([m.kind for m in tr.pending],
+                         ["arb", "arb", "ev", "outlier", "arb", "arb", "ev", "outlier"])
+        self.assertIsNone(parlays.on_open)                            # parlay legs are followed one by one
+
+    def test_once_demo_and_dry_run_record_nothing(self):
+        ev = outlier_event(1.85, 1.95)
+        [o] = find_outliers([ev], self.cfg, NOW)
+        for flag in ("once", "demo", "dry_run"):
+            a = OutlierAlerter(self.cfg, dry_run=True)
+            tr = _arbbot.make_markouts(self.cfg, self.args(**{flag: True}), [a])
+            a.handle([o], now=NOW.timestamp())
+            self.assertEqual(tr.pending, [], flag)
+            self.assertEqual(tr.update([stamped(ev, 200)], [], at(4000)), 0, flag)
+            self.assertFalse(self.state.exists(), flag)
+            self.assertFalse(Path(self.cfg.markout_file).exists(), flag)
+        a = OutlierAlerter(self.cfg, dry_run=True)
+        tr = _arbbot.make_markouts(self.cfg, self.args(), [a])         # the service: followed and saved
+        a.handle([o], now=NOW.timestamp())
+        tr.update([], [], NOW)
+        self.assertEqual(len(tr.pending), 1)
+        self.assertTrue(self.state.exists())
+
+    def test_update_reads_main_lines_then_props_then_writes(self):
+        out_alr, prop_outs = OutlierAlerter(self.cfg, True), OutlierAlerter(self.cfg, True, noun="prop outliers")
+        tr = _arbbot.make_markouts(self.cfg, self.args(), [out_alr, prop_outs])
+        main, props = outlier_event(1.85, 1.95), priced_prop()
+        out_alr.handle(find_outliers([main], self.cfg, NOW), now=NOW.timestamp())     # pass 1: the alerts
+        prop_outs.handle(find_outliers([props], self.cfg, NOW), now=NOW.timestamp())
+        self.assertEqual(tr.update([main], [props], NOW), 0)
+        self.assertEqual([m.readings for m in tr.pending], [{}, {}])   # the alerts' own check isn't "later"
+        tr.update([stamped(outlier_event(1.85, 1.95), 200)], [priced_prop()], at(200))   # pass 2
+        self.assertEqual([sorted(m.readings) for m in tr.pending], [["3m", "next"], ["3m", "next"]])
+        self.assertEqual(tr.update([], [], at(1300)), 2)               # pass 3: both done, both written
+        self.assertEqual(len(_read(self.cfg.markout_file)), 2)
+
+    def run_bot(self, **flags):
+        """run() for one pass of the main loop against a fake Odds API: a live game with an outlier,
+        a game starting in an hour with a +EV bet and an arb, and that game's props."""
+        import argparse, contextlib, io
+        from unittest import mock
+        real = datetime.now(timezone.utc)
+        iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
+        live_start, pre_start = iso(real - timedelta(minutes=30)), iso(real + timedelta(hours=1))
+
+        def fresh(ev, gid):
+            ev["id"], ev["sport_key"] = gid, "basketball_nba"
+            ts = iso(datetime.now(timezone.utc))
+            for bm in ev["bookmakers"]:
+                bm["last_update"] = ts
+                for m in bm["markets"]:
+                    m["last_update"] = ts
+            return ev
+
+        class Api:
+            remaining, used = 50000.0, None
+            def __init__(self, cfg):
+                pass
+            def events(self, sport, horizon_hours=26):
+                return [{"id": "live1", "commence_time": live_start}, {"id": "p1", "commence_time": pre_start}]
+            def odds(self, sport, until):
+                pre = event({"Pinnacle": [("h2h", [("Home", 1.91, None), ("Away", 1.91, None)])],
+                             "B": [("h2h", [("Home", 2.20, None)])],
+                             "X": [("totals", [("Over", 2.10, 220.5), ("Under", 1.75, 220.5)])],
+                             "Y": [("totals", [("Over", 1.75, 220.5), ("Under", 2.10, 220.5)])]}, start=pre_start)
+                pre["bookmakers"][0]["key"] = "pinnacle"
+                return [fresh(outlier_event(1.85, 1.95, start=live_start), "live1"), fresh(pre, "p1")]
+            def event_odds(self, sport, gid, markets):
+                return fresh(priced_prop(start=pre_start), gid)
+
+        cfg = replace(self.cfg, sports=["basketball_nba"], prop_sports=["basketball_nba"], kalshi_check=False,
+                      summary_hour=-1, results_minutes=0, pregame_max_age_seconds=900)
+        args = argparse.Namespace(**{"once": False, "demo": False, "dry_run": False, "plan": False,
+                                     "check_kalshi": False, "results": None, "post_results": None, **flags})
+        seen = []
+        real_update = _arbbot.MarkoutTracker.update
+
+        def spy(tracker, events, prop_events, now):
+            seen.append((tracker, sorted(e["id"] for e in events), sorted(e["id"] for e in prop_events)))
+            return real_update(tracker, events, prop_events, now)
+
+        with mock.patch("arbbot.OddsAPI", Api), mock.patch.object(_arbbot.MarkoutTracker, "update", spy), \
+                mock.patch("arbbot.time.sleep", side_effect=StopLoop), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(StopLoop):
+                _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        return seen
+
+    def test_run_follows_every_new_alert_and_reads_each_pass(self):
+        [(tracker, main_ids, prop_ids)] = self.run_bot()              # one pass, one update after the alerts
+        self.assertEqual((main_ids, prop_ids), (["live1", "p1"], ["p1"]))
+        self.assertEqual({(m.kind, m.event_id, m.market) for m in tracker.pending},
+                         {("outlier", "live1", "h2h"), ("ev", "p1", "h2h"), ("arb", "p1", "totals"),
+                          ("outlier", "p1", "player_points"), ("arb", "p1", "player_points")})
+        self.assertTrue(self.state.exists())
+
+    def test_run_dry_run_follows_nothing(self):
+        [(tracker, main_ids, _)] = self.run_bot(dry_run=True)
+        self.assertEqual(main_ids, ["live1", "p1"])
+        self.assertEqual(tracker.pending, [])
+        self.assertFalse(self.state.exists())
+
+    def test_results_command_prints_markouts_and_survives_a_broken_file(self):
+        import argparse, contextlib, io
+        from unittest import mock
+        self.rows(3, 2.0)
+        args = argparse.Namespace(once=False, demo=False, dry_run=False, plan=False, check_kalshi=False,
+                                  results="today", post_results=None)
+        for broken in (False, True):
+            if broken:
+                Path(self.cfg.markout_file).write_bytes(b"first_seen,kind\n\xff\xfe\x00,outlier\n")
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch("arbbot.OddsAPI", lambda cfg: SimpleNamespace(remaining=None)), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                _arbbot.run(self.cfg, args, _arbbot.Status(self.cfg, dry_run=True))
+            self.assertIn("All time", out.getvalue())
+            if broken:
+                self.assertNotIn("Markouts (each", out.getvalue())
+                self.assertIn("! Markouts (--results)", err.getvalue())
+            else:
+                self.assertIn("Markouts (each alert's price checked again minutes later)", out.getvalue())
+                self.assertIn("Live outliers", out.getvalue())
+
+    # --- never in the way of the alerts
+    def test_bad_data_never_stops_the_alerts(self):
+        from unittest import mock
+        import contextlib, io
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        a, o = self.live_outlier(tr)
+        other = outlier_event(1.85, 1.95)
+        other["id"] = "e2"
+        tr.add(find_outliers([other], self.cfg, NOW)[0], NOW.timestamp(), "outlier")
+        tr.add(o, NOW.timestamp(), "outlier")
+        tr.pending[2].line = ["unhashable"]                           # one damaged alert on game e1
+        broken = outlier_event(1.85, 1.95)
+        del broken["home_team"]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            tr.observe([broken, stamped(other, 70)], at(70))          # a bad game doesn't stop the next one
+            tr.observe([stamped(outlier_event(1.26, 3.90), 200)], at(200))   # nor a bad alert the next one
+        self.assertIn("! Markouts", err.getvalue())
+        self.assertEqual([sorted(m.readings) for m in tr.pending], [["3m", "next"], ["next"], []])
+        # Following an alert can't break sending it...
+        b = OutlierAlerter(self.cfg, dry_run=True, noun="x")
+        tr2 = _arbbot.make_markouts(self.cfg, self.args(), [b])
+        with mock.patch.object(_arbbot.MarkoutTracker, "_add", side_effect=KeyError("boom")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(b.handle([o], now=NOW.timestamp()), 1)
+        self.assertEqual((b.stats["found"], len(b.open), tr2.pending), (1, 1, []))
+        # ...and a row that can't be saved is dropped, not retried (and failed) every pass.
+        with mock.patch("arbbot.append_csv", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(tr.finalize(at(4000)), 0)
+        self.assertEqual(tr.pending, [])
+
+    # --- reporting
+    def rows(self, n, pct, kind="outlier", live=True, book="FanDuel", still=1, edge=8.0, sport="NBA", **extra):
+        for i in range(n):
+            append_csv(self.cfg.markout_file, _arbbot.MARKOUT_FIELDS, {
+                "first_seen": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds"),
+                "bet_id": f"{kind}{live}{book}{pct}{i}", "kind": kind, "live": live, "sport": sport, "book": book,
+                "markout_pct": pct + (i % 2) * 0.2, "markout_secs": 190, "3m_pct": pct + (i % 2) * 0.2,
+                "3m_secs": 190, "moved": "book", "still_ok": still, "edge_pct": edge, **extra})
+
+    def arb(self, arb_id, legs, edge=2.0, key=None, **extra):
+        """One arb's legs: [(book, still there on the next check)]. Legs with the same key are the same bets."""
+        for i, (book, still) in enumerate(legs):
+            append_csv(self.cfg.markout_file, _arbbot.MARKOUT_FIELDS, {
+                "first_seen": datetime.now(timezone.utc).isoformat(timespec="seconds"), "kind": "arb", "live": True,
+                "book": book, "arb_id": arb_id, "bet_id": f"{key or arb_id}|leg{i}", "still_ok": still,
+                "edge_pct": edge, **extra})
+
+    def test_stats_and_verdicts(self):
+        n, mean, se, lo, hi = _arbbot.markout_stats([1.0, 3.0])
+        self.assertEqual((n, mean), (2, 2.0))
+        self.assertAlmostEqual(se, 1.0)
+        self.assertAlmostEqual(lo, 2 - 1.96)
+        self.assertEqual(_arbbot.markout_verdict(49, 0.5, 2.0), "")         # too few to say
+        self.assertEqual(_arbbot.markout_verdict(50, 0.5, 2.0), "✅ real edge")
+        self.assertEqual(_arbbot.markout_verdict(50, -2.0, -0.1), "⚠️ review")
+        self.assertEqual(_arbbot.markout_verdict(50, -1.0, 1.0), "")
+
+    def test_groups(self):
+        g = _arbbot.markout_group
+        self.assertEqual(g({"kind": "outlier", "live": "True"}), "Live outliers")
+        self.assertEqual(g({"kind": "outlier", "live": "False"}), "Pre-game outliers")
+        self.assertEqual(g({"kind": "ev", "live": "False"}), "Pre-game +EV")
+        self.assertEqual(g({"kind": "outlier", "live": "False", "player": "LeBron James"}), "Props")
+        self.assertEqual(g({"kind": "arb", "live": "True", "player": "LeBron James"}), "Arbs")
+
+    def test_scoreboard_summary_and_command_line(self):
+        self.rows(60, 4.0, edge=12.0)                                 # live outliers, clearly above 0
+        self.rows(12, -2.0, book="DraftKings", edge=12.0)
+        self.rows(60, 3.0, kind="ev", live=False, edge=6.0)           # clearly above 0 too, but pre-game
+        self.rows(1, 0, kind="ev", live=False, markout_pct="", still_ok="")   # a pre-game alert never re-read
+        self.rows(5, 9.0, book="BetOnline.ag")                        # not your book: left out
+        self.arb("a1", [("FanDuel", 1), ("DraftKings", 0)])
+        cfg = replace(self.cfg, my_books="fanduel,draftkings")
+        board = _arbbot.scoreboard_text(cfg, datetime.now(timezone.utc))
+        self.assertIn("📏 Did the edge hold?", board)
+        self.assertRegex(board, r"Live outliers\s+72\s+\+12%\s+\+3\.1%.*✅")
+        self.assertRegex(board, r"Pre-game \+EV\s+60\s+\+6%\s+\+3\.1%\s+\S+\s+100%\n")   # no verdict for pre-game
+        self.assertRegex(board, r"Arbs\s+1\s+\+2%\s+—\s+—\s+0%")
+        self.assertIn("CLV is the better test there (measured 60 of 61)", board)
+        card = _arbbot.summary_payload(cfg, [], 5000)["embeds"][0]["description"]
+        self.assertIn("Live outliers: sent +12.0% → later +3.1% (72 bets, 95% range", card)
+        self.assertIn("Pre-game +EV: sent +6.0% → later +3.1% (60 of 61 bets measured, 95% range", card)
+        self.assertEqual(card.count("✅ real edge"), 1)
+        self.assertIn("Arbs: every leg still there on the next check 0% (1 arb)", card)
+        self.assertIn("Best book: FanDuel", card)
+        self.assertIn("Worst: DraftKings (-1.9% later, 12 bets)", card)
+        self.assertNotIn("Worst:", _arbbot.summary_payload(replace(cfg, my_books="fanduel"), [], 5000)
+                         ["embeds"][0]["description"])
+        report = _arbbot.markout_report(cfg)
+        self.assertIn("FanDuel", report)
+        self.assertNotIn("BetOnline", report)
+        self.assertIn("book fixed it 100%", report)
+        self.assertIn("by time:", report)
+
+    def test_bets_not_cards(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        a, o = self.live_outlier(tr)
+        tr.observe([stamped(outlier_event(1.85, 1.95), 200)], at(200))
+        a.handle([], now=at(250).timestamp())                         # GONE...
+        a.handle([o], now=at(300).timestamp())                        # ...and back: a second card, one bet
+        tr.observe([stamped(moved_event((1.85, 1.95)), 460)], at(460))   # the second card's ~3 min look
+        self.assertEqual(tr.finalize(at(5000)), 2)
+        self.assertEqual([r["markout_secs"] for r in _read(self.cfg.markout_file)], ["200", "160"])
+        [r] = _arbbot.markout_rows(self.cfg)                          # counted once: the first card
+        self.assertEqual(r["markout_secs"], "200")
+        self.arb("e1|h2h|200", [("FanDuel", 1), ("DraftKings", 1)], key="e1|h2h")
+        self.arb("e1|h2h|900", [("FanDuel", 0), ("DraftKings", 0)], key="e1|h2h")   # the same arb again
+        [arbs] = [g for g in _arbbot.markout_breakdown(self.cfg)["Alert type"] if g["name"] == "Arbs"]
+        self.assertEqual((arbs["n"], arbs["still"]), (1, 100))
+
+    def test_ev_markout_ties_back_to_the_bet_log(self):
+        tr = _arbbot.MarkoutTracker(self.cfg)
+        cfg = replace(self.cfg, min_ev_pct=3)
+        a = self.wired(EVAlerter(cfg, dry_run=True), tr)
+        pre = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [b] = find_evs([pre], cfg, NOW)
+        a.handle([b], now=NOW.timestamp())
+        tr.finalize(at(4000))
+        [row], [logged] = _read(self.cfg.markout_file), _read(self.cfg.ev_log_file)
+        self.assertEqual(row["bet_id"], _arbbot._bet_id(logged))      # the same id CLV and results use
+        self.assertEqual((row["confidence"], row["fair_source"]), (b.confidence, "sharp"))
+        self.assertAlmostEqual(float(row["edge_pct"]), b.ev_pct, places=2)
+
+    def test_table_columns_line_up(self):
+        self.rows(3, 1.5)
+        self.rows(3, -10.5, live=False)
+        self.rows(3, 2.0, kind="ev", live=False)
+        self.rows(3, 2.0, kind="ev", live=True)
+        self.rows(3, 2.0, player="LeBron James", live=False)
+        self.arb("a1", [("FanDuel", 1), ("DraftKings", 1)])
+        table = _arbbot.markout_table(self.cfg).split("```")[1].strip("\n").split("\n")
+        self.assertEqual([l.split("  ")[0] for l in table[1:]], _arbbot.MARKOUT_GROUP_ORDER)
+        self.assertEqual(len({len(l.removesuffix(" ✅").removesuffix(" ⚠️")) for l in table}), 1, "\n".join(table))
+
+    def test_scoreboard_keeps_clv_and_drops_markouts_when_too_long(self):
+        from unittest import mock
+        append_csv(self.cfg.ev_log_file, _arbbot.EV_LOG_FIELDS, {
+            "first_seen": "2026-10-03T12:00:00+00:00", "event_id": "g1", "sport": "NBA", "sport_key": "basketball_nba",
+            "matchup": "Away @ Home", "home_team": "Home", "away_team": "Away", "commence_time": "2026-10-03T18:00:00Z",
+            "live": False, "market": "h2h", "outcome": "Home", "point": "", "n_outcomes": 2, "book": "FanDuel",
+            "price": 2.2, "fair_odds": 2.0, "best_ev_pct": 10, "stake": 10, "player": "", "confidence": "high"})
+        append_csv(self.cfg.closing_file, _arbbot.CLOSING_FIELDS, {"bet_id": "g1|h2h|Home|", "closing_fair_prob": 0.5})
+        self.rows(3, 2.0)
+        now = datetime(2026, 10, 3, 20, 0, tzinfo=timezone.utc)
+        self.assertIn("📏", _arbbot.scoreboard_text(self.cfg, now))
+        with mock.patch("arbbot.day_summary", return_value="x" * 3000):
+            text = _arbbot.scoreboard_text(self.cfg, now)
+            card = _arbbot.scoreboard_payload(self.cfg, now)["embeds"][0]["description"]
+        self.assertIn("📐 Bet quality (CLV)", text)
+        self.assertNotIn("📏", text)
+        self.assertLessEqual(len(text), 4000)
+        self.assertIn("bets   CLV  beat", card)                         # the CLV table wasn't cut
+
+    def test_best_and_worst_book_need_ten_bets_each(self):
+        self.rows(10, 4.0)
+        self.rows(9, -2.0, book="DraftKings")
+        self.assertEqual(_arbbot.markout_books_line(self.cfg), "")
+        self.rows(1, -2.0, book="DraftKings", bet_id="extra")
+        self.assertIn("Worst: DraftKings", _arbbot.markout_books_line(self.cfg))
+
+    def test_book_and_sport_tables_are_single_bets_only(self):
+        self.rows(3, 2.0)
+        self.arb("a1", [("BetMGM", 1), ("FanDuel", 1)], sport="NBA", markout_pct=1.0)
+        mk = _arbbot.markout_breakdown(self.cfg)
+        self.assertEqual([g["name"] for g in mk["Book"]], ["FanDuel"])
+        self.assertEqual([(g["name"], g["of"]) for g in mk["Sport"]], [("NBA", 3)])
+
+    def test_bad_markouts_file_never_breaks_the_cards(self):
+        import contextlib, io
+        self.rows(3, 2.0)
+        self.rows(1, 0, markout_pct="abc", edge_pct="?", still_ok="x", markout_secs="zz")   # garbage cells
+        text = _arbbot.scoreboard_text(self.cfg, NOW)
+        self.assertRegex(text, r"Live outliers\s+3\s")                # the damaged row just isn't measured
+        Path(self.cfg.markout_file).write_bytes(b"first_seen,kind\n\xff\xfe\x00,outlier\n")   # a damaged file
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            text = _arbbot.scoreboard_text(self.cfg, NOW)
+            card = _arbbot.summary_payload(self.cfg, [], 5000)["embeds"][0]["description"]
+        self.assertIn("All time", text)
+        self.assertNotIn("📏", text + card)
+        self.assertIn("💳 **Credits**", card)
+        self.assertIn("! Markouts (scoreboard)", err.getvalue())
+        self.assertIn("! Markouts (daily summary)", err.getvalue())
+
+    def test_markouts_off_everywhere(self):
+        off = replace(self.cfg, markout_file="")
+        self.rows(3, 2.0)
+        self.assertEqual(_arbbot.markout_rows(off), [])               # never opens the bot's own folder
+        self.assertNotIn("📏", _arbbot.scoreboard_text(off, NOW))
+        self.assertNotIn("📏", _arbbot.summary_payload(off, [], 5000)["embeds"][0]["description"])
+        self.assertEqual(_arbbot.markout_report(off), "")
+        tr = _arbbot.MarkoutTracker(off)
+        tr.add(find_outliers([outlier_event(1.85, 1.95)], off, NOW)[0], NOW.timestamp(), "outlier")
+        self.assertEqual((tr.pending, tr.finalize(at(4000))), ([], 0))
+        self.assertFalse(self.state.exists())
+
+    def test_from_env(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"MARKOUT_FILE": ""}, clear=False):
+            self.assertEqual(Config.from_env().markout_file, "")
+        with mock.patch.dict(os.environ, {"MARKOUT_FILE": "m.csv"}, clear=False):
+            self.assertEqual(Config.from_env().markout_file, "m.csv")
 
 
 if __name__ == "__main__":

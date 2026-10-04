@@ -289,6 +289,7 @@ class Config:
     ev_log_file: str = "ev_bets.csv"
     ev_results_file: str = "ev_results.csv"
     closing_file: str = "closing_lines.csv"
+    markout_file: str = "markouts.csv"   # every alert's price checked again a few minutes later ("" = off)
     # Player props (fetched per game, so they're budgeted separately and checked less often)
     props_enabled: bool = True
     prop_sports: list[str] = field(default_factory=lambda: [
@@ -441,6 +442,7 @@ class Config:
             ev_log_file=e("EV_LOG_FILE", d.ev_log_file),
             ev_results_file=e("EV_RESULTS_FILE", d.ev_results_file),
             closing_file=e("CLOSING_FILE", d.closing_file),
+            markout_file=e("MARKOUT_FILE", d.markout_file),
             props_enabled=e("PROPS_ENABLED", "true").lower() in ("1", "true", "yes"),
             prop_sports=_csv(e("PROP_SPORTS", "")) or d.prop_sports,
             prop_markets={**d.prop_markets, **{k.strip(): v.strip().replace("|", ",") for k, v in
@@ -1164,6 +1166,7 @@ class Alerter:
     noun = "arbs"
     log_fields = LOG_FIELDS
     on_log = None  # optional callback(row) after a row is logged
+    on_open = None  # optional callback(item, first_seen) when a brand-new alert goes out (markouts)
     log_on_open = False  # arbs are logged when they close, so the row has how long it lasted
 
     RESTORE_GRACE = 900  # seconds a restored alert gets to show up again before it's marked gone
@@ -1354,6 +1357,8 @@ class Alerter:
                 self.open[arb.key] = op
                 if self.log_on_open and handed is None:   # a handed-over bet was logged already
                     self._log(op, now, None)
+                if self.on_open and handed is None:       # ...and is already being followed
+                    self.on_open(arb, first)
                 self.stats["found"] += 1
                 if self.value(arb) > self.stats["best_pct"]:
                     self.stats["best_pct"], self.stats["best"] = self.value(arb), arb.matchup
@@ -3959,6 +3964,9 @@ def scoreboard_text(cfg: Config, now: datetime | None = None) -> str:
                      + ("✅ Beating the closing line: the edge looks real." if good
                         else "⚠️ Not beating the closing line yet. Give it more bets.")
                      + "\n```\n                    bets   CLV  beat\n" + "\n".join(table) + "\n```")
+    marks = _safely("scoreboard", markout_table, cfg)
+    if marks and len("\n\n".join(parts + [marks])) <= 4000:   # only if the card still fits: CLV comes first
+        parts.append(marks)
     return "\n\n".join(parts)
 
 
@@ -4437,6 +4445,547 @@ def clv_record(cfg: Config, days: int | None = None) -> str:
     return f"avg {avg:+.1f}%, beat the close on {beat:.0f}% of {len(rows)} bets"
 
 
+# --------------------------------------------------------------------------- markouts: did the edge hold?
+
+# When to look at an alert's price again: (slot, earliest, latest) seconds after it went out. Checks
+# don't run on a timer (live checks slow down on a tight budget, pre-game ones are 15-60 minutes
+# apart), so each slot takes the first check inside its window and keeps the real seconds.
+MARKOUT_SLOTS = (("next", 1, 3600), ("3m", 150, 360), ("10m", 480, 1200))
+MARKOUT_HEADLINE = ("3m", "10m", "next")   # the reading reports use: the first of these that's there
+MARKOUT_MOVE_PTS = 0.5       # a move under this many win-% points isn't a move
+MARKOUT_VERDICT_BETS = 50    # bets a group needs before it's called a real edge (or flagged)
+MARKOUT_FIELDS = (["first_seen", "bet_id", "kind", "live", "sport", "sport_key", "event_id", "matchup", "market",
+                   "pick", "player", "outcome", "point", "book", "price", "skip_price", "confidence", "edge_pct",
+                   "fair_source", "fair_at_alert"]
+                  + [f"{s}_{x}" for s, _, _ in MARKOUT_SLOTS for x in ("secs", "price", "fair", "pct")]
+                  + ["markout_pct", "markout_secs", "moved", "still_ok", "arb_id"])
+
+
+@dataclass
+class Markout:
+    """One alerted price being followed after the alert (an arb: one per leg)."""
+    first_seen: float
+    kind: str                 # "ev", "outlier" or "arb"
+    live: bool
+    sport: str
+    sport_key: str
+    event_id: str
+    matchup: str
+    commence_time: str
+    market: str
+    line: object              # the grouping key (see _line_for)
+    outcome: str
+    point: float | None       # this outcome's own point
+    pick: str
+    book: str
+    price: float
+    skip: float               # the card's "skip if the price is worse than"
+    edge: float               # the edge the card showed: +EV/outlier edge, or the arb's profit (%)
+    ref: str                  # the card's fair price: "sharp", "consensus", "median" (outliers) or "arb"
+    fair0: float = 0.0        # the card's fair win chance (arbs: none)
+    confidence: str = ""
+    player: str = ""
+    arb_id: str = ""          # the legs of one arb share it
+    readings: dict = field(default_factory=dict)   # slot -> [seconds after, the book's price or None, fair or None]
+
+
+def _fresh_quotes(ev: dict, cfg: Config, now: datetime, is_live: bool) -> dict[tuple, dict[str, dict[str, float]]]:
+    """Every fresh price in one game: {(market, line): {book title: {outcome: price}}}."""
+    out: dict[tuple, dict[str, dict[str, float]]] = {}
+    start = _parse_time(ev["commence_time"])
+    for bm in ev.get("bookmakers", []):
+        for mkt in bm.get("markets", []):
+            if not is_fresh(mkt, bm, now, is_live, cfg, start):
+                continue
+            for oc in mkt.get("outcomes", []):
+                price = float(oc.get("price") or 0)
+                if price > 1.0:
+                    k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
+                    out.setdefault(k, {}).setdefault(bm.get("title", bm["key"]), {})[oc["name"]] = price
+    return out
+
+
+def _book_probs(ev: dict, cfg: Config, now: datetime, is_live: bool) -> dict[tuple, dict[str, dict[str, float]]]:
+    """Each book's no-vig win chances per line, {(market, line): {book title: {outcome: prob}}}, from
+    fresh full markets only: the same numbers find_outliers takes its median from."""
+    lines: dict[tuple, dict[str, dict[str, float]]] = {}
+    for k, books in _fresh_quotes(ev, cfg, now, is_live).items():
+        n_out = max(len(o) for o in books.values())
+        full = {bk: o for bk, o in books.items() if len(o) == n_out and n_out >= 2}
+        names = set().union(*full.values()) if full else set()
+        lines[k] = {bk: dict(zip(o, devig(list(o.values()), cfg.devig_method)))
+                    for bk, o in full.items() if set(o) == names}
+    return lines
+
+
+def _markout_fair(m: Markout, ev: dict, cfg: Config, now: datetime, is_live: bool, cache: dict) -> float | None:
+    """The fair win chance now, by the same yardstick the alert's card used, so "later" compares
+    straight with the edge on the card: Pinnacle's no-vig price (+EV), the median of 4+ books (a
+    +EV prop Pinnacle doesn't price), or the median of the other books, never the alerted one
+    (outliers). None when that yardstick can't price it now (the source is never swapped)."""
+    k = (m.market, m.line)
+    if m.ref == "sharp":
+        if "sharp" not in cache:
+            cache["sharp"] = sharp_fair(ev, cfg, now, is_live)[0]
+        return cache["sharp"].get(k, {}).get(m.outcome)
+    if m.ref == "consensus":
+        if "consensus" not in cache:
+            cache["consensus"] = consensus_fair(ev, cfg.for_props(), now, is_live, set(_csv(cfg.sharp_books)))
+        return cache["consensus"].get(k, ({}, 0))[0].get(m.outcome)
+    if m.ref == "median":
+        if "books" not in cache:
+            cache["books"] = _book_probs(ev, cfg, now, is_live)
+        others = sorted(p[m.outcome] for bk, p in cache["books"].get(k, {}).items()
+                        if bk != m.book and m.outcome in p)
+        if len(others) < cfg.outlier_min_books:
+            return None
+        mid = len(others) // 2
+        return others[mid] if len(others) % 2 else (others[mid - 1] + others[mid]) / 2
+    return None   # an arb: the arb itself is the yardstick (are all its legs still there?)
+
+
+def who_moved(price0: float, fair0: float, price1: float | None, fair1: float) -> str:
+    """After an alert: "book" (the book fixed its price: it was stale, the edge was real),
+    "market" (the market moved to the book: it was just fast, no edge), "neither", or "pulled"
+    (the book no longer had that price: taken down, or moved to another line)."""
+    if price1 is None:
+        return "pulled"
+    book = (1 / price1 - 1 / price0) * 100     # + = the book shortened its price, toward the market
+    market = (fair0 - fair1) * 100             # + = the fair price came toward the book's
+    if max(book, market) < MARKOUT_MOVE_PTS:
+        return "neither"
+    return "book" if book > market else "market"
+
+
+class MarkoutTracker:
+    """Prices every new alert again on the next checks of its game (next check, ~3 and ~10
+    minutes later), against the same fair price its card used. markout = alerted price x later
+    fair chance - 1, the CLV sum, but it works for live bets too and settles far sooner than
+    win/loss. Every alert gets a row in MARKOUT_FILE once its slots are in or can't be any more
+    (a row with no reading counts as "not measured"). Alerts still being followed are saved in
+    STATE_DIR, so a restart keeps them. Measuring must never stop or change the alerts, so
+    every step here prints a problem and carries on."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.pending: list[Markout] = []
+        self.dirty = False
+        self._load()
+
+    def _path(self) -> Path | None:
+        if not self.cfg.markout_file or not self.cfg.state_dir:
+            return None
+        return data_path(self.cfg.state_dir) / "markouts_pending.json"
+
+    def _load(self) -> None:
+        path = self._path()
+        if not path or not path.exists():
+            return
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return   # unreadable: start fresh
+        for d in saved if isinstance(saved, list) else []:
+            try:
+                if isinstance(d.get("line"), list):
+                    d["line"] = tuple(d["line"])   # a prop's (player, point): JSON saved it as a list
+                self.pending.append(Markout(**d))
+            except (AttributeError, TypeError) as e:
+                print(f"  ! Markouts: skipped a saved alert: {e!r:.200}", file=sys.stderr)
+
+    def _save(self) -> None:
+        path = self._path()
+        if not path:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps([vars(m) for m in self.pending]))
+            tmp.replace(path)
+        except (OSError, TypeError, ValueError) as e:
+            print(f"  ! Couldn't save markout state: {e}", file=sys.stderr)
+
+    def add(self, item, first_seen: float, kind: str) -> None:
+        """Start following a new alert (Alerter.on_open). An arb is followed leg by leg."""
+        if not self.cfg.markout_file:
+            return
+        try:
+            self._add(item, first_seen, kind)
+        except Exception as e:  # noqa: BLE001 - the alert went out; following it must never break that
+            print(f"  ! Markouts: couldn't follow {getattr(item, 'matchup', '?')}: {e!r:.200}", file=sys.stderr)
+
+    def _add(self, item, first_seen: float, kind: str) -> None:
+        player = item.line[0] if is_prop(item.line) else ""
+        base = dict(first_seen=first_seen, kind=kind, live=item.is_live, sport=item.sport,
+                    sport_key=item.sport_key, event_id=item.event_id, matchup=item.matchup,
+                    commence_time=item.commence_time, market=item.market, line=item.line, player=player)
+        if isinstance(item, Arb):
+            home = item.matchup.rpartition(" @ ")[2]
+            for i, leg in enumerate(item.legs):
+                # The arb's line is the home team's point; the away side of a spread is the other sign.
+                point = (item.line[1] if player else None if item.line is None
+                         else -item.line if item.market == "spreads" and leg.outcome != home else item.line)
+                self.pending.append(Markout(
+                    **base, outcome=leg.outcome, point=point, book=leg.book, price=leg.price,
+                    pick=row_pick({"market": item.market, "outcome": leg.outcome, "point": point, "player": player}),
+                    skip=item.worst_ok_price(i) or leg.price, edge=item.profit_pct, ref="arb",
+                    arb_id=f"{item.key}|{int(first_seen)}"))
+        else:
+            ref = ("median" if item.sharp_book.startswith("median")
+                   else "consensus" if item.sharp_book.startswith("consensus") else "sharp")
+            self.pending.append(Markout(**base, outcome=item.outcome, point=item.point, pick=item.pick,
+                                        book=item.book, price=item.price, skip=item.worst_ok_price(),
+                                        edge=item.ev_pct, ref=ref, fair0=item.fair_prob,
+                                        confidence=item.confidence))
+        self.dirty = True
+
+    def update(self, events: list[dict], prop_events: list[dict], now: datetime) -> int:
+        """One pass of the main loop, after every alert of the pass went out: read the main-line
+        check, then the prop check, then write what's finished. Returns rows written."""
+        self.observe(events, now)
+        self.observe(prop_events, now)
+        return self.finalize(now)
+
+    def observe(self, events: list[dict], now: datetime | None = None) -> None:
+        """Read the followed lines in this check. Skipped: a check without the line (a prop in a
+        main-line check, a line every book took down) and a pre-game bet once its game starts
+        (CLV takes over there). One bad game or alert never stops the rest."""
+        now = now or datetime.now(timezone.utc)
+        by_game: dict[str, list[Markout]] = {}
+        for m in self.pending:
+            by_game.setdefault(m.event_id, []).append(m)
+        for ev in events:
+            try:
+                ms = by_game.get(ev.get("id"))
+                if not ms:
+                    continue
+                is_live = _parse_time(ev["commence_time"]) <= now
+                quotes = _fresh_quotes(ev, self.cfg, now, is_live)
+            except Exception as e:  # noqa: BLE001 - measuring alerts must never stop them
+                print(f"  ! Markouts: {e!r:.200}", file=sys.stderr)
+                continue
+            cache: dict = {}
+            for m in ms:
+                try:
+                    self._read(m, ev, quotes, cache, now, is_live)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  ! Markouts: {m.pick} ({m.book}): {e!r:.200}", file=sys.stderr)
+
+    def _read(self, m: Markout, ev: dict, quotes: dict, cache: dict, now: datetime, is_live: bool) -> None:
+        k = (m.market, m.line)
+        if (is_live and not m.live) or k not in quotes:
+            return
+        secs = now.timestamp() - m.first_seen
+        slots = [s for s, lo, hi in MARKOUT_SLOTS if s not in m.readings and lo <= secs <= hi]
+        if not slots:
+            return
+        fair = None
+        if m.ref != "arb":
+            fair = _markout_fair(m, ev, self.cfg, now, is_live, cache)
+            if fair is None:
+                return
+        price = quotes[k].get(m.book, {}).get(m.outcome)   # fresh only: else it's not there
+        for s in slots:
+            m.readings[s] = [round(secs), price, None if fair is None else round(fair, 5)]
+        self.dirty = True
+
+    def finalize(self, now: datetime | None = None) -> int:
+        """Write the alerts that are done: every slot in or past its window, or a pre-game bet's
+        game started. Returns how many rows were written."""
+        now = now or datetime.now(timezone.utc)
+        written, keep = 0, []
+        for m in self.pending:
+            try:
+                secs = now.timestamp() - m.first_seen
+                done = (all(s in m.readings or secs > hi for s, _, hi in MARKOUT_SLOTS)
+                        or (not m.live and _parse_time(m.commence_time) <= now))
+                if not done:
+                    keep.append(m)
+                    continue
+                self.dirty = True
+                append_csv(self.cfg.markout_file, MARKOUT_FIELDS, markout_row(m))
+                written += 1
+            except Exception as e:  # noqa: BLE001 - dropped, so it can't fail on every pass
+                self.dirty = True
+                print(f"  ! Markouts: couldn't save {getattr(m, 'pick', '?')}: {e!r:.200}", file=sys.stderr)
+        self.pending = keep
+        if self.dirty:
+            self._save()
+            self.dirty = False
+        return written
+
+
+def make_markouts(cfg: Config, args, alerters: list[Alerter]) -> MarkoutTracker:
+    """The markout tracker, following every new alert of these alerters. Off (nothing followed,
+    no files written) for --once (one look can't follow anything), --demo (sample data must
+    never reach the logs) and --dry-run (a test run must not write the service's files).
+    Parlays aren't followed: their legs already are, one by one."""
+    off = args.once or args.demo or args.dry_run
+    tracker = MarkoutTracker(replace(cfg, markout_file="") if off else cfg)
+    for a in alerters:
+        if isinstance(a, ParlayAlerter):
+            continue
+        kind = "outlier" if isinstance(a, OutlierAlerter) else "ev" if isinstance(a, EVAlerter) else "arb"
+        a.on_open = lambda item, first, kind=kind: tracker.add(item, first, kind)
+    return tracker
+
+
+def markout_row(m: Markout) -> dict:
+    """The markouts.csv row for one finished alert (or arb leg)."""
+    row = {"first_seen": datetime.fromtimestamp(m.first_seen, timezone.utc).isoformat(timespec="seconds"),
+           "bet_id": _bet_id({"event_id": m.event_id, "market": m.market, "player": m.player,
+                              "outcome": m.outcome, "point": _blank(m.point)}),
+           "kind": m.kind, "live": m.live, "sport": m.sport, "sport_key": m.sport_key, "event_id": m.event_id,
+           "matchup": m.matchup, "market": m.market, "pick": m.pick, "player": m.player, "outcome": m.outcome,
+           "point": _blank(m.point), "book": m.book, "price": m.price, "skip_price": round(m.skip, 3),
+           "confidence": m.confidence, "edge_pct": round(m.edge, 2), "fair_source": m.ref,
+           "fair_at_alert": round(m.fair0, 5) if m.fair0 else "", "arb_id": m.arb_id}
+    for slot, _, _ in MARKOUT_SLOTS:
+        secs, price, fair = m.readings.get(slot) or ("", None, None)
+        row.update({f"{slot}_secs": secs, f"{slot}_price": _blank(price), f"{slot}_fair": _blank(fair),
+                    f"{slot}_pct": "" if fair is None else round(clv_pct(m.price, fair), 2)})
+    head = next((s for s in MARKOUT_HEADLINE if s in m.readings and m.readings[s][2] is not None), None)
+    if head:
+        secs, price, fair = m.readings[head]
+        row.update(markout_pct=round(clv_pct(m.price, fair), 2), markout_secs=secs,
+                   moved=who_moved(m.price, m.fair0, price, fair))
+    if "next" in m.readings:
+        price = m.readings["next"][1]
+        row["still_ok"] = int(price is not None and price >= m.skip - 1e-9)
+    return row
+
+
+def markout_group(r: dict) -> str:
+    """Live outliers, Pre-game outliers, Pre-game +EV, Live +EV, Props or Arbs."""
+    if r.get("kind") == "arb":
+        return "Arbs"
+    if r.get("player"):
+        return "Props"
+    when = "Live" if str(r.get("live")).lower() == "true" else "Pre-game"
+    return f"{when} {'outliers' if r.get('kind') == 'outlier' else '+EV'}"
+
+
+MARKOUT_GROUP_ORDER = ["Live outliers", "Pre-game outliers", "Pre-game +EV", "Live +EV", "Props", "Arbs"]
+# Only live bets get a ✅/⚠️ verdict. Pre-game prices are re-checked only every 15-60 minutes (and
+# props are all pre-game), so CLV is the better test there and a second verdict could contradict it.
+MARKOUT_JUDGED = {"Live outliers", "Live +EV"}
+
+
+def markout_rows(cfg: Config) -> list[dict]:
+    """Every finished markout at your books (MY_BOOKS), oldest first, the first card per bet only
+    (the same rule as the records: a bet that comes back after GONE, or is sent again after a
+    restart, counts once). Arb legs count apart from single bets."""
+    if not cfg.markout_file:
+        return []   # (_read_csv("") would open the bot's own folder)
+    rows = sorted((r for r in _read_csv(cfg.markout_file) if cfg.counts(r.get("book", ""))),
+                  key=lambda r: r.get("first_seen") or "")
+    out, seen = [], set()
+    for i, r in enumerate(rows):
+        key = (r.get("kind") == "arb", r.get("bet_id") or i)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _cell(v) -> float | None:
+    """A number from a CSV cell, or None if it's blank or not a number."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def markout_stats(xs: list[float]) -> tuple[int, float, float | None, float | None, float | None]:
+    """(n, mean, standard error, low end, high end of the 95% range). Under 2 values: no range."""
+    n = len(xs)
+    if n < 2:
+        return n, (xs[0] if xs else 0.0), None, None, None
+    mean = sum(xs) / n
+    se = math.sqrt(sum((x - mean) ** 2 for x in xs) / (n - 1) / n)
+    return n, mean, se, mean - 1.96 * se, mean + 1.96 * se
+
+
+def markout_verdict(n: int, lo: float | None, hi: float | None) -> str:
+    if n < MARKOUT_VERDICT_BETS or lo is None:
+        return ""
+    return "✅ real edge" if lo > 0 else "⚠️ review" if hi < 0 else ""
+
+
+def _markout_summary(name: str, rows: list[dict], slot: str = "", judge: bool = False) -> dict:
+    """One group's numbers. n = bets with a reading ("measured"), of = every bet in the group."""
+    col, secs_col = f"{slot or 'markout'}_pct", f"{slot or 'markout'}_secs"
+    measured = [r for r in rows if _cell(r.get(col)) is not None]
+    n, mean, se, lo, hi = markout_stats([_cell(r[col]) for r in measured])
+    sent = [x for x in (_cell(r.get("edge_pct")) for r in measured) if x is not None]
+    still = [r["still_ok"] == "1" for r in rows if r.get("still_ok") in ("0", "1")]
+    moved = [r.get("moved") for r in measured if r.get("moved")]
+    fixed = [x for x in moved if x in ("book", "market")]
+    secs = sorted(x for x in (_cell(r.get(secs_col)) for r in measured) if x is not None)
+    return {"name": name, "n": n, "of": len(rows), "sent": sum(sent) / len(sent) if sent else None,
+            "mean": mean if n else None, "se": se, "lo": lo, "hi": hi,
+            "still": sum(still) / len(still) * 100 if still else None,
+            "book_moved": fixed.count("book") / len(fixed) * 100 if fixed else None,
+            "pulled": moved.count("pulled") / len(moved) * 100 if moved else None,
+            "secs": secs[len(secs) // 2] if secs else None,
+            "verdict": markout_verdict(n, lo, hi) if judge else ""}
+
+
+def _arb_summary(rows: list[dict]) -> dict:
+    """Arbs: how often every leg was still there (at or above its skip price) on the next check."""
+    legs: dict[str, list[dict]] = {}
+    for r in rows:
+        legs.setdefault(r.get("arb_id", ""), []).append(r)
+    done = [v for v in legs.values() if all(r.get("still_ok") in ("0", "1") for r in v)]
+    sent = [x for x in (_cell(v[0].get("edge_pct")) for v in done) if x is not None]
+    return {"name": "Arbs", "n": len(done), "of": len(legs), "sent": sum(sent) / len(sent) if sent else None,
+            "mean": None, "se": None, "lo": None, "hi": None,
+            "still": sum(all(r["still_ok"] == "1" for r in v) for v in done) / len(done) * 100 if done else None,
+            "book_moved": None, "pulled": None, "secs": None, "verdict": ""}
+
+
+def markout_breakdown(cfg: Config) -> dict[str, list[dict]]:
+    """Markouts by alert type, then (single bets only) by book and by sport. Groups with no
+    measured bet are left out; markout_coverage counts them."""
+    rows = markout_rows(cfg)
+    single = [r for r in rows if r.get("kind") != "arb"]
+    out: dict[str, list[dict]] = {"Alert type": []}
+    for name in MARKOUT_GROUP_ORDER:
+        group = [r for r in rows if markout_group(r) == name]
+        if group:
+            out["Alert type"].append(_arb_summary(group) if name == "Arbs"
+                                     else _markout_summary(name, group, judge=name in MARKOUT_JUDGED))
+    for title, key in (("Book", "book"), ("Sport", "sport")):
+        buckets: dict[str, list[dict]] = {}
+        for r in single:
+            buckets.setdefault(r.get(key) or "?", []).append(r)
+        out[title] = sorted((_markout_summary(k, v) for k, v in buckets.items()), key=lambda g: -g["n"])
+    return {k: [g for g in v if g["n"]] for k, v in out.items()}
+
+
+def markout_coverage(cfg: Config) -> tuple[int, int]:
+    """(measured, all) pre-game bets and props: the groups without a verdict."""
+    rows = [r for r in markout_rows(cfg) if markout_group(r) not in MARKOUT_JUDGED | {"Arbs"}]
+    return sum(1 for r in rows if _cell(r.get("markout_pct")) is not None), len(rows)
+
+
+def _mk_pct(x: float | None, places: int = 1, signed: bool = True) -> str:
+    return "—" if x is None else f"{x:+.{places}f}%" if signed else f"{x:.{places}f}%"
+
+
+def _bets(g: dict, noun: str = "bet") -> str:
+    """'64 bets', or '31 of 80 bets measured' when some had no later reading."""
+    def many(k: int) -> str:
+        return f"{k} {noun}{'s' if k != 1 else ''}"
+    return many(g["n"]) if g["n"] == g["of"] else f"{g['n']} of {many(g['of'])} measured"
+
+
+def _pregame_note(cfg: Config) -> str:
+    measured, total = markout_coverage(cfg)
+    if not total:
+        return ""
+    return (f"Pre-game and props get no ✅/⚠️: they're re-checked only every 15-60 minutes, so CLV is the "
+            f"better test there (measured {measured} of {total}).")
+
+
+def markout_table(cfg: Config) -> str:
+    """The scoreboard's 📏 part: one line per alert type, all time."""
+    groups = markout_breakdown(cfg)["Alert type"]
+    if not groups:
+        return ""
+    w = max(len(name) for name in MARKOUT_GROUP_ORDER)   # every name fits, so the columns line up
+    lines = [f"{'':<{w}}{'bets':>5}{'sent':>6}{'later':>7}{'±':>5}{'still':>6}"]
+    for g in groups:
+        pm = f"{1.96 * g['se']:.1f}" if g["se"] is not None else "—"
+        mark = {"✅ real edge": " ✅", "⚠️ review": " ⚠️"}.get(g["verdict"], "")
+        lines.append(f"{g['name']:<{w}}{g['n']:>5}{_mk_pct(g['sent'], 0):>6}{_mk_pct(g['mean']):>7}{pm:>5}"
+                     f"{_mk_pct(g['still'], 0, False):>6}{mark}")
+    note = _pregame_note(cfg)
+    return ("__**📏 Did the edge hold?**__\n"
+            "Each alert's price checked again on the next checks (live: ~3 min later), against the same "
+            "fair odds its card used.\n```\n" + "\n".join(lines) + "\n```\n"
+            "Sent = the edge on the card · later = that price's edge then (± = 95% range) · still = the book "
+            "still had it, at or above the skip price, on the next check.\n"
+            f"✅ = {MARKOUT_VERDICT_BETS}+ live bets and above 0 even at the low end · ⚠️ = below 0 even at "
+            "the high end: review" + (f"\n{note}" if note else ""))
+
+
+def markout_line(g: dict) -> str:
+    """One alert type for the daily summary."""
+    still = f" · still there {g['still']:.0f}%" if g["still"] is not None else ""
+    if g["mean"] is None:   # arbs
+        return f"{g['name']}: every leg still there on the next check {_mk_pct(g['still'], 0, False)} ({_bets(g, 'arb')})"
+    rng = f", 95% range {g['lo']:+.1f}% to {g['hi']:+.1f}%" if g["lo"] is not None else ""
+    return (f"{g['name']}: sent {_mk_pct(g['sent'])} → later {g['mean']:+.1f}% ({_bets(g)}{rng}){still}"
+            + (f" · {g['verdict']}" if g["verdict"] else ""))
+
+
+def markout_books_line(cfg: Config, min_bets: int = 10) -> str:
+    """'Best book: ... · Worst: ...' for the daily summary, from books with min_bets or more."""
+    books = [g for g in markout_breakdown(cfg)["Book"] if g["n"] >= min_bets]
+    if len(books) < 2:
+        return ""
+    best, worst = max(books, key=lambda g: g["mean"]), min(books, key=lambda g: g["mean"])
+    return (f"\nBest book: {best['name']} ({best['mean']:+.1f}% later, {best['n']} bets) · "
+            f"Worst: {worst['name']} ({worst['mean']:+.1f}% later, {worst['n']} bets)")
+
+
+def markout_summary(cfg: Config) -> str:
+    """The daily summary's 📏 section ("" with no markouts yet)."""
+    groups = markout_breakdown(cfg)["Alert type"]
+    if not groups:
+        return ""
+    note = _pregame_note(cfg)
+    return ("📏 **Did the edge hold?** (each alert's price a few minutes later, against the same fair odds "
+            "its card used; all time)\n" + "\n".join(markout_line(g) for g in groups) + markout_books_line(cfg)
+            + (f"\n{note}" if note else ""))
+
+
+def markout_report(cfg: Config) -> str:
+    """Plain-text markout tables for --results: by alert type (with each slot), book and sport."""
+    lines = []
+    rows = markout_rows(cfg)
+    for group, items in markout_breakdown(cfg).items():
+        if not items:
+            continue
+        lines.append(f"  {group}:")
+        for g in items:
+            if g["mean"] is None:
+                lines.append(f"    {g['name']:<18} {_bets(g, 'arb')}: every leg still there on the next check "
+                             f"{_mk_pct(g['still'], 0, False)}")
+                continue
+            rng = f" (95% range {g['lo']:+.1f}% to {g['hi']:+.1f}%)" if g["lo"] is not None else ""
+            after = f" ~{_fmt_secs(g['secs'])} after the alert" if g["secs"] is not None else ""
+            extra = "".join(x for x in (
+                f"  still there {g['still']:.0f}%" if g["still"] is not None else "",
+                f"  book fixed it {g['book_moved']:.0f}%" if g["book_moved"] is not None else "",
+                f"  pulled {g['pulled']:.0f}%" if g["pulled"] is not None else "",
+                f"  {g['verdict']}" if g["verdict"] else ""))
+            lines.append(f"    {g['name']:<18} {_bets(g)}: sent {_mk_pct(g['sent'])} → later {g['mean']:+.1f}%"
+                         f"{rng}{after}{extra}")
+            if group == "Alert type":
+                mine = [r for r in rows if markout_group(r) == g["name"]]
+                slots = [(s, _markout_summary(s, mine, s)) for s, _, _ in MARKOUT_SLOTS]
+                if by_time := " · ".join(f"{s} {x['mean']:+.1f}% (n={x['n']}, ~{_fmt_secs(x['secs'])})"
+                                         for s, x in slots if x["n"]):
+                    lines.append(f"      by time: {by_time}")
+    note = _pregame_note(cfg)
+    if lines and note:
+        lines.append("  " + note)
+    return "\n".join(lines)
+
+
+def _safely(what: str, fn, *args) -> str:
+    """fn(*args), or "" after printing the problem: a bad markouts.csv must never stop the
+    scoreboard, the daily summary or --results (an error there would crash the bot)."""
+    try:
+        return fn(*args)
+    except Exception as e:  # noqa: BLE001
+        print(f"  ! Markouts ({what}): {e!r:.200}", file=sys.stderr)
+        return ""
+
+
 # --------------------------------------------------------------------------- schedule
 
 def seconds_until_active(cfg: Config, now: datetime | None = None) -> float:
@@ -4819,7 +5368,7 @@ One ticket with 2-3 +EV bets from different games, all at the same book. Every l
 The chance is over. Ignore it.
 
 📋 **RESULTS** (in the results channel)
-As games finish, the bot posts what hit: ✅ won, ❌ lost, ➖ push, with the profit at the stake shown, and the day's record so far. Props are graded from the box score too. 🎯 means check that one yourself. The pinned 📊 Scoreboard keeps the running record.
+As games finish, the bot posts what hit: ✅ won, ❌ lost, ➖ push, with the profit at the stake shown, and the day's record so far. Props are graded from the box score too. 🎯 means check that one yourself. The pinned 📊 Scoreboard keeps the running record; its 📏 part shows whether alert prices held up a few minutes later.
 
 **Every time**
 1. Tap the book name to open it. Check the price matches the alert, or is better.
@@ -4846,6 +5395,8 @@ def summary_payload(cfg: Config, sections: list[tuple[str, str]], credits_left: 
                       f"Worst: {worst[0]} ({worst[2]:+.1f}%, {worst[1]} bets)")
         lines.append(f"📐 **Bet quality (CLV)**\nLast 7 days: {clv_record(cfg, 7) if week else 'no closes yet'}\n"
                      f"All time: {clv_record(cfg)}\n{verdict}{detail}")
+    if marks := _safely("daily summary", markout_summary, cfg):
+        lines.append(marks)
     left = f"{credits_left:,.0f}" if credits_left is not None else "?"
     days = max(1.0, (next_reset(cfg, datetime.now(timezone.utc)) - datetime.now(timezone.utc)).total_seconds() / 86400)
     lines.append(f"💳 **Credits**\n{left} left · about {float(credits_left or 0) / days:,.0f}/day until "
@@ -4957,6 +5508,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     prop_evs = EVAlerter(cfg, dry_run=args.dry_run, noun="+EV props")
     prop_outs = OutlierAlerter(cfg, dry_run=args.dry_run, noun="prop outliers")
     prop_evs.on_log = prop_outs.on_log = tracker.add
+    # Every new alert's price is checked again on the next checks (markouts; not for --once,
+    # --demo or --dry-run).
+    markouts = make_markouts(cfg, args, [alerter, ev_alerter, out_alerter, prop_arbs, prop_evs, prop_outs])
     prop_cfg = cfg.for_props()
     sharp_history = SharpHistory(cfg.move_window_minutes)
     price_history = PriceHistory()
@@ -5024,6 +5578,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         print_day(cfg, day)
         board = scoreboard_text(cfg).split("\n\n", 1)[1]     # the day itself is printed above
         print("\n" + re.sub(r"__|\*\*|```\n?", "", board))
+        if report := _safely("--results", markout_report, cfg):
+            print("\nMarkouts (each alert's price checked again minutes later), all time:\n" + report)
         return
 
     mode = "dry run (console only)" if alerter.dry_run else "sending to Discord"
@@ -5155,6 +5711,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             print(f"[{datetime.now():%H:%M:%S}] No games live or starting soon. Waiting (no credits used).",
                   flush=True)
 
+        prop_events: list[dict] = []
         if prop_games:
             t0 = time.time()
             prop_events = [ev for ev in fetched_props if _parse_time(ev["commence_time"]) > now]
@@ -5173,6 +5730,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             print(f"[{datetime.now():%H:%M:%S}] props: {len(prop_games)} games ({time.time() - t0:.1f}s) | "
                   f"{n_arb} new arbs, {n_ev} new +EV, {n_out} new outliers | credits left {left}", flush=True)
+
+        markouts.update(main_events, prop_events, now)   # after every alert of this pass went out
 
         if (due or prop_games) and cfg.parlays_enabled:
             n_par = update_parlays()
