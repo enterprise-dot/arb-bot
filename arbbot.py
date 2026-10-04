@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import csv
+import functools
 import gzip
 import hashlib
 import itertools
@@ -67,11 +68,21 @@ CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 # ALERT_MODE=locks floors: only alerts worth acting on.
 LOCKS = {
-    "arb_pct": 2.0, "live_arb_pct": 3.0, "arb_dollars": 0.0,   # $2+ per $100 staked, guaranteed
+    "arb_pct": 2.0, "live_arb_pct": 5.0, "arb_dollars": 0.0,   # $2+ per $100 staked, guaranteed
     "ev_pct": 5.0, "prop_ev_pct": 8.0, "min_confidence": "high",
-    "outlier_pct": 15.0, "parlay_ev_pct": 15.0, "parlay_legs": 2,
+    "outlier_pct": 15.0, "outlier_live_pct": 20.0, "parlay_ev_pct": 15.0, "parlay_legs": 2,
     "ev_per_hour": 6, "prop_per_hour": 6, "parlay_per_hour": 2,
+    "arb_per_hour": 4, "outlier_per_hour": 6,
+    "live_per_hour": 3,   # every live alert together (arbs, outliers, live +EV): fewer live, more pre-game
+    # A live alert pings only when two checks in a row find it, and the price you're told to bet
+    # was updated by its book in the last 60 seconds: so it's still there when you tap it.
+    "live_confirm": 2, "live_max_age": 60,
 }
+
+# An arb whose price that will move is on Kalshi, with every sportsbook bet at or worse than fair,
+# is easy on your sportsbook accounts (they only see normal bets). It ranks this many points higher
+# for the hourly caps; the card doesn't change.
+ACCOUNT_SAFE_BONUS = 0.5
 
 # Bigger minimum edge where the sharp line is less reliable (lots of small games).
 DEFAULT_SPORT_MIN_EV = {"americanfootball_ncaaf": 6.0, "basketball_ncaab": 6.0}
@@ -83,6 +94,14 @@ WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 BOOK_TITLES = {"williamhill_us": "Caesars", "espnbet": "ESPN BET", "hardrockbet": "Hard Rock Bet",
                "ballybet": "Bally Bet", "betonlineag": "BetOnline.ag", "lowvig": "LowVig.ag",
                "mybookieag": "MyBookie.ag", "betparx": "betPARX", "betrivers": "BetRivers", "fanatics": "Fanatics"}
+
+# New York's licensed sportsbooks can't take bets on a game with a New York college team in it
+# (Racing, Pari-Mutuel Wagering and Breeding Law 1367). Kalshi (an exchange) isn't one of them.
+NY_BOOKS = {"fanduel", "draftkings", "betmgm", "williamhill_us", "betrivers", "fanatics", "ballybet"}
+NY_SCHOOLS = ["albany", "ualbany", "army", "binghamton", "buffalo", "canisius", "clarkson", "colgate", "columbia",
+              "cornell", "fordham", "hobart", "hofstra", "iona", "le moyne", "liu", "long island", "manhattan",
+              "marist", "niagara", "rensselaer", "rpi", "rit", "siena", "st bonaventure", "st johns",
+              "st lawrence", "stony brook", "syracuse", "union", "wagner"]   # as _words() spells them
 
 # Prop markets checked per sport (each one costs a credit per game per check).
 DEFAULT_PROP_MARKETS = {
@@ -207,6 +226,7 @@ class Config:
     my_books: str = ""
     kalshi_fee_rate: float = 0.07   # Kalshi's trading fee factor (fee = rate x P x (1-P) per $1 contract)
     us_state: str = ""              # two letters (e.g. nj); some books' links need it (sports.{state}.betmgm.com)
+    ny_rules: bool = False          # New York: no NY sportsbook on games with a New York college team
     poll_seconds: int = 60        # fastest check rate for sports with live games
     pregame_minutes: int = 15     # check rate before kickoff (0 = live games only)
     pregame_hours: float = 2.0    # how far before kickoff pre-game checks start
@@ -231,6 +251,9 @@ class Config:
     max_ev_per_hour: int = 0      # cap on new +EV alerts per hour, best first (0 = no cap)
     max_prop_per_hour: int = 0
     max_parlay_per_hour: int = 0
+    max_arb_per_hour: int = 0     # arbs and prop arbs together
+    max_outlier_per_hour: int = 0  # outliers and prop outliers together
+    live_per_hour: int = 0        # every new live alert together: arbs, outliers, live +EV
     max_age_seconds: int = 120    # live games: ignore prices not updated this recently
     pregame_max_age_seconds: int = 900  # pre-game lines can sit unchanged for a while
     realert_jump_pct: float = 2.5  # send a fresh alert if the edge grows by this many points
@@ -240,6 +263,8 @@ class Config:
     arb_live: bool = True         # alert on arbs in games already in progress
     min_live_profit_pct: float = 1.0  # live gaps are often one book lagging; ask for more
     live_arb_max_skew: int = 60   # live arb legs must be priced within this many seconds of each other
+    live_confirm_checks: int = 1  # a new live alert pings once this many checks in a row find it (1 = off)
+    live_max_age_alert: int = 0   # ...and only if the price to bet is at most this many seconds old (0 = off)
     live_sports: list[str] = field(default_factory=list)  # sports to check while live ([] = all)
     live_webhook_url: str = ""    # send live arbs to a separate Discord channel
     ev_webhook_url: str = ""      # +EV (incl. props) channel; outliers and parlays fall back to it
@@ -273,6 +298,7 @@ class Config:
     max_sharp_hold_pct: float = 8.0       # skip if the sharp's own margin is wider than this
     sharp_consensus_max_gap: float = 10.0  # skip if sharp and the other books' median differ by more (points)
     min_confidence: str = "low"           # low / medium / high: alert only at or above this
+    confident_hours: float = 24           # main lines this close to kickoff can be high confidence
     sport_min_ev: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SPORT_MIN_EV))
     move_window_minutes: int = 60         # how far back to look for sharp line movement
     confidence_stakes: str = "1,0.75,0.5"  # stake multiplier for high, medium, low
@@ -315,6 +341,7 @@ class Config:
     # Outliers: one book far off every other book's price
     outliers_enabled: bool = True
     outlier_min_pct: float = 10.0   # edge vs the other books' median fair price
+    outlier_live_min_pct: float = 0  # live outliers need this edge (0 = OUTLIER_MIN_PCT)
     outlier_min_books: int = 3      # need at least this many other books to compare against
     outlier_live: bool = True       # live is where stale books show up most
     outlier_mention: str = ""
@@ -365,6 +392,8 @@ class Config:
             my_books=e("MY_BOOKS", ""),
             kalshi_fee_rate=num("KALSHI_FEE_RATE", d.kalshi_fee_rate, float),
             us_state=e("US_STATE", "").strip().lower(),
+            ny_rules=(e("NY_RULES") or ("true" if e("US_STATE", "").strip().lower() == "ny" else "false")
+                      ).strip().lower() in ("1", "true", "yes"),
             poll_seconds=num("POLL_SECONDS", d.poll_seconds, int),
             pregame_minutes=num("PREGAME_MINUTES", d.pregame_minutes, int),
             pregame_hours=num("PREGAME_HOURS", d.pregame_hours, float),
@@ -384,6 +413,9 @@ class Config:
             max_ev_per_hour=num("MAX_EV_PER_HOUR", d.max_ev_per_hour, int),
             max_prop_per_hour=num("MAX_PROP_PER_HOUR", d.max_prop_per_hour, int),
             max_parlay_per_hour=num("MAX_PARLAY_PER_HOUR", d.max_parlay_per_hour, int),
+            max_arb_per_hour=num("MAX_ARB_PER_HOUR", d.max_arb_per_hour, int),
+            max_outlier_per_hour=num("MAX_OUTLIER_PER_HOUR", d.max_outlier_per_hour, int),
+            live_per_hour=num("LIVE_PER_HOUR", d.live_per_hour, int),
             min_profit_dollars=num("MIN_PROFIT_DOLLARS", d.min_profit_dollars, float),
             max_profit_pct=num("MAX_PROFIT_PCT", d.max_profit_pct, float),
             max_age_seconds=num("MAX_AGE_SECONDS", d.max_age_seconds, int),
@@ -395,6 +427,8 @@ class Config:
             arb_live=e("ARB_LIVE", "true").lower() in ("1", "true", "yes"),
             min_live_profit_pct=num("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct, float),
             live_arb_max_skew=num("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew, int),
+            live_confirm_checks=num("LIVE_CONFIRM_CHECKS", d.live_confirm_checks, int),
+            live_max_age_alert=num("LIVE_MAX_AGE_ALERT", d.live_max_age_alert, int),
             live_sports=_csv(e("LIVE_SPORTS", "")),
             live_webhook_url=e("DISCORD_LIVE_WEBHOOK_URL", ""),
             ev_webhook_url=e("DISCORD_EV_WEBHOOK_URL", ""),
@@ -425,6 +459,7 @@ class Config:
             max_sharp_hold_pct=num("MAX_SHARP_HOLD_PCT", d.max_sharp_hold_pct, float),
             sharp_consensus_max_gap=num("SHARP_CONSENSUS_MAX_GAP", d.sharp_consensus_max_gap, float),
             min_confidence=e("MIN_CONFIDENCE", d.min_confidence).strip().lower(),
+            confident_hours=num("CONFIDENT_HOURS", d.confident_hours, float),
             sport_min_ev={**d.sport_min_ev, **pairs("SPORT_MIN_EV", float)},
             move_window_minutes=num("MOVE_WINDOW_MINUTES", d.move_window_minutes, int),
             confidence_stakes=(e("CONFIDENCE_STAKES") or d.confidence_stakes).replace(";", ","),
@@ -464,6 +499,7 @@ class Config:
             closing_minutes=num("CLOSING_MINUTES", d.closing_minutes, int),
             outliers_enabled=e("OUTLIERS_ENABLED", "true").lower() in ("1", "true", "yes"),
             outlier_min_pct=num("OUTLIER_MIN_PCT", d.outlier_min_pct, float),
+            outlier_live_min_pct=num("OUTLIER_LIVE_MIN_PCT", d.outlier_live_min_pct, float),
             outlier_min_books=num("OUTLIER_MIN_BOOKS", d.outlier_min_books, int),
             outlier_live=e("OUTLIER_LIVE", "true").lower() in ("1", "true", "yes"),
             outlier_mention=e("OUTLIER_MENTION", ""),
@@ -501,7 +537,7 @@ class Config:
 
     def with_mode(self) -> "Config":
         """Apply ALERT_MODE. "locks" raises every bar to at least the levels below (your own
-        stricter settings still win) and caps how many +EV-style alerts go out per hour."""
+        stricter settings still win) and caps how many alerts go out per hour, live ones most."""
         if self.alert_mode != "locks":
             return self
         L = LOCKS
@@ -515,12 +551,18 @@ class Config:
             min_ev_pct=max(self.min_ev_pct, L["ev_pct"]),
             prop_min_ev_pct=max(self.prop_min_ev_pct, L["prop_ev_pct"]),
             outlier_min_pct=max(self.outlier_min_pct, L["outlier_pct"]),
+            outlier_live_min_pct=max(self.outlier_live_min_pct, L["outlier_live_pct"]),
             parlay_min_ev_pct=max(self.parlay_min_ev_pct, L["parlay_ev_pct"]),
             parlay_max_legs=min(self.parlay_max_legs, L["parlay_legs"]),
             min_confidence=conf,
             max_ev_per_hour=cap(self.max_ev_per_hour, L["ev_per_hour"]),
             max_prop_per_hour=cap(self.max_prop_per_hour, L["prop_per_hour"]),
             max_parlay_per_hour=cap(self.max_parlay_per_hour, L["parlay_per_hour"]),
+            max_arb_per_hour=cap(self.max_arb_per_hour, L["arb_per_hour"]),
+            max_outlier_per_hour=cap(self.max_outlier_per_hour, L["outlier_per_hour"]),
+            live_per_hour=cap(self.live_per_hour, L["live_per_hour"]),
+            live_confirm_checks=max(self.live_confirm_checks, L["live_confirm"]),
+            live_max_age_alert=cap(self.live_max_age_alert, L["live_max_age"]),
         )
 
     def bad_webhooks(self) -> list[str]:
@@ -539,10 +581,12 @@ class Config:
                 setattr(self, attr, "")
         return bad
 
-    def bettable(self, book_key: str) -> bool:
-        """Can alerts tell you to bet at this book?"""
+    def bettable(self, book_key: str, ev: dict | None = None) -> bool:
+        """Can alerts tell you to bet at this book (on this game, when given)?"""
         mine = _csv(self.my_books)
-        return not mine or book_key in mine
+        if mine and book_key not in mine:
+            return False
+        return not (ev is not None and self.ny_rules and book_key in NY_BOOKS and ny_college_game(ev))
 
     def counts(self, book_title: str) -> bool:
         """Does a logged bet at this book count in your results? Only your books (MY_BOOKS) do:
@@ -596,6 +640,7 @@ class Leg:
     stake: float = 0.0
     link: str = ""    # deep link to the bet slip, when the book provides one
     updated: datetime | None = None  # when the book last updated this price
+    edge: float | None = None        # % better (+) or worse (-) than Pinnacle's fair odds (None: no fair price)
 
 
 @dataclass
@@ -610,6 +655,34 @@ class Arb:
     legs: list[Leg]
     margin: float     # sum of 1/price; < 1.0 means arb
     sport_key: str = ""
+    age: float | None = None   # seconds since the oldest bet price was updated, when first sent (None = unknown)
+    fair_from: str = ""        # whose fair odds the legs' edges are from ("Pinnacle"; "" = none priced it)
+    keep_stake: float = 0.0    # the first leg is a good bet alone: what to stake on it by itself (0 = it isn't)
+    ages: str = ""             # how old each price was, the sharp book's too: "DraftKings 12s; FanDuel 40s; Pinnacle 3s"
+    first: dict = field(default_factory=dict)   # snapshot() as first sent (arbs.csv describes that alert)
+    found: tuple = ()          # live, once the live checks confirm it: (first check that found it, checks in a row)
+
+    @property
+    def tagged(self) -> bool:
+        """Pinnacle prices the line, so legs[0] is the price that will move (bet it first)."""
+        return bool(self.legs) and self.legs[0].edge is not None
+
+    @property
+    def account_safe(self) -> bool:
+        """The price that will move is on Kalshi and every sportsbook bet is at or worse than fair."""
+        return (self.tagged and self.legs[0].book.lower().startswith("kalshi")
+                and all(l.edge <= 0 for l in self.legs[1:]))
+
+    def snapshot(self) -> dict:
+        """What arbs.csv says about the alert itself: the price that would move and by how much,
+        every leg's edge against fair in card order (the other legs' cost), and how old each price
+        was, Pinnacle's included. Two possible rules, "the other bets must be near fair" and "live:
+        Pinnacle's price must be fresh too", are only measured from these for now, never applied."""
+        t = self.tagged
+        return {"stale_book": self.legs[0].book if t else "",
+                "stale_edge_pct": round(self.legs[0].edge, 2) if t else "",
+                "leg_edges": "; ".join(f"{l.book} {l.edge:+.1f}%" for l in self.legs) if t else "",
+                "fair_from": self.fair_from, "leg_ages": self.ages}
 
     @property
     def exact_pct(self) -> float:
@@ -840,6 +913,67 @@ def _line_for(market: str, outcome: dict, home_team: str):
     return point
 
 
+def _one_line(mkt: dict, home_team: str) -> bool:
+    """The market holds a single line (a moneyline, the main spread or total), so its time stamp is
+    when that price last changed. A player-prop market holds every player's line under one stamp,
+    which says nothing about any one of them."""
+    return len({_line_for(mkt["key"], oc, home_team) for oc in mkt.get("outcomes", [])}) == 1
+
+
+def ny_college_game(ev: dict) -> bool:
+    """A college game with a New York school in it (New York's sportsbooks can't take it)."""
+    if "ncaa" not in (ev.get("sport_key") or ""):
+        return False
+    return _ny_school(ev.get("home_team", "")) or _ny_school(ev.get("away_team", ""))
+
+
+@functools.lru_cache(maxsize=4096)
+def _ny_school(team: str) -> bool:
+    """"Buffalo Bulls" and "St. John's Red Storm" are New York schools; "Buffalo State" and
+    "Albany St" aren't (the same check Kalshi team names use: COLLEGE_QUALIFIERS)."""
+    w = ["st" if x == "saint" else x for x in _words(team)]
+    for school in NY_SCHOOLS:
+        s = school.split()
+        if w[:len(s)] == s and (len(w) == len(s) or w[len(s)] not in COLLEGE_QUALIFIERS):
+            return True
+    return False
+
+
+def mark_will_move(arb: Arb, probs: dict[str, float], fair_from: str, cfg: Config) -> None:
+    """With Pinnacle's fair odds on every side, put the leg that beats them most first: that price is
+    off, so it's the one that will move. Bet it first; if the other price is gone, it's still a good
+    bet alone when its own edge clears the +EV minimum (keep_stake: the +EV stake for it)."""
+    if not arb.legs or set(probs) != {l.outcome for l in arb.legs}:
+        return   # no fair price for every side: today's order and wording
+    for l in arb.legs:
+        l.edge = (probs[l.outcome] * l.price - 1) * 100
+    arb.legs.sort(key=lambda l: (-round(l.edge, 1), l.outcome))
+    arb.fair_from = fair_from
+    top = arb.legs[0]
+    floor = max(cfg.prop_min_ev_pct if is_prop(arb.line) else cfg.min_ev_pct,
+                cfg.sport_min_ev.get(arb.sport_key, 0))
+    if top.edge >= floor:
+        arb.keep_stake = kelly_stake(probs[top.outcome], top.price, cfg)
+
+
+def price_ages(arb: Arb, ev: dict, cfg: Config, now: datetime) -> str:
+    """"DraftKings 12s; FanDuel 40s; Pinnacle 3s": how old each price to bet was (card order),
+    then each sharp book's price on the same market. "?" = not known (a player prop: the book's one
+    time stamp covers every player's line)."""
+    def age(t: datetime) -> str:
+        return _fmt_secs(max(0.0, (now - t).total_seconds()))
+    parts = [f"{l.book} {age(l.updated) if l.updated else '?'}" for l in arb.legs]
+    sharp = _csv(cfg.sharp_books)
+    for bm in ev.get("bookmakers", []):
+        if bm["key"] in sharp:
+            mkt = next((m for m in bm.get("markets", []) if m["key"] == arb.market), None)
+            ts = mkt and (mkt.get("last_update") or bm.get("last_update"))
+            if ts:
+                parts.append(f"{bm.get('title', bm['key'])} "
+                             f"{age(_parse_time(ts)) if _one_line(mkt, ev['home_team']) else '?'}")
+    return "; ".join(parts)
+
+
 def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> list[Arb]:
     now = now or datetime.now(timezone.utc)
     arbs: list[Arb] = []
@@ -851,17 +985,20 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
         if (cfg.live_only and not is_live) or (is_live and not cfg.arb_live):
             continue
 
+        fair = None   # Pinnacle's no-vig prices for this game, worked out once if it has an arb
         # (market, line) -> outcome name -> best Leg
         best: dict[tuple, dict[str, Leg]] = {}
         # (market, line) -> most outcomes any single book offers (2 or 3-way)
         n_outcomes: dict[tuple, int] = {}
 
         for bm in ev.get("bookmakers", []):
-            if bm["key"] in sharp_only or not cfg.bettable(bm["key"]):
-                continue  # reference-only book (e.g. Pinnacle), or one you don't bet at
+            if bm["key"] in sharp_only or not cfg.bettable(bm["key"], ev):
+                continue  # reference-only book (e.g. Pinnacle), or one you can't bet at
             for mkt in bm.get("markets", []):
                 if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue  # stale price, likely already moved
+                # When the book last changed the price (unknown for a prop: one stamp for every player).
+                ts = (mkt.get("last_update") or bm.get("last_update")) if _one_line(mkt, ev["home_team"]) else None
                 per_line: dict[tuple, int] = {}
                 for oc in mkt.get("outcomes", []):
                     price = float(oc.get("price") or 0)
@@ -874,7 +1011,6 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
                     title = bm.get("title", bm["key"])
                     if cur is None or price > cur.price or (price == cur.price and title < cur.book):
                         link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
-                        ts = mkt.get("last_update") or bm.get("last_update")
                         slot[oc["name"]] = Leg(oc["name"], price, title, link=link,
                                                updated=_parse_time(ts) if ts else None)
                 for k, n in per_line.items():
@@ -902,6 +1038,8 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
                 margin=margin,
                 sport_key=ev.get("sport_key", ""),
             )
+            if all(l.updated for l in legs):
+                arb.age = max(0.0, max((now - l.updated).total_seconds() for l in legs))
             if is_live and cfg.live_arb_max_skew:
                 stamps = [l.updated for l in arb.legs if l.updated]
                 if len(stamps) == len(arb.legs) and \
@@ -911,6 +1049,10 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
             if min_pct <= arb.exact_pct <= cfg.max_profit_pct:
                 arb.set_stakes(cfg.bankroll, cfg.round_stakes, cfg.round_keep_pct)
                 if arb.profit_pct >= min_pct and arb.guaranteed_profit >= cfg.min_profit_dollars:
+                    if fair is None:
+                        fair, sharp_name = sharp_fair(ev, cfg, now, is_live)[:2]
+                    mark_will_move(arb, fair.get((market, line), {}), sharp_name.get((market, line), ""), cfg)
+                    arb.ages = price_ages(arb, ev, cfg, now)
                     arbs.append(arb)
 
     return sorted(arbs, key=lambda a: a.profit_pct, reverse=True)
@@ -1003,12 +1145,23 @@ def _fmt_secs(s: float) -> str:
     return f"{s}s" if s < 90 else f"{s // 60}m {s % 60:02d}s"
 
 
+def _age_note(age: float | None, many: bool = False) -> str:
+    """'⏱ price was 35s old when sent': how long the book had shown the price when the alert went
+    out (the bigger it is, the likelier it has moved by the time you tap)."""
+    if age is None:
+        return ""
+    s = int(round(age))
+    when = f"{s}s" if s < 90 else f"{round(s / 60)} min" if s < 5400 else f"{s / 3600:.0f}h"
+    return f"\n⏱ {'prices were up to' if many else 'price was'} {when} old when sent"
+
+
 def format_text(arb: Arb) -> str:
     status = "🔴 LIVE" if arb.is_live else f"starts {arb.commence_time}"
     rows = "\n".join(
         f"  • {l.outcome} {odds(l.price)} on {l.book}  → stake {money(l.stake)}"
+        + (f"  (bet first: {l.edge:+.1f}% vs {arb.fair_from})" if i == 0 and arb.tagged else "")
         + (f"\n    {l.link}" if l.link else "")
-        for l in arb.legs
+        for i, l in enumerate(arb.legs)
     )
     return (
         f"💰 {arb.profit_pct:.2f}% ARB | {arb.sport} | {arb.matchup} ({status})\n"
@@ -1075,17 +1228,31 @@ def discord_payload(arb: Arb, mention: str = "", gone_after: float | None = None
         skip = f"\n     ↳ skip if the price is worse than {odds(worst)}" if worst else ""
         num = ["1️⃣", "2️⃣", "3️⃣"][i] if i < 3 else "•"
         what = f"{arb.line[0]} {l.outcome} {arb.line[1]:g}" if is_prop(arb.line) else l.outcome
+        first = ""
+        if i == 0 and arb.tagged:
+            first = "\n     ↳ **Bet this one first:** it's the price that will move."
+            if arb.keep_stake:
+                first += (f"\n     ↳ If the other price{'s are' if len(arb.legs) > 2 else ' is'} gone, keep this one: "
+                          f"it's a good bet alone. Only betting this one? Bet **{money(arb.keep_stake)}**.")
         steps.append(f"{num} Open **{_link(l.book, l.link)}** → bet "
-                     f"**{money(l.stake)}** on **{what} {odds(l.price)}**{skip}")
+                     f"**{money(l.stake)}** on **{what} {odds(l.price)}**{skip}{first}")
     rounding = (f"\n*{arb.exact_pct:.2f}% with exact stakes; rounded to look like normal bets*"
                 if arb.exact_pct - arb.profit_pct >= 0.05 else "")
-    desc = (f"👉 **DO THIS NOW: place BOTH bets. You profit no matter who wins.**\n\n"
+    if arb.tagged:
+        both, rest = ("BOTH", "2️⃣") if len(arb.legs) == 2 else (f"all {len(arb.legs)}", "the others")
+        head = f"place {both} bets, 1️⃣ first"
+        order = (f"\nPlace 1️⃣ first, then {rest} right away. If 1️⃣ has moved past its skip line, "
+                 f"skip {'both' if len(arb.legs) == 2 else 'them all'}.")
+    else:
+        head = "place BOTH bets"
+        order = "\nDo them back to back. If one price moved past its skip line, don't place the other."
+    desc = (f"👉 **DO THIS NOW: {head}. You profit no matter who wins.**\n\n"
             + "\n\n".join(steps)
             + f"\n\n💵 You bet **{money(arb.total_stake)}** and get back at least "
               f"**{money(arb.guaranteed_return)}** (+{money(arb.guaranteed_profit)}).{rounding}"
-            + "\nDo them back to back. If one price moved past its skip line, don't place the other."
+            + order
             + f"\n\n───────────────\n{sport_icon(arb.sport_key)} **{arb.sport}** · {arb.matchup}\n"
-              f"{market} · {_when(arb.is_live, arb.commence_time, first_seen)}")
+              f"{market} · {_when(arb.is_live, arb.commence_time, first_seen)}" + _age_note(arb.age, many=True))
     return _card(f"💰 ARB · +{money(arb.guaranteed_profit)} guaranteed ({arb.profit_pct:.2f}%)", desc,
                  0xE74C3C if arb.is_live else 0x2ECC71, url=arb.legs[0].link,
                  footer="ARB = bet every side at different books, profit locked in.", mention=mention)
@@ -1127,6 +1294,9 @@ class OpenArb:
     alerted_pct: float = 0.0  # edge when we last sent a (pinging) alert
     card: str = ""            # hash of the card as last sent; a different one means edit it
     retry: bool = False       # the first post failed before Discord got it: safe to send again
+    checks: int = 1           # how many checks found it (live: the ones that confirmed it too)
+    spotted: float = 0.0      # when a check first found it (live: before the checks that confirmed it); 0 = first_seen
+    better: int = 0           # live: checks in a row that found a much better price not re-alerted yet
 
 
 def data_path(name: str) -> Path:
@@ -1162,7 +1332,27 @@ def append_csv(name: str, fields: list[str], row: dict) -> None:
 
 
 LOG_FIELDS = ["first_seen", "gone_at", "seconds_open", "sport", "matchup", "market", "line",
-              "live", "best_profit_pct", "legs"]
+              "live", "best_profit_pct", "legs", "checks", "spotted", "stale_book", "stale_edge_pct", "leg_edges",
+              "fair_from", "leg_ages", "reason"]
+HELD_LOG_GAP = 900   # an arb held back again within this many seconds isn't logged again
+
+
+def _utc(t: float) -> str:
+    return datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="seconds")
+
+
+class HourlyCap:
+    """New alerts in the last hour, counted across every alerter that shares it (LIVE_PER_HOUR:
+    every live alert, whatever its kind, and every better-price re-alert on a live one)."""
+
+    def __init__(self, limit: int = 0):
+        self.limit = limit      # 0 = no cap
+        self.times: list[float] = []
+
+    def room(self, now: float) -> float:
+        """How many more may go out this hour (infinite without a cap)."""
+        self.times[:] = [t for t in self.times if now - t < 3600]
+        return self.limit - len(self.times) if self.limit else math.inf
 
 
 class Alerter:
@@ -1178,6 +1368,7 @@ class Alerter:
     on_log = None  # optional callback(row) after a row is logged
     on_open = None  # optional callback(item, first_seen) when a brand-new alert goes out (markouts)
     log_on_open = False  # arbs are logged when they close, so the row has how long it lasted
+    log_held = True      # arbs the caps or live rules held back go in the log too, with the reason
 
     RESTORE_GRACE = 900  # seconds a restored alert gets to show up again before it's marked gone
     scoped = True        # handle() is told which sports/games were checked (parlays: no)
@@ -1191,7 +1382,10 @@ class Alerter:
         self.restored: dict[str, dict] = {}
         self.started = time.time()
         self.max_per_hour = 0          # 0 = no cap
-        self.posted_at: list[float] = []
+        self.posted_at: list[float] = []   # may be shared with a sibling (arbs and prop arbs: one count)
+        self.live_cap: HourlyCap | None = None   # the cap every live alert shares (LIVE_PER_HOUR)
+        self.held_counts: dict[str, int] = {}    # alerts held back, by why (the console line)
+        self.held_logged: dict[tuple, float] = {}  # (key, why) -> last time it was held back
         self.handed: dict[str, float] = {}  # key -> first_seen, for bets taken over from a sibling alerter
         self.send_retryable = False
         self.reset_stats()
@@ -1220,7 +1414,8 @@ class Alerter:
         if not path:
             return
         data = {k: {"message_id": op.message_id, "url": op.url, "first_seen": op.first_seen,
-                    "alerted_pct": op.alerted_pct, "best_pct": op.best_pct, "card": op.card,
+                    "alerted_pct": op.alerted_pct, "best_pct": op.best_pct, "card": op.card, "checks": op.checks,
+                    "spotted": op.spotted,
                     "label": self.label(op.arb), "sport_key": op.arb.sport_key,
                     "event_id": op.arb.event_id, "commence_time": getattr(op.arb, "commence_time", ""),
                     **self.extra_state(op.arb)}
@@ -1243,7 +1438,8 @@ class Alerter:
         op = OpenArb(arb, saved["first_seen"], now, max(saved.get("best_pct", 0), self.value(arb)),
                      message_id=saved.get("message_id"), url=saved.get("url", ""),
                      alerted_pct=saved.get("alerted_pct", self.value(arb)),
-                     card=self.card_hash(arb, saved["first_seen"]))
+                     card=self.card_hash(arb, saved["first_seen"]), checks=saved.get("checks", 1),
+                     spotted=saved.get("spotted") or 0.0)
         self.open[arb.key] = op
         if saved.get("card") != op.card and op.message_id:
             self._discord(self.payload(arb, first_seen=op.first_seen), op.message_id, op.url)
@@ -1294,15 +1490,93 @@ class Alerter:
     def mention(self) -> str:
         return self.cfg.discord_mention
 
+    def ranked(self, items: list) -> list:
+        """The order new alerts go out in, so an hourly cap keeps the best: games that haven't
+        started first (you have time to place them), then the biggest edge, an account-safe arb
+        counting ACCOUNT_SAFE_BONUS points more."""
+        def score(it) -> float:
+            return self.value(it) + (ACCOUNT_SAFE_BONUS if getattr(it, "account_safe", False) else 0)
+        return sorted(items, key=lambda it: (bool(getattr(it, "is_live", False)), -score(it)))
+
+    def capped(self, item, now: float) -> str:
+        """Why an hourly cap holds this new alert back: "capped" (its own kind's cap), "live cap"
+        (the cap all live alerts share), or "" when both have room (the slots are then taken)."""
+        live = self.live_cap if getattr(item, "is_live", False) and self.live_cap else None
+        if self.max_per_hour:
+            self.posted_at[:] = [t for t in self.posted_at if now - t < 3600]   # in place: it may be shared
+            if len(self.posted_at) >= self.max_per_hour:
+                return "capped"
+        if live is not None and live.room(now) <= 0:
+            return "live cap"
+        if self.max_per_hour:
+            self.posted_at.append(now)
+        if live is not None:
+            live.times.append(now)
+        return ""
+
+    def reping_waits(self, item, op: OpenArb, age: float | None, now: float) -> str:
+        """A much better price on an open alert gets a new, pinging alert. When the bet is live, that
+        ping follows the live rules like any new live alert: the price to bet is fresh
+        (LIVE_MAX_AGE_ALERT), LIVE_CONFIRM_CHECKS checks in a row found the better price, and
+        LIVE_PER_HOUR has room (the ping takes a slot). Returns what it waits for ("old price",
+        "waiting", "live cap"), or "" when it may ping now. Until then the card is only edited and the
+        edge it was alerted at stays, so a later check can still send it."""
+        if not getattr(item, "is_live", False):
+            return ""
+        limit = self.cfg.live_max_age_alert
+        if limit and (age is None or age > limit):
+            op.better = 0     # not a sighting: counting starts again at the next fresh one
+            return "old price"
+        op.better += 1
+        if op.better < self.cfg.live_confirm_checks:
+            return "waiting"
+        if self.live_cap is not None:
+            if self.live_cap.room(now) <= 0:
+                return "live cap"
+            self.live_cap.times.append(now)
+        return ""
+
+    def note_held(self, item, why: str, now: float, first_seen: float | None = None, checks: int = 1) -> None:
+        """An alert the hourly caps or the live rules held back: not posted, not followed. Counted
+        for the console line. Arbs also go in arbs.csv with the reason ("capped", "live cap", "old
+        price", "unconfirmed": gone before enough checks found it), once per stretch of checks, so the rules
+        can be tuned from what they held back. `spotted` is when a check first found it, as on alerted rows."""
+        self.held_counts[why] = self.held_counts.get(why, 0) + 1
+        if not self.log_held or why == "waiting" or not self.log_path():
+            return
+        last, self.held_logged[(item.key, why)] = self.held_logged.get((item.key, why)), now
+        if len(self.held_logged) > 2000:
+            self.held_logged = {k: t for k, t in self.held_logged.items() if now - t <= HELD_LOG_GAP}
+        if last is not None and now - last <= HELD_LOG_GAP:
+            return
+        first, gone = first_seen or now, why == "unconfirmed"
+        found = getattr(item, "found", ())   # confirmed by the live checks, then capped
+        row = {**self.row(OpenArb(item, first, now, self.value(item), spotted=found[0] if found else first)),
+               "first_seen": _utc(first), "gone_at": _utc(now) if gone else "",
+               "seconds_open": round(now - first) if gone else "", "checks": checks if gone else "", "reason": why}
+        append_csv(self.log_path(), self.log_fields, row)
+
     def carry(self, old, new) -> None:
-        """Copy anything from the previous sighting the new one should remember."""
+        """Copy anything from the previous sighting the new one should remember: how old the price
+        was when the alert went out (an edit doesn't change it)."""
+        if hasattr(new, "age"):
+            new.age = old.age
+        if isinstance(new, Arb):
+            new.first = old.first or old.snapshot()   # arbs.csv describes the alert as first sent
 
     def extra_state(self, item) -> dict:
         """What carry() remembers, saved so a restart can rebuild the same card."""
-        return {}
+        out = {"age": item.age} if hasattr(item, "age") else {}
+        if isinstance(item, Arb):
+            out["first"] = item.first or item.snapshot()
+        return out
 
     def restore_extra(self, item, saved: dict) -> None:
         """Put extra_state back onto a freshly found item after a restart."""
+        if hasattr(item, "age"):
+            item.age = saved.get("age")   # none saved (an older version sent it): unknown, not today's age
+        if isinstance(item, Arb) and isinstance(saved.get("first"), dict):
+            item.first = saved["first"]
 
     def log_path(self) -> str:
         return self.cfg.log_file
@@ -1314,6 +1588,8 @@ class Alerter:
             "line": "" if a.line is None else a.line, "live": a.is_live,
             "best_profit_pct": round(op.best_pct, 2),
             "legs": "; ".join(f"{l.outcome} @{l.price} {l.book}" for l in a.legs),
+            "checks": op.checks, "spotted": _utc(op.spotted or op.first_seen), **(a.first or a.snapshot()),
+            "reason": "",
         }
 
     def webhook_for(self, item) -> str:
@@ -1348,20 +1624,21 @@ class Alerter:
         now = now or time.time()
         new = 0
         seen = set()
-        for arb in arbs:
+        for arb in self.ranked(arbs):
             seen.add(arb.key)
+            fresh_age = getattr(arb, "age", None)   # (before a restored card puts back the age it was sent with)
             cur = self.open.get(arb.key) or self._restore(arb, now)
             handed = self.handed.pop(arb.key, None)
-            if cur is None and self.max_per_hour and handed is None:
-                self.posted_at = [t for t in self.posted_at if now - t < 3600]
-                if len(self.posted_at) >= self.max_per_hour:
-                    continue  # hourly cap reached; items arrive best-first, so the best already went out
-                self.posted_at.append(now)
+            if cur is None and handed is None and (why := self.capped(arb, now)):
+                self.note_held(arb, why, now)
+                continue  # an hourly cap is full; the best go first, so the best already went out
             if cur is None:
                 print(self.text(arb), flush=True)
                 first = handed or now
+                found = getattr(arb, "found", ())   # live: the checks that confirmed it count too
                 op = OpenArb(arb, first, now, self.value(arb), alerted_pct=self.value(arb),
-                             url=self.webhook_for(arb))
+                             url=self.webhook_for(arb), checks=found[1] if found else 1,
+                             spotted=found[0] if found else first)
                 op.message_id = self._discord(self.payload(arb, self.mention(), first_seen=first), url=op.url)
                 op.card, op.retry = self.card_hash(arb, first), op.message_id is None and self.send_retryable
                 self.open[arb.key] = op
@@ -1378,9 +1655,19 @@ class Alerter:
                 card = self.card_hash(arb, cur.first_seen)
                 changed = card != cur.card
                 cur.arb, cur.last_seen = arb, now
+                cur.checks += 1
                 cur.best_pct = max(cur.best_pct, self.value(arb))
-                if self.value(arb) >= cur.alerted_pct + self.cfg.realert_jump_pct:
-                    # Edits don't ping your phone, so a much better price gets a fresh alert.
+                better = self.value(arb) >= cur.alerted_pct + self.cfg.realert_jump_pct
+                if not better:
+                    cur.better = 0
+                wait = self.reping_waits(arb, cur, fresh_age, now) if better else ""
+                if better and not wait:
+                    # Edits don't ping your phone, so a much better price gets a fresh alert
+                    # (showing how old ITS price is).
+                    cur.better = 0
+                    if hasattr(arb, "age"):
+                        arb.age = fresh_age
+                        card = self.card_hash(arb, cur.first_seen)
                     print(f"  ⬆️ improved: {self.label(arb)} now {self.value(arb):.2f}%", flush=True)
                     print(self.text(arb), flush=True)
                     if cur.message_id:
@@ -1392,8 +1679,11 @@ class Alerter:
                     cur.alerted_pct = self.value(arb)
                     new += 1
                 elif changed or cur.retry:
+                    # (A live bet's better price that the live rules hold back: edited, no new ping yet.)
                     if changed:
-                        print(f"  ↻ updated: {self.label(arb)} now {self.value(arb):.2f}%", flush=True)
+                        print(f"  ↻ updated: {self.label(arb)} now {self.value(arb):.2f}%"
+                              + (f" (better price, no new ping yet: {HELD_LABELS.get(wait, wait)})" if wait else ""),
+                              flush=True)
                     if cur.message_id:
                         self._discord(self.payload(arb, first_seen=cur.first_seen), cur.message_id, cur.url)
                     elif cur.retry:
@@ -1442,8 +1732,8 @@ class Alerter:
         if not self.log_path():
             return
         row = {
-            "first_seen": datetime.fromtimestamp(op.first_seen, timezone.utc).isoformat(timespec="seconds"),
-            "gone_at": "" if lasted is None else datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
+            "first_seen": _utc(op.first_seen),
+            "gone_at": "" if lasted is None else _utc(now),
             "seconds_open": "" if lasted is None else round(lasted),
             **self.row(op),
         }
@@ -1541,6 +1831,8 @@ class EVBet:
     first_sharp_quotes: list[tuple[str, list[float]]] = field(default_factory=list)
     parlay_books: set[str] | None = None   # books this bet may go into a parlay at (None: all on the board)
     kalshi: tuple[float, float, float] | None = None   # Kalshi's (win chance, bid, ask) for this side
+    age: float | None = None         # seconds since the book updated this price, when first sent
+    found: tuple = ()                # live, once the live checks confirm it: (first check that found it, checks in a row)
 
     def worst_ok_price(self, min_edge_pct: float = OK_EDGE_PCT) -> float:
         """Lowest price that still leaves min_edge_pct of edge against the fair price."""
@@ -1719,13 +2011,17 @@ def consensus_fair(ev: dict, cfg: Config, now: datetime, is_live: bool, skip: se
 
 
 CONFIDENCE_BADGE = {"high": "🟢 High", "medium": "🟡 Medium", "low": "🟠 Low"}
+PROP_CONFIDENT_HOURS = 12   # prop lines mature later: only this close to kickoff do they get the point
 
 
 def rate_confidence(hold: float | None, gap: float | None, hours_to_start: float, ev_pct: float,
-                    prop: bool, move: float | None = None, kalshi_gap: float | None = None) -> tuple[str, list[str]]:
+                    prop: bool, move: float | None = None, kalshi_gap: float | None = None,
+                    confident_hours: float = 24) -> tuple[str, list[str]]:
     """How much to trust a +EV price. Points for: a tight sharp market, the other books agreeing
-    with the sharp, a game close enough that the sharp line has matured, a believable edge, and
-    the sharp line moving toward this side (sharp money agrees; moving away costs a point)."""
+    with the sharp, a game close enough that the sharp line has matured (main lines: within
+    CONFIDENT_HOURS, so tonight's and tomorrow's games can be high confidence; props: 12 hours),
+    a believable edge, and the sharp line moving toward this side (sharp money agrees; moving away
+    costs a point)."""
     pts, notes = 0, []
     if move is not None and abs(move) >= 1.5:
         if move > 0:
@@ -1753,7 +2049,7 @@ def rate_confidence(hold: float | None, gap: float | None, hours_to_start: float
         pts += 1
     else:
         notes.append(f"other books disagree by {gap:.0f} pts")
-    if hours_to_start <= 12:
+    if hours_to_start <= (PROP_CONFIDENT_HOURS if prop else confident_hours):
         pts += 1
     else:
         notes.append("early line (less tested)")
@@ -1842,14 +2138,16 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                     fair[k], sharp_name[k], n_used[k], n_total[k] = probs, f"consensus of {n} books", n, n
 
         # Every soft-book price that beats fair by enough (and every price, for the board).
-        offers: dict[tuple, list[tuple[float, str, str, float | None, str]]] = {}
+        offers: dict[tuple, list[tuple[float, str, str, float | None, str, str | None]]] = {}
         boards: dict[tuple, list[tuple[str, float, float, str, bool]]] = {}
         for key, bm in books.items():
-            if key in sharp or (allowed and key not in allowed):
+            if key in sharp or (allowed and key not in allowed) or not cfg.bettable(key, ev):
                 continue
             for mkt in bm.get("markets", []):
                 if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue
+                # When the book last changed the price (unknown for a prop: one stamp for every player).
+                stamp = (mkt.get("last_update") or bm.get("last_update")) if _one_line(mkt, ev["home_team"]) else None
                 for oc in mkt.get("outcomes", []):
                     k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
                     p = fair.get(k, {}).get(oc["name"])
@@ -1865,7 +2163,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                     if max(cfg.min_ev_pct, cfg.sport_min_ev.get(ev.get("sport_key", ""), 0)) <= ev_pct <= cfg.max_ev_pct:
                         link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
                         offers.setdefault((k, oc["name"]), []).append(
-                            (price, bm.get("title", key), link, oc.get("point"), key))
+                            (price, bm.get("title", key), link, oc.get("point"), key, stamp))
 
         for (k, name), lst in offers.items():
             lst.sort(key=lambda o: (-o[0], o[1]))   # best price; ties by book name, so it's stable
@@ -1874,7 +2172,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 lst = [o for o in lst if o[4] != "kalshi" or kalshi_still_there(kq, o[0], cfg)]
                 if not lst:
                     continue
-            price, book, link, point, book_key = lst[0]
+            price, book, link, point, book_key, stamp = lst[0]
             bet = EVBet(
                 event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
                 sport_key=ev.get("sport_key", ""), matchup=f"{ev['away_team']} @ {ev['home_team']}",
@@ -1888,6 +2186,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 sharp_quotes=[(titles[sk], [outs[name]] + [pr for n, pr in outs.items() if n != name])
                               for sk, outs in raw_src.get(k, {}).items() if name in outs],
                 board=sorted(boards.get((k, name), []), key=lambda r: (-r[1], r[0])),
+                age=max(0.0, (now - _parse_time(stamp)).total_seconds()) if stamp else None,
             )
             # Quality checks: skip prices whose fair value is shaky, rate the rest.
             from_sharp = not sharp_name[k].startswith("consensus")
@@ -1913,7 +2212,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                         continue
             move = history.record((ev["id"], k[0], k[1], name), now, bet.fair_prob) if history and from_sharp else None
             bet.confidence, bet.confidence_notes = rate_confidence(hold, gap, hours, bet.ev_pct, is_prop(k[1]), move,
-                                                                   kgap)
+                                                                   kgap, cfg.confident_hours)
             if CONFIDENCE_ORDER[bet.confidence] < CONFIDENCE_ORDER.get(cfg.min_confidence, 0):
                 continue
             # Less certainty -> smaller bet (the edge itself isn't changed).
@@ -2000,8 +2299,8 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
     if b.related:
         parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}. These move together, "
                      f"so treat them as one bet, not separate ones.")
-    details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}\n\n"
-               f"**Fair value** {_fair_line(b)} · {b.fair_prob:.1%} to win"
+    details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}"
+               f"{_age_note(b.age)}\n\n**Fair value** {_fair_line(b)} · {b.fair_prob:.1%} to win"
                + (f"\n**{b.sharp_quotes[0][0]}** {' / '.join(odds(x) for x in b.sharp_quotes[0][1])}"
                   if b.sharp_quotes else "")
                + (f" *(was {' / '.join(odds(x) for x in b.first_sharp_quotes[0][1])})*"
@@ -2024,6 +2323,7 @@ class EVAlerter(Alerter):
     noun = "+EV bets"
     log_fields = EV_LOG_FIELDS
     log_on_open = True  # logged at first sight, so a restart never loses a bet from the results
+    log_held = False    # the bet log is what was alerted (results are graded from it)
 
     def text(self, item) -> str:
         return format_ev_text(item)
@@ -2041,14 +2341,16 @@ class EVAlerter(Alerter):
         return self.cfg.ev_mention
 
     def carry(self, old, new) -> None:
+        super().carry(old, new)
         new.first_fair_prob = old.first_fair_prob or old.fair_prob
         new.first_sharp_quotes = old.first_sharp_quotes or old.sharp_quotes
 
     def extra_state(self, item) -> dict:
-        return {"first_fair_prob": item.first_fair_prob or item.fair_prob,
+        return {**super().extra_state(item), "first_fair_prob": item.first_fair_prob or item.fair_prob,
                 "first_sharp_quotes": item.first_sharp_quotes or item.sharp_quotes, "pick": item.pick}
 
     def restore_extra(self, item, saved: dict) -> None:
+        super().restore_extra(item, saved)
         if saved.get("first_fair_prob"):
             item.first_fair_prob = saved["first_fair_prob"]
             item.first_sharp_quotes = [(bk, list(prs)) for bk, prs in saved.get("first_sharp_quotes", [])]
@@ -2547,19 +2849,21 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
         is_live = _parse_time(ev["commence_time"]) <= now
         if (cfg.live_only and not is_live) or (is_live and not cfg.outlier_live):
             continue
+        # Live prices move in seconds, so a live outlier needs a bigger edge (OUTLIER_LIVE_MIN_PCT).
+        bar = max(cfg.outlier_min_pct, cfg.outlier_live_min_pct) if is_live else cfg.outlier_min_pct
         # (market, line) -> book key -> {outcome: price}, fresh full markets only
         lines: dict[tuple, dict[str, dict[str, float]]] = {}
         titles: dict[str, str] = {}
         links: dict[tuple, str] = {}
         points: dict[tuple, float | None] = {}
-        stamps: dict[tuple, datetime] = {}   # (line, book) -> when that book last moved it
+        stamps: dict[tuple, datetime] = {}   # (line, book) -> when that book last moved it (props: unknown)
         for bm in ev.get("bookmakers", []):
             titles[bm["key"]] = bm.get("title", bm["key"])
             for mkt in bm.get("markets", []):
                 if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue
                 stamp = mkt.get("last_update") or bm.get("last_update")
-                if len({_line_for(mkt["key"], oc, ev["home_team"]) for oc in mkt.get("outcomes", [])}) != 1:
+                if not _one_line(mkt, ev["home_team"]):
                     stamp = None   # one stamp for many lines (every player's prop): says nothing about this one
                 for oc in mkt.get("outcomes", []):
                     price = float(oc.get("price") or 0)
@@ -2599,7 +2903,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                     if history:
                         history.put(hkey, now, since, anchor)
                     leading = since is not None
-                    if bk in reference_only or not cfg.bettable(bk) or edge < cfg.outlier_min_pct or leading:
+                    if bk in reference_only or not cfg.bettable(bk, ev) or edge < bar or leading:
                         continue
                     # And when the sharp book prices this line, it has to agree the price is good.
                     sp = sharp.get(k, {}).get(name)
@@ -2612,7 +2916,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                         continue
                     board = sorted(((titles[b], oo[name], (fair_p * oo[name] - 1) * 100,
                                      links.get((k, b, name), ""), True)
-                                    for b, oo in full.items() if b not in reference_only and cfg.bettable(b)),
+                                    for b, oo in full.items() if b not in reference_only and cfg.bettable(b, ev)),
                                    key=lambda r: (-r[1], r[0]))
                     bet = EVBet(
                         event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
@@ -2625,6 +2929,8 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                         n_outcomes=n_out, sources_used=len(others), sources_total=len(others),
                         unit_size=cfg.unit_size, board=board, kalshi=kq,
                     )
+                    if (at := stamps.get((k, bk))) is not None:
+                        bet.age = max(0.0, (now - at).total_seconds())
                     bet.stake = kelly_stake(fair_p, price, cfg)
                     if sp is None and cfg.consensus_stake < 1:
                         # No sharp price backs the other books up (usually a prop Pinnacle doesn't
@@ -2633,12 +2939,13 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                         bet.confidence_notes.append(f"no {_csv(cfg.sharp_books)[0].title()} price: stake "
                                                     f"{round((1 - cfg.consensus_stake) * 100)}% smaller")
                     # The board shows every book you have; parlays stick to EV_BOOKS like +EV bets.
-                    bet.parlay_books = {titles[b] for b in full if not ev_allowed or b in ev_allowed}
+                    bet.parlay_books = {titles[b] for b in full if (not ev_allowed or b in ev_allowed)
+                                        and cfg.bettable(b, ev)}
                     # Can the other side(s) be bet elsewhere to lock in a profit?
                     hedge = []
                     for other in sorted(names - {name}):
                         cands = [(oo[other], b) for b, oo in full.items()
-                                 if b != bk and b not in reference_only and cfg.bettable(b)]
+                                 if b != bk and b not in reference_only and cfg.bettable(b, ev)]
                         if cands:
                             pr, b = max(cands)
                             hedge.append((other, titles[b], pr, links.get((k, b, other), "")))
@@ -2701,16 +3008,23 @@ def note_related(groups: list[tuple[list[EVBet], "Alerter", set[str]]], now: flo
     """
     now = now or time.time()
     pool: dict[str, EVBet] = {}
+    live_left: dict[int, float] = {}   # the live cap is shared, so what one group takes the next can't
     for bets, a, checked in groups:
         slots = None
         if a.max_per_hour:
             slots = a.max_per_hour - len([t for t in a.posted_at if now - t < 3600])
-        for b in bets:  # best first, the same order handle() posts them in
+        cap = a.live_cap
+        if cap is not None and id(cap) not in live_left:
+            live_left[id(cap)] = cap.room(now)
+        for b in a.ranked(bets):  # the same order handle() posts them in
+            live = cap is not None and b.is_live
             if b.key in a.open or b.key in a.restored or b.key in a.handed:
                 pool[b.key] = b
-            elif slots is None or slots > 0:
+            elif (slots is None or slots > 0) and not (live and live_left[id(cap)] <= 0):
                 pool[b.key] = b
                 slots = None if slots is None else slots - 1
+                if live:
+                    live_left[id(cap)] -= 1
         for k, op in a.open.items():
             if k not in pool and op.arb.sport_key not in checked and op.arb.event_id not in checked:
                 pool[k] = op.arb  # not looked at this scan, so it stays open
@@ -2727,21 +3041,38 @@ def note_related(groups: list[tuple[list[EVBet], "Alerter", set[str]]], now: flo
             b.related = sorted([o.pick for o in by_game.get(b.event_id, []) if o.key != b.key][:3])
 
 
-def hand_over(evs: list[EVBet], outs: list[EVBet], ev_alr: "EVAlerter", out_alr: "OutlierAlerter") -> None:
+def hand_over(evs: list[EVBet], outs: list[EVBet], ev_alr: "EVAlerter", out_alr: "OutlierAlerter",
+              now: float | None = None) -> None:
     """A bet that turns from +EV into an outlier (or back) is the same bet: retire its old card
     with a pointer instead of a false "GONE", and let the other alerter post it without logging
-    it twice. Call right before both handle() calls."""
+    it twice. Call right before both handle() calls (and the live rules).
+
+    Not when the new alert is live and the old card went out before the game started: that card
+    says nothing about a live price, so it closes as usual and the live bet is a new live alert (two
+    checks, a fresh price, LIVE_PER_HOUR)."""
+    now = now or time.time()
     out_keys, ev_keys = {o.key for o in outs}, {b.key for b in evs}
+    live = {b.key for b in (*outs, *evs) if b.is_live}
+
+    def before_kickoff(first_seen: float, commence_time: str) -> bool:
+        return bool(commence_time) and first_seen < _parse_time(commence_time).timestamp()
     for src, dst, keys, note in (
             (ev_alr, out_alr, out_keys, "⬆️ Now an OUTLIER (bigger edge): see the new 🚨 alert"),
             (out_alr, ev_alr, ev_keys - out_keys, "↘️ Back to a normal +EV edge: see the new 📈 alert")):
         for k in [k for k in src.open if k in keys and k not in dst.open]:
+            if k in live and before_kickoff(src.open[k].first_seen, src.open[k].arb.commence_time):
+                src._close(k, now)
+                continue
             op = src.open.pop(k)
             dst.handed[k] = op.first_seen
             if op.message_id:
                 src._discord(_gone_card(note, f"{op.arb.pick} {odds(op.arb.price)} at {op.arb.book} · "
                                               f"{op.arb.matchup}"), op.message_id, op.url)
         for k in [k for k in src.restored if k in keys and k not in dst.open]:
+            if k in live and before_kickoff(src.restored[k].get("first_seen", now),
+                                            src.restored[k].get("commence_time", "")):
+                src._drop_restored(k, "Ignore this one. The game has started.")
+                continue
             saved = src.restored.pop(k)
             dst.handed[k] = saved.get("first_seen", time.time())
             if saved.get("message_id"):
@@ -2775,8 +3106,8 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
                  for o, bk, pr, ln in legs]
         parts.append(f"🔒 **Want a sure profit instead?** Place all of these for **+{b.hedge_pct:.1f}% "
                      f"guaranteed** (per $100 total):\n" + "\n".join(lines))
-    details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}\n\n"
-               f"**Why:** {b.book} has {b.pick} at **{odds(b.price)}**, but the other {b.sources_used} books "
+    details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}"
+               f"{_age_note(b.age)}\n\n**Why:** {b.book} has {b.pick} at **{odds(b.price)}**, but the other {b.sources_used} books "
                f"say **{odds(b.fair_odds)}** ({b.fair_prob:.1%} to win)." + _kalshi_line(b)
                + "".join(f"\n📉 {n[0].upper()}{n[1:]}." for n in b.confidence_notes if "smaller" in n))
     desc = "\n\n".join(parts) + DIVIDER + details
@@ -2967,6 +3298,7 @@ class ParlayAlerter(Alerter):
     scoped = False
     log_fields = PARLAY_FIELDS
     log_on_open = True
+    log_held = False
 
     def text(self, item) -> str:
         return format_parlay_text(item)
@@ -3890,8 +4222,8 @@ def day_summary(rows: list[dict], cfg: Config | None = None, now: datetime | Non
 def arbs_on(cfg: Config, day) -> str:
     """Arbs alerted that day: how many different ones (an arb that closes and reopens is logged
     each time), what they'd have locked in placed once each at BANKROLL, and how long they lasted."""
-    rows = [r for r in _read_csv(cfg.log_file) if r.get("first_seen")
-            and local_day(cfg, r["first_seen"]) == day]
+    rows = [r for r in _read_csv(cfg.log_file) if r.get("first_seen") and not r.get("reason")
+            and local_day(cfg, r["first_seen"]) == day]   # (a reason: held back, never alerted)
     if not rows:
         return ""
     first: dict[tuple, dict] = {}
@@ -4753,7 +5085,7 @@ def make_markouts(cfg: Config, args, alerters: list[Alerter]) -> MarkoutTracker:
     no files written) for --once (one look can't follow anything), --demo (sample data must
     never reach the logs) and --dry-run (a test run must not write the service's files).
     Parlays aren't followed: their legs already are, one by one."""
-    off = args.once or args.demo or args.dry_run
+    off = any(getattr(args, flag, False) for flag in ("once", "demo", "dry_run"))
     tracker = MarkoutTracker(replace(cfg, markout_file="") if off else cfg)
     for a in alerters:
         if isinstance(a, ParlayAlerter):
@@ -5383,12 +5715,14 @@ def feed_freshness(events: list[dict], now: datetime | None = None) -> str:
 
 
 GUIDE = """**When an alert pops up, do what its 👉 line says. That's it.**
-The bot only sends strong ones (locks mode), so every alert is worth a look.
+The bot only sends strong ones (locks mode), so every alert is worth a look. Games that haven't started come first; live alerts are kept to a few an hour.
 
 💰 **ARB** (green, or red if the game is live)
 Bet **every** side shown, each at the book listed, using the exact amounts. You profit no matter who wins.
-• Place the bets back to back.
+• If a bet says **Bet this one first**, place it first: it's the price that will move. Then the other right away.
+• No "first" note? Place the bets back to back.
 • If a price has moved past its "skip" line, don't place the other bet.
+• If the other price is gone after you placed the first, the card says when the first is still worth keeping on its own ("keep this one").
 
 📈 **+EV** (blue)
 Bet **one** side at the book shown, for the amount shown. It's a better price than it should be, but it won't win every time. It pays off over many bets.
@@ -5402,6 +5736,8 @@ Optional: also place the 🔒 bets it lists to lock in a guaranteed profit.
 One ticket with 2-3 +EV bets from different games, all at the same book. Every leg must win. Bigger payout, wins less often, so the stake is small.
 
 🏦 **Kalshi** prices in alerts already include Kalshi's trading fee.
+
+⏱ **Price age** on a card: how long the book had shown that price when the alert went out. A live alert only goes out once two checks in a row (about a minute apart) find it and the price is under a minute old, so it's less likely to be gone when you tap. Before a game, a price can sit unchanged for hours: that's normal. Player props don't show one: the book doesn't say when each player's line last moved.
 
 🎯 **Player props** show up as normal +EV, arb or outlier alerts, e.g. "LeBron James Over 25.5 Points".
 
@@ -5451,9 +5787,14 @@ def guide_payload() -> dict:
                  footer="Pin this message: hover over it → ⋯ → Pin Message")
 
 
-def demo_events() -> list[dict]:
-    """Sample data with one planted arb, re-stamped as fresh so it passes the age filter."""
+def demo_events(live_arb: bool = True) -> list[dict]:
+    """Sample data with one planted arb, re-stamped as fresh so it passes the age filter.
+    live_arb=False moves the arb's game to later today: in locks mode a live arb needs 5%+."""
     data = json.loads((HERE / "sample_odds.json").read_text())
+    if not live_arb:
+        for ev in data:
+            if ev["id"] == "demo-nba-1":
+                ev["commence_time"] = _iso(datetime.now(timezone.utc) + timedelta(hours=3))
     fresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     for ev in data:
         for bm in ev["bookmakers"]:
@@ -5469,12 +5810,19 @@ def short(sport: str) -> str:
 
 def mode_line(cfg: Config) -> str:
     if cfg.alert_mode == "locks":
-        caps = ", ".join(f"{n} {what}/hour" for n, what in ((cfg.max_ev_per_hour, "+EV"),
-                         (cfg.max_prop_per_hour, "props"), (cfg.max_parlay_per_hour, "parlays")) if n)
+        caps = ", ".join(f"{n} {what}/hour" for n, what in (
+            (cfg.max_arb_per_hour, "arbs"), (cfg.max_ev_per_hour, "+EV"), (cfg.max_prop_per_hour, "props"),
+            (cfg.max_outlier_per_hour, "outliers"), (cfg.max_parlay_per_hour, "parlays")) if n)
+        if cfg.live_per_hour:
+            caps += f"{', ' if caps else ''}{cfg.live_per_hour} live alerts/hour in all"
+        rules = [f"{cfg.live_confirm_checks} checks in a row"] if cfg.live_confirm_checks > 1 else []
+        rules += [f"a price under {cfg.live_max_age_alert}s old"] if cfg.live_max_age_alert else []
+        live_out = max(cfg.outlier_min_pct, cfg.outlier_live_min_pct)
         return (f"Alert mode: LOCKS: arbs {cfg.min_profit_pct:g}%+ (live {cfg.min_live_profit_pct:g}%+), "
                 f"+EV {cfg.min_ev_pct:g}%+ {cfg.min_confidence}-confidence only, props {cfg.prop_min_ev_pct:g}%+, "
-                f"outliers {cfg.outlier_min_pct:g}%+, parlays {cfg.parlay_min_ev_pct:g}%+"
-                + (f"; at most {caps}" if caps else ""))
+                f"outliers {cfg.outlier_min_pct:g}%+ (live {live_out:g}%+), parlays {cfg.parlay_min_ev_pct:g}%+"
+                + (f"; at most {caps}" if caps else "")
+                + (f"; live alerts need {' and '.join(rules)}" if rules else ""))
     return f"Alert mode: {cfg.alert_mode.upper()} (thresholds as set in .env)"
 
 
@@ -5536,29 +5884,207 @@ def close_started(now: datetime, *alerters: Alerter) -> set[str]:
     return started
 
 
+class LiveConfirm:
+    """The live rules for NEW live alerts (pre-game ones, and ones already open, restored after a
+    restart or handed over from a live alert between +EV and outlier, pass straight through; a much
+    better price on an open live alert meets the same rules in Alerter.reping_waits):
+
+    - Fresh price: the book(s) you're told to bet updated the price within LIVE_MAX_AGE_ALERT
+      seconds (Pinnacle's age doesn't matter here). An older price has likely moved already.
+    - Two checks: it pings only when LIVE_CONFIRM_CHECKS checks of its sport in a row found it, each
+      within `window` seconds of the one before. One that's gone by the next check never pings, and
+      one seen, then missing, then back starts counting again. One that passes carries its streak
+      (`found`: first check that found it, checks in a row) for arbs.csv.
+
+    The memory is in-process only: after a restart, a live alert waits one more check."""
+
+    def __init__(self, checks: int = 1, max_age: float = 0, window: float = 180):
+        self.checks, self.max_age, self.window = checks, max_age, window
+        self.streak: dict[str, tuple[int, float, float, object]] = {}   # key -> (checks in a row, first, last, item)
+        self.held: list[tuple[object, str]] = []        # this check's: (item, "waiting" or "old price")
+        self.dropped: list[tuple[object, float, int]] = []   # ended unconfirmed: (item, first seen, checks)
+
+    def filter(self, items: list, checked: set[str], now: float, alerters=()) -> list:
+        """The items that may go to handle() now. checked = the sports (or games) this check looked
+        at; alerters = the ones whose open, restored and handed-over alerts are exempt."""
+        self.held, self.dropped = [], []
+        exempt = {k for a in alerters for k in (*a.open, *a.restored, *a.handed)}
+        out, found, stale = [], set(), set()
+        for it in items:
+            if not it.is_live or it.key in exempt:
+                out.append(it)
+                continue
+            if self.max_age and (it.age is None or it.age > self.max_age):
+                self.held.append((it, "old price"))
+                stale.add(it.key)
+                continue   # not a sighting: its streak (if any) ends below, without counting as gone
+            if self.checks <= 1:
+                out.append(it)
+                continue
+            found.add(it.key)
+            n, first, last, _ = self.streak.get(it.key, (0, now, -math.inf, None))
+            if now - last > self.window:
+                n, first = 0, now
+            self.streak[it.key] = (n + 1, first, now, it)
+            if n + 1 >= self.checks:
+                it.found = (first, n + 1)
+                out.append(it)
+            else:
+                self.held.append((it, "waiting"))
+        for k, (n, first, last, it) in list(self.streak.items()):
+            if k in found:
+                continue
+            if it.sport_key in checked or it.event_id in checked or now - last > self.window:
+                del self.streak[k]   # looked for and not found (or too long ago): start over
+                if n < self.checks and k not in stale:
+                    self.dropped.append((it, first, n))
+        return out
+
+
+class Trackers:
+    """Every alert tracker the main loop keeps, wired together the way run() uses them: the hourly
+    caps (arbs and prop arbs share one count, outliers and prop outliers another, and every live
+    alert shares LIVE_PER_HOUR), closing lines, markouts and the line histories. scan_main() and
+    scan_props() put one check through them."""
+
+    def __init__(self, cfg: Config, args):
+        dry = args.dry_run
+        self.cfg, self.prop_cfg = cfg, cfg.for_props()
+        self.arbs = Alerter(cfg, dry_run=dry)
+        self.evs = EVAlerter(cfg, dry_run=dry)
+        self.outs = OutlierAlerter(cfg, dry_run=dry)
+        # Props are fetched per game on their own schedule, so they get their own alert trackers
+        # (a main-line check must never "close" a prop alert it didn't look at).
+        self.prop_arbs = Alerter(cfg, dry_run=dry, noun="prop arbs")
+        self.prop_evs = EVAlerter(cfg, dry_run=dry, noun="+EV props")
+        self.prop_outs = OutlierAlerter(cfg, dry_run=dry, noun="prop outliers")
+        self.parlays = ParlayAlerter(cfg, dry_run=dry)
+        self.closing = ClosingTracker(cfg)
+        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs):
+            a.on_log = self.closing.add
+        # Every new alert's price is checked again on the next checks (markouts; not for --once,
+        # --demo or --dry-run).
+        self.markouts = make_markouts(cfg, args, [self.arbs, self.evs, self.outs,
+                                                  self.prop_arbs, self.prop_evs, self.prop_outs])
+        self.sharp_history = SharpHistory(cfg.move_window_minutes)
+        self.price_history = PriceHistory()
+        self.evs.max_per_hour = cfg.max_ev_per_hour
+        self.prop_evs.max_per_hour = cfg.max_prop_per_hour
+        self.parlays.max_per_hour = cfg.max_parlay_per_hour
+        self.arbs.max_per_hour = self.prop_arbs.max_per_hour = cfg.max_arb_per_hour
+        self.outs.max_per_hour = self.prop_outs.max_per_hour = cfg.max_outlier_per_hour
+        self.prop_arbs.posted_at, self.prop_outs.posted_at = self.arbs.posted_at, self.outs.posted_at
+        self.live_cap = HourlyCap(cfg.live_per_hour)
+        for a in self.singles():
+            a.live_cap = self.live_cap
+        # The live rules, one memory for arbs and one for bets (+EV and outliers share keys). Props
+        # are pre-game only, so they never need them.
+        self.arb_live = LiveConfirm(cfg.live_confirm_checks, cfg.live_max_age_alert)
+        self.bet_live = LiveConfirm(cfg.live_confirm_checks, cfg.live_max_age_alert)
+        self.set_live_interval(cfg.poll_seconds)
+
+    def singles(self) -> list[Alerter]:
+        """Every alerter but parlays."""
+        return [self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs, self.prop_outs]
+
+    def set_live_interval(self, seconds: float) -> None:
+        """How often live games are checked right now (POLL_SECONDS, or slower on a tight budget):
+        "the previous check" may be up to three of those back, and at least 3 minutes, so slower
+        live checks don't stop every live alert from being confirmed."""
+        for rules in (self.arb_live, self.bet_live):
+            rules.window = max(180.0, 3.0 * seconds)
+
+    @staticmethod
+    def screen(rules: LiveConfirm, items: list, scope: set[str], now: float, alerters: tuple) -> list:
+        """Put items through the live rules. What they hold back is noted by the first alerter
+        (the console line counts it; arbs.csv logs held arbs)."""
+        kept = rules.filter(items, scope, now, alerters)
+        for it, why in rules.held:
+            alerters[0].note_held(it, why, now)
+        for it, first, n in rules.dropped:
+            alerters[0].note_held(it, "unconfirmed", now, first, n)
+        return kept
+
+
+HELD_LABELS = {"waiting": "live, waiting for another check", "unconfirmed": "live, gone before it was confirmed",
+               "old price": "live, price too old", "capped": "over the hourly cap",
+               "live cap": "over the live-alert cap"}
+
+
+def take_held(*alerters: Alerter) -> dict[str, int]:
+    """What these alerters held back since the last call, by why (then reset)."""
+    out: dict[str, int] = {}
+    for a in alerters:
+        for why, n in a.held_counts.items():
+            out[why] = out.get(why, 0) + n
+        a.held_counts = {}
+    return out
+
+
+def held_text(held: dict[str, int]) -> str:
+    """' | held back: 2 over the hourly cap' for the console line ('' when nothing was)."""
+    parts = [f"{n} {HELD_LABELS.get(why, why)}" for why, n in held.items() if n]
+    return f" | held back: {', '.join(parts)}" if parts else ""
+
+
+def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: datetime | None = None,
+              kalshi: bool = True) -> SimpleNamespace:
+    """One main-line check through every alert type: arbs first (they post before Kalshi is asked,
+    which can take seconds), then outliers and +EV. Each step reads the clock as it goes, unless
+    `now` fixes it (tests, the demo). Returns what the console line reports."""
+    cfg, scope = t.cfg, set(checked_sports)
+
+    def clock() -> datetime:
+        return now or datetime.now(timezone.utc)
+    take_held(t.arbs, t.outs, t.evs)
+    at = clock()
+    arbs = find_arbs(events, cfg, at)
+    sent = t.arbs.handle(t.screen(t.arb_live, arbs, scope, at.timestamp(), (t.arbs,)),
+                         checked_sports=checked_sports, now=at.timestamp())
+    kq = kalshi_fair(events, cfg, clock()) if kalshi else {}   # free: Kalshi's own prices as a second opinion
+    at = clock()
+    outs = find_outliers(events, cfg, at, history=t.price_history, kalshi=kq)
+    evs = without_outliers(find_evs(events, cfg, at, history=t.sharp_history, kalshi=kq), outs)
+    hand_over(evs, outs, t.evs, t.outs, at.timestamp())
+    kept = {id(b) for b in t.screen(t.bet_live, outs + evs, scope, at.timestamp(), (t.outs, t.evs))}
+    post_outs, post_evs = [b for b in outs if id(b) in kept], [b for b in evs if id(b) in kept]
+    note_related([(post_outs, t.outs, scope), (post_evs, t.evs, scope), ([], t.prop_outs, set()),
+                  ([], t.prop_evs, set())], at.timestamp())
+    t.sharp_history.prune(at)
+    t.price_history.prune(at)
+    out_sent = t.outs.handle(post_outs, checked_sports=checked_sports, now=at.timestamp())
+    ev_sent = t.evs.handle(post_evs, checked_sports=checked_sports, now=at.timestamp())
+    t.closing.observe(events, at)
+    t.closing.finalize(clock())
+    return SimpleNamespace(arbs=arbs, sent=sent, outs=outs, out_sent=out_sent, evs=evs, ev_sent=ev_sent,
+                           held=take_held(t.arbs, t.outs, t.evs))
+
+
+def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: datetime | None = None) -> SimpleNamespace:
+    """One prop check (games before kickoff only, so nothing here is live)."""
+    cfg = t.cfg
+    at = now or datetime.now(timezone.utc)
+    ts = at.timestamp()
+    take_held(t.prop_arbs, t.prop_outs, t.prop_evs)
+    p_outs = find_outliers(prop_events, cfg, at, history=t.price_history)
+    p_evs = without_outliers(find_evs(prop_events, t.prop_cfg, at, history=t.sharp_history), p_outs)
+    hand_over(p_evs, p_outs, t.prop_evs, t.prop_outs, ts)
+    note_related([(p_outs, t.prop_outs, checked), (p_evs, t.prop_evs, checked),
+                  ([], t.outs, set()), ([], t.evs, set())], ts)
+    n_arb = t.prop_arbs.handle(find_arbs(prop_events, cfg, at), checked_events=checked, now=ts)
+    n_out = t.prop_outs.handle(p_outs, checked_events=checked, now=ts)
+    n_ev = t.prop_evs.handle(p_evs, checked_events=checked, now=ts)
+    t.closing.observe(prop_events, at)
+    t.closing.finalize(at)
+    return SimpleNamespace(n_arb=n_arb, n_out=n_out, n_ev=n_ev, held=take_held(t.prop_arbs, t.prop_outs, t.prop_evs))
+
+
 def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
-    alerter = Alerter(cfg, dry_run=args.dry_run)
-    ev_alerter = EVAlerter(cfg, dry_run=args.dry_run)
-    out_alerter = OutlierAlerter(cfg, dry_run=args.dry_run)
-    tracker = ClosingTracker(cfg)
+    t = Trackers(cfg, args)
+    alerter, ev_alerter, out_alerter, parlay_alerter = t.arbs, t.evs, t.outs, t.parlays
+    prop_arbs, prop_evs, prop_outs = t.prop_arbs, t.prop_evs, t.prop_outs
+    tracker, markouts = t.closing, t.markouts
     results = Results(cfg, dry_run=args.dry_run)
-    ev_alerter.on_log = out_alerter.on_log = tracker.add
-    # Props are fetched per game on their own schedule, so they get their own alert trackers
-    # (a main-line check must never "close" a prop alert it didn't look at).
-    prop_arbs = Alerter(cfg, dry_run=args.dry_run, noun="prop arbs")
-    prop_evs = EVAlerter(cfg, dry_run=args.dry_run, noun="+EV props")
-    prop_outs = OutlierAlerter(cfg, dry_run=args.dry_run, noun="prop outliers")
-    prop_evs.on_log = prop_outs.on_log = tracker.add
-    # Every new alert's price is checked again on the next checks (markouts; not for --once,
-    # --demo or --dry-run).
-    markouts = make_markouts(cfg, args, [alerter, ev_alerter, out_alerter, prop_arbs, prop_evs, prop_outs])
-    prop_cfg = cfg.for_props()
-    sharp_history = SharpHistory(cfg.move_window_minutes)
-    price_history = PriceHistory()
-    parlay_alerter = ParlayAlerter(cfg, dry_run=args.dry_run)
-    ev_alerter.max_per_hour = cfg.max_ev_per_hour
-    prop_evs.max_per_hour = cfg.max_prop_per_hour
-    parlay_alerter.max_per_hour = cfg.max_parlay_per_hour
 
     def update_parlays() -> int:
         # Outliers too: a leg that grew into an outlier is still the same bet (find_parlays
@@ -5574,13 +6100,20 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             a.log_path = lambda: ""
             a._state_path = lambda: None
             a.restored = {}
-        events = demo_events()
-        outs = find_outliers(events, cfg)
-        arbs, evs = find_arbs(events, cfg), without_outliers(find_evs(events, cfg), outs)
-        alerter.handle(arbs)
-        ev_alerter.handle(evs)
-        out_alerter.handle(outs)
-        print(f"[demo] {len(arbs)} arb(s), {len(evs)} +EV bet(s), {len(outs)} outlier(s) in sample data")
+        events = demo_events(live_arb=False)
+        sports = sorted({ev["sport_key"] for ev in events})
+        # Checked like the real loop, a minute apart, as many times as a live alert needs to show up
+        # (LIVE_CONFIRM_CHECKS). Kalshi isn't asked: the games are made up.
+        n = max(1, cfg.live_confirm_checks)
+        start = datetime.now(timezone.utc) - timedelta(seconds=cfg.poll_seconds * (n - 1))
+        sent, held = [0, 0, 0], {}
+        for i in range(n):
+            res = scan_main(t, events, sports, start + timedelta(seconds=cfg.poll_seconds * i), kalshi=False)
+            sent = [sent[0] + res.sent, sent[1] + res.ev_sent, sent[2] + res.out_sent]
+            held = res.held
+        print(f"[demo] {sent[0]} arb(s), {sent[1]} +EV bet(s), {sent[2]} outlier(s) in sample data"
+              + (f" ({n} checks: live alerts go out once {n} checks in a row find them)" if n > 1 else "")
+              + held_text(held))
         return
 
     api = OddsAPI(cfg)
@@ -5709,28 +6242,15 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             idle_logged = False
             t0 = time.time()
             events = main_events
-            arbs = find_arbs(events, cfg)
-            sent = alerter.handle(arbs, checked_sports=checked_sports)
-            kalshi = kalshi_fair(events, cfg, now)   # free: Kalshi's own prices as a second opinion
-            outs = find_outliers(events, cfg, history=price_history, kalshi=kalshi)
-            evs = without_outliers(find_evs(events, cfg, history=sharp_history, kalshi=kalshi), outs)
-            hand_over(evs, outs, ev_alerter, out_alerter)
-            scope = set(checked_sports)
-            note_related([(outs, out_alerter, scope), (evs, ev_alerter, scope),
-                          ([], prop_outs, set()), ([], prop_evs, set())])
-            sharp_history.prune(now)
-            price_history.prune(now)
-            out_sent = out_alerter.handle(outs, checked_sports=checked_sports)
-            ev_sent = ev_alerter.handle(evs, checked_sports=checked_sports)
-            tracker.observe(events, now)
-            tracker.finalize()
+            t.set_live_interval(sched.interval(LIVE))
+            res = scan_main(t, events, checked_sports)
             status.check_credits(api.remaining)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
-            ev_note = f" | {len(evs)} +EV, {ev_sent} new" if cfg.ev_enabled else ""
-            ev_note += f" | {len(outs)} outliers, {out_sent} new" if cfg.outliers_enabled else ""
+            ev_note = f" | {len(res.evs)} +EV, {res.ev_sent} new" if cfg.ev_enabled else ""
+            ev_note += f" | {len(res.outs)} outliers, {res.out_sent} new" if cfg.outliers_enabled else ""
             print(f"[{datetime.now():%H:%M:%S}] checked {', '.join(short(s) for s in due)} "
-                  f"({len(events)} games, {time.time() - t0:.1f}s) | {len(arbs)} arbs, {sent} new"
-                  f"{ev_note} | credits left {left}", flush=True)
+                  f"({len(events)} games, {time.time() - t0:.1f}s) | {len(res.arbs)} arbs, {res.sent} new"
+                  f"{ev_note}{held_text(res.held)} | credits left {left}", flush=True)
 
             seen_books = {bm["key"] for ev in events for bm in ev.get("bookmakers", [])}
             if args.once:
@@ -5756,21 +6276,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         if prop_games:
             t0 = time.time()
             prop_events = [ev for ev in fetched_props if _parse_time(ev["commence_time"]) > now]
-            checked = fetched_gids
-            p_outs = find_outliers(prop_events, cfg, history=price_history)
-            p_evs = without_outliers(find_evs(prop_events, prop_cfg, history=sharp_history), p_outs)
-            hand_over(p_evs, p_outs, prop_evs, prop_outs)
-            note_related([(p_outs, prop_outs, checked), (p_evs, prop_evs, checked),
-                          ([], out_alerter, set()), ([], ev_alerter, set())])
-            n_arb = prop_arbs.handle(find_arbs(prop_events, cfg), checked_events=checked)
-            n_out = prop_outs.handle(p_outs, checked_events=checked)
-            n_ev = prop_evs.handle(p_evs,
-                                   checked_events=checked)
-            tracker.observe(prop_events, now)
-            tracker.finalize()
+            p = scan_props(t, prop_events, fetched_gids)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             print(f"[{datetime.now():%H:%M:%S}] props: {len(prop_games)} games ({time.time() - t0:.1f}s) | "
-                  f"{n_arb} new arbs, {n_ev} new +EV, {n_out} new outliers | credits left {left}", flush=True)
+                  f"{p.n_arb} new arbs, {p.n_ev} new +EV, {p.n_out} new outliers{held_text(p.held)} | "
+                  f"credits left {left}", flush=True)
 
         markouts.update(main_events, prop_events, now)   # after every alert of this pass went out
 
@@ -5878,7 +6388,7 @@ def main() -> None:
     if args.test_discord:
         if not cfg.webhook_url:
             sys.exit("Set DISCORD_WEBHOOK_URL in .env first.")
-        events = demo_events()
+        events = demo_events(live_arb=False)
         arb = find_arbs(events, cfg)[0]
         cfg.bad_webhooks()
         ev_url = cfg.ev_webhook_url or cfg.webhook_url
