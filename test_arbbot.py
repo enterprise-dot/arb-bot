@@ -133,9 +133,9 @@ class FindArbs(unittest.TestCase):
 
     def test_arb_skip_lines(self):
         [arb] = find_arbs(demo_events(), Config())
-        worst = arb.worst_ok_price(0)          # Celtics leg, with the stakes as printed
-        # At the skip-line price, the printed Celtics stake still returns total + 0.5%, rounded
-        # up to a price the card can show (-133, not -134, which would keep less).
+        worst = arb.worst_ok_price(0)          # the first leg, with the stakes as printed
+        # At the skip-line price, the printed stake still returns total + 0.5%, rounded up to a
+        # price the card can show (never one that would keep less).
         exact = arb.total_stake * 1.005 / arb.legs[0].stake
         self.assertGreaterEqual(worst, exact - 1e-9)
         self.assertLess(worst - exact, 0.01)
@@ -184,10 +184,12 @@ class FindArbs(unittest.TestCase):
         self.assertEqual(arb.matchup, "New York Knicks @ Boston Celtics")
         self.assertAlmostEqual(arb.exact_pct, 3.76, places=2)   # (1/(1/1.8+1/2.45)-1)*100
         self.assertAlmostEqual(arb.profit_pct, 3.50, places=2)  # $57.50 / $42.50 -> $103.50
-        self.assertEqual([l.stake for l in arb.legs], [57.5, 42.5])
+        # Pinnacle has the Knicks at about +134 no-vig: DraftKings' +145 is the price that will move, so it's 1.
+        self.assertEqual([(l.book, l.stake) for l in arb.legs], [("DraftKings", 42.5), ("FanDuel", 57.5)])
         desc = discord_payload(arb)["embeds"][0]["description"]
-        self.assertTrue(desc.startswith("👉 **DO THIS NOW: place BOTH bets."))
-        self.assertIn("1️⃣ Open **FanDuel** → bet **$57.50** on **Boston Celtics -125**", desc)
+        self.assertTrue(desc.startswith("👉 **DO THIS NOW: place BOTH bets, 1️⃣ first."))
+        self.assertIn("1️⃣ Open **DraftKings** → bet **$42.50** on **New York Knicks +145**", desc)
+        self.assertIn("2️⃣ Open **FanDuel** → bet **$57.50** on **Boston Celtics -125**", desc)
         self.assertIn("skip if the price is worse than -133", desc)
         self.assertIn("get back at least **$103.50**", desc)
 
@@ -321,7 +323,8 @@ class AlerterLifecycle(unittest.TestCase):
     def test_big_improvement_sends_fresh_alert(self):
         a = self.alerter
         a.handle(self.arbs, ["basketball_nba"], now=1000)
-        self.arbs[0].legs[0].price = 1.95   # 3.5% -> ~7.9%: jump of more than 2.5 points
+        celtics = next(l for l in self.arbs[0].legs if l.outcome == "Boston Celtics")
+        celtics.price = 1.95                # 3.5% -> ~7.9%: jump of more than 2.5 points
         self.arbs[0].margin = 1 / 1.95 + 1 / 2.45
         self.arbs[0].set_stakes(100, 5)
         self.assertEqual(a.handle(self.arbs, ["basketball_nba"], now=1060), 1)
@@ -1013,7 +1016,7 @@ class LocksMode(unittest.TestCase):
     def test_raises_floors_but_keeps_stricter_settings(self):
         c = Config(min_profit_pct=1.5, min_ev_pct=4, min_confidence="low", prop_min_ev_pct=10).with_mode()
         self.assertEqual(c.min_profit_pct, 2.0)
-        self.assertEqual(c.min_live_profit_pct, 3.0)
+        self.assertEqual(c.min_live_profit_pct, 5.0)      # live arbs: 5%+ in locks mode
         self.assertEqual(c.min_ev_pct, 5.0)
         self.assertEqual(c.prop_min_ev_pct, 10)            # yours was already stricter
         self.assertEqual(c.min_confidence, "high")
@@ -4296,6 +4299,940 @@ class Markouts(unittest.TestCase):
             self.assertEqual(Config.from_env().markout_file, "")
         with mock.patch.dict(os.environ, {"MARKOUT_FILE": "m.csv"}, clear=False):
             self.assertEqual(Config.from_env().markout_file, "m.csv")
+
+
+# --------------------------------------------------------------------------- alert mix: fewer live alerts,
+# more pre-game ones, and live alerts that are still there when you tap them
+
+STARTED = "2026-10-03T11:00:00Z"     # an hour before NOW: a live game
+
+
+def mix_event(home, away, sharp=(1.91, 1.91), ev_id="e1", start="2026-10-03T18:00:00Z", books=("A", "B"),
+              sport="basketball_nba", home_team="Home", away_team="Away"):
+    """A moneyline where book 1 has `home` on Home and book 2 `away` on Away (an arb when they add up
+    to under 100%), and Pinnacle (key 'pinnacle') the fair line, unless sharp is None."""
+    b1, b2 = books
+    mk = {b1: [("h2h", [(home_team, home, None), (away_team, 1.50, None)])],
+          b2: [("h2h", [(home_team, 1.50, None), (away_team, away, None)])]}
+    if sharp:
+        mk = {"Pinnacle": [("h2h", [(home_team, sharp[0], None), (away_team, sharp[1], None)])], **mk}
+    ev = event(mk, home=home_team, away=away_team, start=start)
+    ev.update(id=ev_id, sport_key=sport)
+    for bm in ev["bookmakers"]:
+        bm["key"] = {"Pinnacle": "pinnacle", "Kalshi": "kalshi", "FanDuel": "fanduel",
+                     "DraftKings": "draftkings"}.get(bm["title"], bm["key"])
+    return ev
+
+
+def age_book(ev, title, secs, when=NOW):
+    """That book's prices were last updated secs before `when`."""
+    bm = next(b for b in ev["bookmakers"] if b["title"] == title)
+    bm["last_update"] = bm["markets"][0]["last_update"] = \
+        (when - timedelta(seconds=secs)).isoformat().replace("+00:00", "Z")
+    return ev
+
+
+MIX = Config(min_profit_pct=0, min_live_profit_pct=0, round_stakes=0)
+
+
+class MixFiles(unittest.TestCase):
+    """Every file a test's alerters could write goes in a temporary folder."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        d = self.d = Path(self.tmp.name)
+        self.files = dict(log_file=str(d / "arbs.csv"), ev_log_file=str(d / "ev.csv"),
+                          outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"),
+                          markout_file=str(d / "mk.csv"), ev_results_file=str(d / "res.csv"),
+                          parlay_log_file=str(d / "par.csv"), state_dir=str(d / "state"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def cfg(self, base=None, **kw):
+        return replace(base or Config(), **self.files, **kw)
+
+    @staticmethod
+    def args(**flags):
+        return SimpleNamespace(**{"once": False, "demo": False, "dry_run": True, **flags})
+
+
+class FewerLiveAlerts(MixFiles):
+    def test_locks_mode_values_and_settings(self):
+        import os
+        from unittest import mock
+        c = Config().with_mode()
+        self.assertEqual((c.live_per_hour, c.max_arb_per_hour, c.max_outlier_per_hour), (3, 4, 6))
+        self.assertEqual((c.min_profit_pct, c.min_live_profit_pct), (2.0, 5.0))
+        self.assertEqual((c.outlier_min_pct, c.outlier_live_min_pct), (15.0, 20.0))
+        mine = Config(live_per_hour=2, max_arb_per_hour=1, max_outlier_per_hour=9, outlier_live_min_pct=30).with_mode()
+        self.assertEqual((mine.live_per_hour, mine.max_arb_per_hour, mine.max_outlier_per_hour,
+                          mine.outlier_live_min_pct), (2, 1, 6, 30))            # yours win only when stricter
+        plain = Config(alert_mode="balanced").with_mode()
+        self.assertEqual((plain.live_per_hour, plain.max_arb_per_hour, plain.outlier_live_min_pct), (0, 0, 0))
+        env = {"ALERT_MODE": "balanced", "LIVE_PER_HOUR": "5", "MAX_ARB_PER_HOUR": "7", "MAX_OUTLIER_PER_HOUR": "8",
+               "OUTLIER_LIVE_MIN_PCT": "25", "CONFIDENT_HOURS": "36"}
+        with mock.patch.dict(os.environ, env):
+            e = Config.from_env()
+        self.assertEqual((e.live_per_hour, e.max_arb_per_hour, e.max_outlier_per_hour, e.outlier_live_min_pct,
+                          e.confident_hours), (5, 7, 8, 25, 36))
+        line = _arbbot.mode_line(c)
+        for words in ("arbs 2%+ (live 5%+)", "outliers 15%+ (live 20%+)", "4 arbs/hour", "6 outliers/hour",
+                      "3 live alerts/hour in all"):
+            self.assertIn(words, line)
+
+    def test_live_arbs_need_five_percent_in_locks_mode(self):
+        ev_pre, ev_live = mix_event(2.15, 2.02, ev_id="pre"), mix_event(2.15, 2.02, ev_id="live", start=STARTED)
+        locks = Config(round_stakes=0).with_mode()
+        [pre] = find_arbs([ev_pre], locks, NOW)                                  # ~4.2%: fine before the game
+        self.assertTrue(2 <= pre.profit_pct < 5)
+        self.assertEqual(find_arbs([ev_live], locks, NOW), [])                    # live needs 5%+ now
+        self.assertEqual(len(find_arbs([ev_live], replace(locks, min_live_profit_pct=3), NOW)), 1)
+
+    def test_live_outliers_need_a_bigger_edge(self):
+        live, pre = outlier_event(1.50, 3.0), outlier_event(1.50, 3.0, start="2026-10-03T18:00:00Z")   # ~17%
+        locks = Config().with_mode()
+        self.assertEqual(find_outliers([live], locks, NOW), [])                   # live: 20%+
+        self.assertEqual(len(find_outliers([pre], locks, NOW)), 1)                # before the game: 15%+
+        own = Config(outlier_min_pct=10, outlier_live_min_pct=17)
+        self.assertEqual(len(find_outliers([live], own, NOW)), 1)
+        self.assertEqual(find_outliers([live], replace(own, outlier_live_min_pct=18), NOW), [])
+        self.assertEqual(len(find_outliers([live], replace(own, outlier_live_min_pct=0), NOW)), 1)   # 0: OUTLIER_MIN_PCT
+        self.assertEqual(find_outliers([live], replace(own, outlier_min_pct=18, outlier_live_min_pct=0), NOW), [])
+        self.assertEqual(find_outliers([live], replace(own, outlier_min_pct=18, outlier_live_min_pct=12), NOW), [])
+
+    def test_one_hourly_cap_for_every_live_alert(self):
+        cfg = self.cfg(MIX)
+        cap = _arbbot.HourlyCap(1)
+        arbs, outs = Alerter(cfg, dry_run=True), OutlierAlerter(cfg, dry_run=True)
+        arbs.live_cap = outs.live_cap = cap
+        [live_arb] = find_arbs([mix_event(2.25, 1.98, ev_id="g1", start=STARTED)], MIX, NOW)
+        [pre_arb] = find_arbs([mix_event(2.25, 1.98, ev_id="g2")], MIX, NOW)
+        [live_out] = find_outliers([outlier_event(1.85, 1.95)], cfg, NOW)
+        self.assertEqual(arbs.handle([live_arb], now=1000), 1)
+        self.assertEqual(outs.handle([live_out], now=1010), 0)                  # the hour's one live alert went
+        self.assertEqual(outs.held_counts, {"live cap": 1})
+        self.assertEqual(outs.open, {})
+        self.assertEqual(arbs.handle([live_arb, pre_arb], now=1020), 1)         # pre-game never counts
+        self.assertEqual(len(cap.times), 1)
+        self.assertEqual(outs.handle([live_out], now=1000 + 3601), 1)           # a new hour
+
+    def test_caps_send_games_that_havent_started_first(self):
+        cfg = self.cfg(MIX)
+        a = Alerter(cfg, dry_run=True)
+        a.max_per_hour = 1
+        [big_live] = find_arbs([mix_event(2.60, 1.98, ev_id="live", start=STARTED)], MIX, NOW)
+        [small_pre] = find_arbs([mix_event(2.08, 1.98, ev_id="pre")], MIX, NOW)
+        self.assertGreater(big_live.profit_pct, small_pre.profit_pct)
+        self.assertEqual(a.handle([big_live, small_pre], now=1000), 1)
+        self.assertEqual(list(a.open), [small_pre.key])                          # you have time to place it
+        self.assertEqual(a.held_counts, {"capped": 1})
+        e = EVAlerter(cfg, dry_run=True)
+        e.max_per_hour = 2
+        bets = [replace(ev_leg(f"g{i}", {"DK": 2.20 + i / 20}), event_id=f"g{i}", is_live=i > 0) for i in range(4)]
+        e.handle(bets, now=1000)
+        self.assertEqual(sorted(b.event_id for b in (op.arb for op in e.open.values())), ["g0", "g3"])  # then biggest
+
+    def test_main_and_prop_alerts_share_their_caps(self):
+        t = _arbbot.Trackers(self.cfg(max_arb_per_hour=1, max_outlier_per_hour=1, live_per_hour=2), self.args())
+        self.assertEqual((t.arbs.max_per_hour, t.prop_arbs.max_per_hour, t.outs.max_per_hour,
+                          t.prop_outs.max_per_hour), (1, 1, 1, 1))
+        self.assertTrue(all(a.live_cap is t.live_cap for a in t.singles()))
+        self.assertEqual(t.live_cap.limit, 2)
+        self.assertIsNone(t.parlays.live_cap)
+        [one] = find_arbs([mix_event(2.25, 1.98, ev_id="g1")], MIX, NOW)
+        [two] = find_arbs([mix_event(2.25, 1.98, ev_id="g2")], MIX, NOW)
+        self.assertEqual(t.arbs.handle([one], now=1000), 1)
+        self.assertEqual(t.prop_arbs.handle([two], now=1100), 0)                 # the hour's one arb already went
+        self.assertEqual(t.prop_arbs.handle([two], now=1000 + 3700), 1)
+        [o] = find_outliers([outlier_event(1.85, 1.95, start="2026-10-03T18:00:00Z")], t.cfg, NOW)
+        po = replace(o, event_id="p1")
+        self.assertEqual(t.outs.handle([o], now=1000), 1)
+        self.assertEqual(t.prop_outs.handle([po], now=1100), 0)
+
+    def test_related_bets_leave_out_ones_the_live_cap_holds(self):
+        from arbbot import note_related
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        [ml] = find_evs([ev], EVCFG, NOW)
+        live_tot = replace(ml, market="totals", line=220.5, point=220.5, outcome="Over", is_live=True)
+        pre_sp = replace(ml, market="spreads", line=-3.5, point=-3.5)
+        a = EVAlerter(self.cfg(EVCFG), dry_run=True)
+        a.live_cap = _arbbot.HourlyCap(1)
+        a.live_cap.times.append(time.time())                                     # the live slot is taken
+        note_related([([ml, live_tot, pre_sp], a, set())])
+        self.assertEqual(ml.related, ["Home -3.5"])                               # not the live total
+        a.live_cap.times.clear()
+        live_under = replace(live_tot, outcome="Under", price=2.10)
+        note_related([([ml, live_under, live_tot, pre_sp], a, set())])
+        self.assertEqual(ml.related, ["Home -3.5", "Over 220.5"])                 # one live slot: the better one
+
+    def test_tonight_and_tomorrow_can_be_high_confidence(self):
+        from arbbot import rate_confidence
+        self.assertEqual(rate_confidence(2.5, 1.0, 20, 5, False), ("high", ["tight sharp market (2.5% margin)",
+                                                                           "other books agree"]))
+        self.assertEqual(rate_confidence(2.5, 4.0, 20, 5, False)[0], "high")       # 20h out: the hours point
+        self.assertEqual(rate_confidence(2.5, 4.0, 20, 5, False, confident_hours=12)[0], "medium")
+        conf, notes = rate_confidence(2.5, 4.0, 30, 5, False)
+        self.assertEqual(conf, "medium")
+        self.assertIn("early line (less tested)", notes)                          # past CONFIDENT_HOURS
+        conf, notes = rate_confidence(2.5, 4.0, 20, 5, True)                      # props: still 12 hours
+        self.assertEqual(conf, "medium")
+        self.assertIn("early line (less tested)", notes)
+        # find_evs passes the hours to kickoff and CONFIDENT_HOURS through.
+        tomorrow = ev_event([("Home", 1.93, None), ("Away", 1.93, None)], {"B": [("Home", 2.15, None)],
+                            "C": [("Home", 1.93, None), ("Away", 1.93, None)], "D": [("Home", 1.94, None), ("Away", 1.92, None)],
+                            "E": [("Home", 1.92, None), ("Away", 1.94, None)]}, start="2026-10-04T08:00:00Z")   # 20h out
+        cfg = Config(min_ev_pct=3, round_stakes=0, min_confidence="high")
+        [b] = find_evs([tomorrow], cfg, NOW)
+        self.assertEqual(b.confidence, "high")
+        self.assertEqual(find_evs([tomorrow], replace(cfg, confident_hours=12), NOW), [])
+
+
+class LiveAlertsHoldUp(MixFiles):
+    """"u keep sending notis that by the time u click on it the odds already switch within seconds"."""
+
+    def live_arb(self, ev_id="live", **kw):
+        [arb] = find_arbs([mix_event(2.25, 1.98, ev_id=ev_id, start=STARTED, **kw)], MIX, NOW)
+        return arb
+
+    def test_locks_mode_values_and_settings(self):
+        import os
+        from unittest import mock
+        c = Config().with_mode()
+        self.assertEqual((c.live_confirm_checks, c.live_max_age_alert), (2, 60))
+        self.assertEqual((Config().live_confirm_checks, Config().live_max_age_alert), (1, 0))   # off outside locks
+        mine = Config(live_confirm_checks=3, live_max_age_alert=30).with_mode()
+        self.assertEqual((mine.live_confirm_checks, mine.live_max_age_alert), (3, 30))         # stricter wins
+        loose = Config(live_confirm_checks=1, live_max_age_alert=0).with_mode()
+        self.assertEqual((loose.live_confirm_checks, loose.live_max_age_alert), (2, 60))
+        with mock.patch.dict(os.environ, {"ALERT_MODE": "balanced", "LIVE_CONFIRM_CHECKS": "3",
+                                          "LIVE_MAX_AGE_ALERT": "45"}):
+            e = Config.from_env()
+        self.assertEqual((e.live_confirm_checks, e.live_max_age_alert), (3, 45))
+        self.assertIn("live alerts need 2 checks in a row and a price under 60s old", _arbbot.mode_line(c))
+
+    def test_a_live_alert_needs_two_checks_in_a_row(self):
+        rules = _arbbot.LiveConfirm(checks=2)
+        live, scope = self.live_arb(), {"basketball_nba"}
+        [pre] = find_arbs([mix_event(2.25, 1.98, ev_id="pre")], MIX, NOW)
+        self.assertEqual(rules.filter([live, pre], scope, 1000), [pre])           # pre-game: right away
+        self.assertEqual(rules.held, [(live, "waiting")])
+        self.assertEqual(rules.filter([live, pre], scope, 1060), [live, pre])     # found again: it pings
+        self.assertEqual(rules.filter([live], scope, 1120), [live])               # (capped? it can still go)
+        # Seen, missing on the next check of its sport, back: counting starts over.
+        rules = _arbbot.LiveConfirm(checks=2)
+        rules.filter([live], scope, 1000)
+        self.assertEqual(rules.filter([], scope, 1060), [])
+        self.assertEqual(rules.dropped, [(live, 1000, 1)])                        # gone before its 2nd check
+        self.assertEqual(rules.filter([live], scope, 1120), [])
+        self.assertEqual(rules.filter([live], scope, 1180), [live])
+        # A check of other sports isn't "missing"; a check too long after the last one is.
+        rules = _arbbot.LiveConfirm(checks=2, window=180)
+        rules.filter([live], scope, 1000)
+        self.assertEqual(rules.filter([], {"icehockey_nhl"}, 1060), [])
+        self.assertEqual(rules.dropped, [])
+        self.assertEqual(rules.filter([live], scope, 1170), [live])
+        rules = _arbbot.LiveConfirm(checks=2, window=180)
+        rules.filter([live], scope, 1000)
+        self.assertEqual(rules.filter([live], scope, 1181), [])                    # 181s later: not "in a row"
+        # 1 = off; 3 = three in a row.
+        self.assertEqual(_arbbot.LiveConfirm(checks=1).filter([live], scope, 1000), [live])
+        three = _arbbot.LiveConfirm(checks=3)
+        self.assertEqual([len(three.filter([live], scope, t)) for t in (1000, 1060, 1120)], [0, 0, 1])
+
+    def test_open_restored_and_handed_over_alerts_dont_wait(self):
+        live, scope = self.live_arb(), {"basketball_nba"}
+        cfg = self.cfg(MIX)
+        for how in ("open", "restored", "handed"):
+            a = Alerter(cfg, dry_run=True)
+            if how == "open":
+                a.handle([live], now=900)
+            elif how == "restored":
+                a.restored[live.key] = {"first_seen": 900}
+            else:
+                a.handed[live.key] = 900
+            rules = _arbbot.LiveConfirm(checks=2)
+            self.assertEqual(rules.filter([live], scope, 1000, (a,)), [live], how)
+            self.assertEqual(rules.filter([live], scope, 1000, (Alerter(cfg, dry_run=True),)), [], how)
+
+    def test_the_price_to_bet_must_be_fresh(self):
+        scope = {"basketball_nba"}
+        ev = age_book(age_book(mix_event(2.25, 1.98, start=STARTED), "A", 10), "B", 70)
+        [old] = find_arbs([ev], MIX, NOW)
+        self.assertEqual(old.age, 70)                                            # the oldest price to bet
+        rules = _arbbot.LiveConfirm(max_age=60)
+        self.assertEqual(rules.filter([old], scope, 1000), [])
+        self.assertEqual(rules.held, [(old, "old price")])
+        [ok] = find_arbs([age_book(mix_event(2.25, 1.98, start=STARTED), "B", 50)], MIX, NOW)
+        self.assertEqual(rules.filter([ok], scope, 1000), [ok])
+        [pin_old] = find_arbs([age_book(mix_event(2.25, 1.98, start=STARTED), "Pinnacle", 100)], MIX, NOW)
+        self.assertEqual(rules.filter([pin_old], scope, 1000), [pin_old])        # Pinnacle's age doesn't matter
+        [pre_old] = find_arbs([age_book(mix_event(2.25, 1.98), "B", 600)], MIX, NOW)
+        self.assertEqual(rules.filter([pre_old], scope, 1000), [pre_old])        # before the game: no limit
+        self.assertEqual(rules.filter([replace(ok, age=None)], scope, 1000), [])  # no time on it: can't tell
+        self.assertEqual(_arbbot.LiveConfirm(max_age=0).filter([old], scope, 1000), [old])   # 0 = off
+        # An old price on the 2nd check isn't a sighting: start over, and it isn't "gone" either.
+        both = _arbbot.LiveConfirm(checks=2, max_age=60)
+        both.filter([ok], scope, 1000)
+        self.assertEqual(both.filter([replace(ok, age=70)], scope, 1060), [])
+        self.assertEqual((both.held[0][1], both.dropped), ("old price", []))
+        self.assertEqual(both.filter([ok], scope, 1120), [])
+        self.assertEqual(both.filter([ok], scope, 1180), [ok])
+        # Outliers and +EV: the alerted book's price.
+        out_ev = age_book(outlier_event(1.85, 1.95), "Stale", 40)
+        [o] = find_outliers([out_ev], Config(), NOW)
+        self.assertEqual(o.age, 40)
+        [b] = find_evs([age_book(ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]}),
+                                 "B", 25)], EVCFG, NOW)
+        self.assertEqual(b.age, 25)
+
+    def test_two_checks_then_the_ping_and_markouts_follow_only_what_went_out(self):
+        cfg = self.cfg(MIX, live_confirm_checks=2, live_max_age_alert=60, ev_enabled=False)
+        t = _arbbot.Trackers(cfg, self.args(dry_run=False))
+        out_ev = outlier_event(1.85, 1.95)
+        out_ev["sport_key"] = "basketball_nba"
+
+        def check(secs):
+            evs = [mix_event(2.25, 1.98, ev_id="live", start=STARTED), mix_event(2.25, 1.98, ev_id="pre"), out_ev]
+            return _arbbot.scan_main(t, [stamped(e, secs) for e in evs], ["basketball_nba"], at(secs), kalshi=False)
+        first = check(0)
+        self.assertEqual((first.sent, first.out_sent), (1, 0))                   # the pre-game arb, right away
+        self.assertEqual(list(t.arbs.open), ["pre|h2h|None"])
+        self.assertEqual(first.held, {"waiting": 2})
+        self.assertEqual(_arbbot.held_text(first.held), " | held back: 2 live, waiting for another check")
+        self.assertEqual({m.event_id for m in t.markouts.pending}, {"pre"})       # only what went out is followed
+        second = check(60)
+        self.assertEqual((second.sent, second.out_sent, second.held), (1, 1, {}))   # still there: now they ping
+        self.assertEqual(sorted({(m.kind, m.event_id) for m in t.markouts.pending}),
+                         [("arb", "live"), ("arb", "pre"), ("outlier", "e1")])
+        n = len(t.markouts.pending)
+        third = check(120)
+        self.assertEqual((third.sent, third.out_sent, len(t.markouts.pending)), (0, 0, n))   # followed once
+
+    def test_the_live_cap_and_live_rules_together(self):
+        cfg = self.cfg(MIX, live_confirm_checks=2, live_per_hour=1, ev_enabled=False)
+        t = _arbbot.Trackers(cfg, self.args())
+
+        def check(secs, ids):
+            evs = [mix_event(2.25 + i / 50, 1.98, ev_id=g, start=STARTED) for i, g in enumerate(ids)]
+            return _arbbot.scan_main(t, [stamped(e, secs) for e in evs], ["basketball_nba"], at(secs), kalshi=False)
+        check(0, ["g1", "g2"])
+        res = check(60, ["g1", "g2"])
+        self.assertEqual(res.sent, 1)                                             # one live alert an hour
+        self.assertEqual(res.held, {"live cap": 1})
+        self.assertEqual(list(t.arbs.open), ["g2|h2h|None"])                      # the bigger one
+        self.assertIn("1 over the live-alert cap", _arbbot.held_text(res.held))
+
+    def test_cards_show_how_old_the_price_was_when_sent(self):
+        ev = age_book(age_book(mix_event(2.25, 1.98), "A", 10), "B", 35)
+        [arb] = find_arbs([ev], MIX, NOW)
+        self.assertIn("⏱ prices were up to 35s old when sent", discord_payload(arb)["embeds"][0]["description"])
+        [b] = find_evs([age_book(ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]}),
+                                 "B", 20)], EVCFG, NOW)
+        self.assertIn("⏱ price was 20s old when sent", ev_payload(b)["embeds"][0]["description"])
+        [o] = find_outliers([age_book(outlier_event(1.85, 1.95), "Stale", 40)], Config(), NOW)
+        self.assertIn("⏱ price was 40s old when sent", outlier_payload(o)["embeds"][0]["description"])
+        self.assertEqual([_arbbot._age_note(s) for s in (600, 7200)],
+                         ["\n⏱ price was 10 min old when sent", "\n⏱ price was 2h old when sent"])
+        self.assertNotIn("⏱", discord_payload(replace(arb, age=None))["embeds"][0]["description"])
+        # Kept as first sent: a later sighting with a newer price time doesn't edit the card.
+        sent = []
+        a = Alerter(self.cfg(MIX, webhook_url="https://x"), dry_run=False)
+        a._discord = lambda payload, message_id=None, url="": sent.append(message_id) or message_id or "m1"
+        a.handle([arb], now=1000)
+        [again] = find_arbs([mix_event(2.25, 1.98)], MIX, NOW)                    # same prices, 0s old now
+        a.handle([again], now=1060)
+        self.assertEqual((sent, a.open[arb.key].arb.age), ([None], 35))
+        [jump] = find_arbs([age_book(mix_event(2.60, 1.98), "A", 5)], MIX, NOW)  # a much better price: new alert
+        a.handle([jump], now=1120)
+        self.assertEqual(a.open[arb.key].arb.age, 5)                             # ...showing its own price's age
+        n = len(sent)
+        a.handle(find_arbs([mix_event(2.60, 1.98)], MIX, NOW), now=1180)
+        self.assertEqual(len(sent), n)                                           # and no needless edit after it
+        b2 = EVAlerter(self.cfg(EVCFG), dry_run=True)
+        b2.handle([b], now=1000)
+        b2.handle([replace(b, age=0)], now=1060)
+        self.assertEqual(b2.open[b.key].arb.age, 20)
+
+    def test_restart_keeps_the_price_age_on_the_card(self):
+        cfg = self.cfg(MIX, webhook_url="https://x")
+        sent = []
+
+        def make(cls):
+            a = cls(cfg, dry_run=False)
+            a._discord = lambda payload, message_id=None, url="": sent.append(message_id) or message_id or "m1"
+            return a
+        [arb] = find_arbs([age_book(mix_event(2.25, 1.98), "B", 35)], MIX, NOW)
+        make(Alerter).handle([arb], ["basketball_nba"], now=time.time())
+        [b] = find_evs([age_book(ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]}),
+                                 "B", 20)], EVCFG, NOW)
+        make(EVAlerter).handle([b], now=time.time())
+        a2, e2 = make(Alerter), make(EVAlerter)                                   # restart
+        [arb2] = find_arbs([mix_event(2.25, 1.98)], MIX, NOW)
+        a2.handle([arb2], ["basketball_nba"], now=time.time())
+        e2.handle([replace(b, age=0)], now=time.time())
+        self.assertEqual(sent, [None, None])                                     # no edits, no new posts
+        self.assertEqual((a2.open[arb.key].arb.age, e2.open[b.key].arb.age), (35, 20))
+
+    def test_demo_shows_a_pregame_arb_and_the_live_outlier_in_locks_mode(self):
+        import contextlib, io
+        from unittest import mock
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch("arbbot.kalshi_fair", side_effect=AssertionError("network")):
+            _arbbot.run(self.cfg(Config().with_mode()), SimpleNamespace(demo=True, dry_run=True), None)
+        text = out.getvalue()
+        self.assertIn("[demo] 1 arb(s), 0 +EV bet(s), 1 outlier(s) in sample data (2 checks", text)
+        self.assertEqual(text.count("🚨 OUTLIER"), 1)
+        self.assertEqual(len(find_arbs(demo_events(live_arb=False), Config().with_mode())), 1)   # --test-discord too
+        self.assertEqual(find_arbs(demo_events(), Config().with_mode()), [])     # (live at 3.5%: not in locks)
+        self.assertEqual(list(Path(self.d).iterdir()), [])                       # the demo writes nothing
+
+    def test_slow_live_checks_still_confirm(self):
+        t = _arbbot.Trackers(self.cfg(live_confirm_checks=2), self.args())
+        self.assertEqual((t.arb_live.window, t.bet_live.window), (180, 180))     # max(3 x POLL_SECONDS, 3 min)
+        t.set_live_interval(300)                                                 # a tight budget: every 5 min
+        self.assertEqual((t.arb_live.window, t.bet_live.window), (900, 900))
+        t.set_live_interval(30)
+        self.assertEqual(t.arb_live.window, 180)
+        self.assertEqual(_arbbot.Trackers(self.cfg(poll_seconds=90), self.args()).bet_live.window, 270)
+
+    def test_a_waiting_live_bet_isnt_named_on_other_cards(self):
+        cfg = self.cfg(live_confirm_checks=2, ev_enabled=False)
+        t = _arbbot.Trackers(cfg, self.args())
+
+        def check(secs, both):
+            ev = outlier_event(1.85, 1.95)
+            ev["sport_key"] = "basketball_nba"
+            if both:   # a second book far off on the other side
+                ev["bookmakers"].append({"key": "stale2", "title": "Stale2", "markets": [{"key": "h2h", "outcomes": [
+                    {"name": "Home", "price": 1.10}, {"name": "Away", "price": 6.5}]}]})
+            return _arbbot.scan_main(t, [stamped(ev, secs)], ["basketball_nba"], at(secs), kalshi=False)
+        check(0, False)
+        check(60, False)
+        [home] = t.outs.open.values()
+        check(120, True)                                                          # Away waits for its 2nd check
+        self.assertEqual(home.arb.related, [])
+        check(180, True)
+        self.assertEqual(home.arb.related, ["Away ML"])
+        self.assertEqual(len(t.outs.open), 2)
+
+    def test_test_discord_sends_an_arb_in_locks_mode(self):
+        import os, contextlib, io, sys
+        from unittest import mock
+        sent = []
+        env = {"DISCORD_WEBHOOK_URL": "https://discord.example/hook", "ALERT_MODE": "locks", "STATE_DIR": "",
+               "LOG_FILE": ""}
+        with mock.patch.dict(os.environ, env), mock.patch.object(sys, "argv", ["arbbot.py", "--test-discord"]), \
+                mock.patch("arbbot.load_dotenv"), mock.patch("arbbot.time.sleep"), \
+                mock.patch("arbbot._webhook", lambda url, payload, *a: sent.append(payload) or {"id": "1"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            _arbbot.main()
+        self.assertTrue(sent[0]["embeds"][0]["title"].startswith("🧪 SAMPLE · 💰 ARB"))
+
+    def test_once_checks_one_time_and_says_what_waits(self):
+        import argparse, contextlib, io
+        from unittest import mock
+        real = datetime.now(timezone.utc)
+        iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
+        live_start, pre_start = iso(real - timedelta(minutes=30)), iso(real + timedelta(hours=5))
+
+        class Api:
+            remaining, used = 50000.0, None
+
+            def __init__(self, cfg):
+                pass
+
+            def events(self, sport, horizon_hours=26):
+                return [{"id": "live1", "commence_time": live_start}, {"id": "pre1", "commence_time": pre_start}]
+
+            def odds(self, sport, until):
+                secs = (datetime.now(timezone.utc) - NOW).total_seconds()
+                live = outlier_event(1.85, 1.95, start=live_start)
+                live.update(id="live1", sport_key="basketball_nba")
+                pre = mix_event(2.25, 1.98, ev_id="pre1", start=pre_start)
+                return [stamped(live, secs), stamped(pre, secs)]
+
+            def event_odds(self, sport, gid, markets):   # a prop arb in the same game
+                prop = priced_prop({"Pinnacle": (2.0, 2.0), "DK": (2.20, 1.80), "FD": (1.80, 2.05)}, start=pre_start)
+                prop["id"] = gid
+                return stamped(prop, (datetime.now(timezone.utc) - NOW).total_seconds())
+
+        cfg = self.cfg(Config(round_stakes=0, max_arb_per_hour=1).with_mode(), sports=["basketball_nba"],
+                       prop_sports=["basketball_nba"], kalshi_check=False, ev_enabled=False)
+        args = argparse.Namespace(once=True, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        with mock.patch("arbbot.OddsAPI", Api), contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        text = out.getvalue()
+        self.assertIn("1 arbs, 1 new", text)                                      # the game later today
+        self.assertIn("1 outliers, 0 new | held back: 1 live, waiting for another check", text)
+        self.assertIn("0 new arbs, 0 new +EV, 0 new outliers | held back: 1 over the hourly cap", text)   # props
+        self.assertIn("Feed freshness:", text)                                   # (and the rest of --once)
+        self.assertEqual([r["reason"] for r in _read(self.files["log_file"])], ["capped"])   # (the held prop arb)
+
+    def test_run_confirms_live_alerts_on_its_next_pass(self):
+        import argparse, contextlib, io
+        from unittest import mock
+        real = datetime.now(timezone.utc)
+        iso = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
+        live_start = iso(real - timedelta(minutes=30))
+
+        class Api:
+            remaining, used = 50000.0, None
+
+            def __init__(self, cfg):
+                pass
+
+            def events(self, sport, horizon_hours=26):
+                return [{"id": "live1", "commence_time": live_start}]
+
+            def odds(self, sport, until):
+                ev = outlier_event(1.85, 1.95, start=live_start)
+                ev.update(id="live1", sport_key="basketball_nba")
+                return [stamped(ev, (datetime.now(timezone.utc) - NOW).total_seconds())]
+
+        cfg = self.cfg(sports=["basketball_nba"], props_enabled=False, kalshi_check=False, summary_hour=-1,
+                       results_minutes=0, live_confirm_checks=2, live_max_age_alert=60, parlays_enabled=False)
+        args = argparse.Namespace(once=False, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        passes, windows = [], []
+        real_scan, real_window = _arbbot.scan_main, _arbbot.Trackers.set_live_interval
+
+        def scan(t, *a, **kw):
+            passes.append(real_scan(t, *a, **kw))
+            return passes[-1]
+
+        def window(t, secs):
+            windows.append(secs)
+            return real_window(t, secs)
+        with mock.patch("arbbot.OddsAPI", Api), mock.patch("arbbot.scan_main", scan), \
+                mock.patch.object(_arbbot.Trackers, "set_live_interval", window), \
+                mock.patch.object(_arbbot.Scheduler, "due", lambda s, now: list(s.cfg.sports)), \
+                mock.patch.object(_arbbot.Scheduler, "interval", lambda s, st: 100.0), \
+                mock.patch("arbbot.time.sleep", side_effect=[None, StopLoop]), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(StopLoop):
+                _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        self.assertEqual([(p.out_sent, p.held) for p in passes], [(0, {"waiting": 1}), (1, {})])
+        self.assertIn("held back: 1 live, waiting for another check", out.getvalue())   # on the console line
+        self.assertEqual(windows.count(100), 2)                                   # the live check rate, each pass
+
+
+class PriceThatWillMoveFirst(MixFiles):
+    def test_the_leg_that_beats_pinnacle_goes_first(self):
+        # Fair is 50/50. A's Home +125 is 12.5% better than fair; B's Away -102 is 1% worse.
+        ev = mix_event(2.25, 1.98)
+        ev["bookmakers"][1]["markets"][0]["outcomes"][0]["link"] = "https://a.example/slip"
+        [arb] = find_arbs([ev], MIX, NOW)
+        self.assertEqual([l.book for l in arb.legs], ["A", "B"])                 # not by name (Away would be 1st)
+        self.assertEqual([round(l.edge, 2) for l in arb.legs], [12.5, -1.0])
+        self.assertEqual(arb.fair_from, "Pinnacle")
+        self.assertEqual(arb.keep_stake, kelly_stake(0.5, 2.25, MIX))
+        [asym] = find_arbs([mix_event(2.25, 1.98, sharp=(1.80, 2.10))], MIX, NOW)
+        p_home = devig([1.80, 2.10], "power")[0]
+        self.assertEqual(asym.keep_stake, kelly_stake(p_home, 2.25, MIX))         # the +EV stake on Home alone
+        self.assertNotEqual(asym.keep_stake, kelly_stake(1 - p_home, 2.25, MIX))
+        d = discord_payload(arb)["embeds"][0]["description"]
+        self.assertTrue(d.startswith("👉 **DO THIS NOW: place BOTH bets, 1️⃣ first. You profit no matter who wins.**"))
+        self.assertIn("1️⃣ Open **[A](https://a.example/slip)** → bet", d)
+        self.assertIn("\n     ↳ **Bet this one first:** it's the price that will move.", d)
+        self.assertIn(f"\n     ↳ If the other price is gone, keep this one: it's a good bet alone. Only betting "
+                      f"this one? Bet **{_arbbot.money(arb.keep_stake)}**.", d)
+        self.assertIn("Place 1️⃣ first, then 2️⃣ right away. If 1️⃣ has moved past its skip line, skip both.", d)
+        self.assertNotIn("back to back", d)
+        self.assertEqual(discord_payload(arb)["embeds"][0]["url"], "https://a.example/slip")   # the title opens it
+        self.assertIn("Home +125 on A  → stake $46.81  (bet first: +12.5% vs Pinnacle)\n", _arbbot.format_text(arb))
+        # Pinnacle's line isn't the same bet (it has a draw): no fair price for these two sides.
+        draw = mix_event(2.25, 1.98)
+        draw["bookmakers"][0]["markets"][0]["outcomes"].append({"name": "Draw", "price": 12.0})
+        [odd] = find_arbs([draw], MIX, NOW)
+        self.assertFalse(odd.tagged)
+        # No Pinnacle price: today's order and wording, and never "keep".
+        [plain] = find_arbs([mix_event(2.25, 1.98, sharp=None)], MIX, NOW)
+        self.assertEqual(([l.outcome for l in plain.legs], plain.fair_from, plain.keep_stake), (["Away", "Home"], "", 0))
+        p = discord_payload(plain)["embeds"][0]["description"]
+        self.assertTrue(p.startswith("👉 **DO THIS NOW: place BOTH bets. You profit no matter who wins.**"))
+        self.assertIn("Do them back to back. If one price moved past its skip line, don't place the other.", p)
+        for words in ("first", "keep"):
+            self.assertNotIn(words, p)
+        self.assertNotIn("bet first", _arbbot.format_text(plain))
+
+    def test_keep_it_only_when_its_own_edge_clears_the_ev_minimum(self):
+        [small] = find_arbs([mix_event(2.02, 1.99, sharp=(1.95, 1.95))], MIX, NOW)   # Home 1% better than fair
+        d = discord_payload(small)["embeds"][0]["description"]
+        self.assertIn("Bet this one first", d)
+        self.assertNotIn("keep this one", d)
+        self.assertEqual(small.keep_stake, 0)
+        ev = mix_event(2.09, 2.05, sharp=(2.0, 2.0))                               # Home 4.5% better
+        self.assertGreater(find_arbs([ev], replace(MIX, min_ev_pct=4), NOW)[0].keep_stake, 0)
+        self.assertEqual(find_arbs([ev], replace(MIX, min_ev_pct=5), NOW)[0].keep_stake, 0)
+        ev["sport_key"] = "basketball_ncaab"                                       # college needs 6% (SPORT_MIN_EV)
+        self.assertEqual(find_arbs([ev], replace(MIX, min_ev_pct=4), NOW)[0].keep_stake, 0)
+        prop = priced_prop({"Pinnacle": (2.0, 2.0), "DK": (2.09, 1.80), "FD": (1.80, 2.05)})
+        cfg = replace(MIX, min_ev_pct=4, prop_min_ev_pct=7)                         # props: PROP_MIN_EV_PCT
+        [p] = find_arbs([prop], cfg, NOW)
+        self.assertTrue(p.tagged)
+        self.assertEqual(p.keep_stake, 0)
+        self.assertGreater(find_arbs([prop], replace(cfg, prop_min_ev_pct=4), NOW)[0].keep_stake, 0)
+
+    def test_three_way_wording(self):
+        ev = event({"Pinnacle": [("h2h", [("Home", 2.9, None), ("Away", 2.9, None), ("Draw", 3.3, None)])],
+                    "A": [("h2h", [("Home", 3.4, None), ("Away", 2.5, None), ("Draw", 3.0, None)])],
+                    "B": [("h2h", [("Home", 2.6, None), ("Away", 3.1, None), ("Draw", 3.2, None)])],
+                    "C": [("h2h", [("Home", 2.6, None), ("Away", 2.5, None), ("Draw", 3.6, None)])]})
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        [arb] = find_arbs([ev], MIX, NOW)
+        self.assertEqual(len(arb.legs), 3)
+        self.assertEqual([l.book for l in arb.legs], ["A", "C", "B"])              # most better than fair first
+        d = discord_payload(arb)["embeds"][0]["description"]
+        self.assertIn("place all 3 bets, 1️⃣ first", d)
+        self.assertIn("then the others right away. If 1️⃣ has moved past its skip line, skip them all.", d)
+        self.assertIn("If the other prices are gone, keep this one", d)
+
+    def test_pinnacle_is_worked_out_once_per_game_with_an_arb(self):
+        from unittest import mock
+        ev = mix_event(2.25, 1.98)
+        for bm in ev["bookmakers"][1:]:   # a totals arb in the same game
+            bm["markets"].append({"key": "totals", "last_update": FRESH, "outcomes": [
+                {"name": "Over", "price": 2.2 if bm["title"] == "A" else 1.7, "point": 220.5},
+                {"name": "Under", "price": 1.7 if bm["title"] == "A" else 2.2, "point": 220.5}]})
+        quiet = mix_event(1.90, 1.90, ev_id="quiet")
+        real = _arbbot.sharp_fair
+        with mock.patch("arbbot.sharp_fair", side_effect=real) as spy:
+            arbs = find_arbs([ev, quiet], MIX, NOW)
+        self.assertEqual(len(arbs), 2)
+        self.assertEqual([c.args[0]["id"] for c in spy.call_args_list], ["e1"])
+        self.assertEqual({a.market: a.tagged for a in arbs}, {"h2h": True, "totals": False})   # no Pinnacle total
+
+    def test_guide_says_when_to_bet_first_and_when_to_keep(self):
+        g = _arbbot.GUIDE
+        self.assertIn("If a bet says **Bet this one first**, place it first: it's the price that will move.", g)
+        self.assertIn('No "first" note? Place the bets back to back.', g)
+        self.assertIn('the card says when the first is still worth keeping on its own ("keep this one")', g)
+        self.assertNotIn("• Place the bets back to back.", g)
+        self.assertIn("⏱ **Price age** on a card: how long the book had shown that price", g)
+        self.assertIn("A live alert only goes out once two checks in a row", g)
+        self.assertIn("Games that haven't started come first; live alerts are kept to a few an hour.", g)
+
+
+class NewYorkCollegeGames(MixFiles):
+    """New York's sportsbooks can't take bets on games with a New York college team in them."""
+
+    NY = replace(MIX, ny_rules=True)
+
+    def test_which_games_count(self):
+        def ny(team, sport="basketball_ncaab"):
+            return _arbbot.ny_college_game({"sport_key": sport, "home_team": team, "away_team": "Duke Blue Devils"})
+        for team in ("Syracuse Orange", "St. John's Red Storm", "Saint John's Red Storm", "Army Black Knights",
+                     "LIU Sharks", "Albany Great Danes", "Buffalo Bulls", "Stony Brook Seawolves",
+                     "St. Bonaventure Bonnies", "Le Moyne Dolphins", "Cornell Big Red"):
+            self.assertTrue(ny(team), team)
+        self.assertTrue(ny("Hobart Statesmen", "lacrosse_ncaa"))
+        self.assertTrue(_arbbot.ny_college_game({"sport_key": "americanfootball_ncaaf", "home_team": "Clemson Tigers",
+                                                 "away_team": "Syracuse Orange"}))         # either team
+        for team in ("Buffalo State Bengals", "Albany State Golden Rams", "Albany St Golden Rams", "Miami Hurricanes",
+                     "Columbia International Rams"):
+            self.assertFalse(ny(team), team)
+        self.assertFalse(ny("Buffalo Bills", "americanfootball_nfl"))                       # not college
+
+    def test_settings(self):
+        import os
+        from unittest import mock
+        for env, want in (({"US_STATE": "ny", "NY_RULES": ""}, True), ({"US_STATE": "NY", "NY_RULES": ""}, True),
+                          ({"US_STATE": "ny", "NY_RULES": "false"}, False), ({"US_STATE": "nj", "NY_RULES": ""}, False),
+                          ({"US_STATE": "", "NY_RULES": "true"}, True)):
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(Config.from_env().ny_rules, want, env)
+        self.assertFalse(Config().ny_rules)
+
+    def game(self, home="Syracuse Orange", sport="americanfootball_ncaaf", books=("FanDuel", "Kalshi")):
+        return mix_event(2.25, 1.98, books=books, sport=sport, home_team=home, away_team="Clemson Tigers")
+
+    def test_arbs(self):
+        self.assertEqual(len(find_arbs([self.game()], MIX, NOW)), 1)
+        self.assertEqual(find_arbs([self.game()], self.NY, NOW), [])                        # FanDuel can't take it
+        self.assertEqual(len(find_arbs([self.game(books=("Kalshi", "Other"))], self.NY, NOW)), 1)   # Kalshi can
+        for ok in (self.game("Albany State Golden Rams"), self.game("Buffalo Bills", "americanfootball_nfl")):
+            self.assertEqual(len(find_arbs([ok], self.NY, NOW)), 1)
+
+    def test_plus_ev_and_its_board(self):
+        ev = ev_event([("Syracuse Orange", 1.91, None), ("Clemson Tigers", 1.91, None)],
+                      {"FanDuel": [("Syracuse Orange", 2.30, None)], "Kalshi": [("Syracuse Orange", 2.20, None)]})
+        ev.update(sport_key="americanfootball_ncaaf", home_team="Syracuse Orange", away_team="Clemson Tigers")
+        for bm in ev["bookmakers"]:
+            bm["key"] = {"FanDuel": "fanduel", "Kalshi": "kalshi"}.get(bm["title"], bm["key"])
+        [b] = find_evs([ev], EVCFG, NOW)
+        self.assertEqual((b.book, [r[0] for r in b.board]), ("FanDuel", ["FanDuel", "Kalshi"]))
+        [b] = find_evs([ev], replace(EVCFG, ny_rules=True), NOW)
+        self.assertEqual((b.book, [r[0] for r in b.board], b.also), ("Kalshi", ["Kalshi"], []))   # no FanDuel at all
+
+    def test_outliers_their_board_hedge_and_parlays(self):
+        def syracuse():
+            ev = outlier_event(1.85, 1.95)
+            ev.update(sport_key="basketball_ncaab", home_team="Syracuse Orange")
+            for bm in ev["bookmakers"]:
+                bm["key"] = {"DK": "draftkings", "FD": "fanduel", "MGM": "betmgm", "Stale": "kalshi"}.get(
+                    bm["title"], bm["key"])
+                bm["markets"][0]["outcomes"][0]["name"] = "Syracuse Orange"
+            return ev
+        [o] = find_outliers([syracuse()], Config(), NOW)
+        self.assertEqual(o.book, "Stale")
+        self.assertEqual(({r[0] for r in o.board}, o.hedge[0][1]), ({"Stale", "DK", "FD", "MGM"}, "DK"))
+        self.assertEqual(o.parlay_books, {"Stale", "DK", "FD", "MGM", "Pinnacle"})
+        [o] = find_outliers([syracuse()], Config(ny_rules=True), NOW)                        # still flagged (Kalshi)
+        self.assertEqual(([r[0] for r in o.board], o.hedge, o.parlay_books), (["Stale"], [], {"Stale", "Pinnacle"}))
+        nyb = syracuse()
+        next(bm for bm in nyb["bookmakers"] if bm["title"] == "Stale")["key"] = "fanduel"
+        self.assertEqual(len(find_outliers([nyb], Config(), NOW)), 1)
+        self.assertEqual(find_outliers([nyb], Config(ny_rules=True), NOW), [])               # a NY book: not flagged
+
+
+class ArbLogColumns(MixFiles):
+    """arbs.csv: which price would move and by how much, every leg's edge and age (Pinnacle's too),
+    how many checks it lasted, and the arbs the caps and live rules held back, with the reason."""
+
+    def rows(self):
+        return _read(self.files["log_file"])
+
+    def test_alerted_arb_row(self):
+        cfg = self.cfg(MIX)
+        a = Alerter(cfg, dry_run=True)
+        first = age_book(age_book(age_book(mix_event(2.25, 1.98), "A", 10), "B", 30), "Pinnacle", 45)
+        first["bookmakers"][0]["markets"].insert(0, {"key": "spreads", "last_update": "2026-10-03T11:55:00Z",
+                                                     "outcomes": [{"name": "Home", "price": 1.91, "point": -3.5},
+                                                                  {"name": "Away", "price": 1.91, "point": 3.5}]})
+        a.handle(find_arbs([first], MIX, NOW), ["basketball_nba"], now=1000)
+        later = age_book(mix_event(2.30, 1.98), "A", 2)                          # a check later: new price and ages
+        a.handle(find_arbs([later], MIX, NOW), ["basketball_nba"], now=1060)
+        a.handle([], ["basketball_nba"], now=1120)
+        [row] = self.rows()
+        self.assertEqual((row["stale_book"], row["stale_edge_pct"], row["fair_from"]), ("A", "12.5", "Pinnacle"))
+        self.assertEqual(row["leg_edges"], "A +12.5%; B -1.0%")                  # the other bet's cost vs fair
+        self.assertEqual(row["leg_ages"], "A 10s; B 30s; Pinnacle 45s")          # as first sent, Pinnacle's too
+        self.assertEqual((row["checks"], row["reason"], row["seconds_open"]), ("2", "", "120"))
+        self.assertEqual(row["legs"], "Home @2.3 A; Away @1.98 B")                # (the latest prices, as before)
+        # No Pinnacle price: nothing to measure the legs against.
+        a.handle(find_arbs([mix_event(2.25, 1.98, sharp=None)], MIX, NOW), ["basketball_nba"], now=2000)
+        a.handle([], ["basketball_nba"], now=2060)
+        plain = self.rows()[1]
+        self.assertEqual((plain["stale_book"], plain["stale_edge_pct"], plain["leg_edges"], plain["fair_from"],
+                          plain["leg_ages"], plain["checks"]), ("", "", "", "", "B 0s; A 0s", "1"))
+
+    def test_restart_keeps_the_first_sighting_and_the_count(self):
+        cfg = self.cfg(MIX, webhook_url="https://x")
+
+        def make():
+            a = Alerter(cfg, dry_run=False)
+            a._discord = lambda payload, message_id=None, url="": message_id or "m1"
+            return a
+        first = age_book(mix_event(2.25, 1.98), "A", 10)
+        a = make()
+        a.handle(find_arbs([first], MIX, NOW), ["basketball_nba"], now=time.time())
+        a.handle(find_arbs([mix_event(2.25, 1.98)], MIX, NOW), ["basketball_nba"], now=time.time())
+        b = make()                                                                # restart
+        b.handle(find_arbs([mix_event(2.25, 1.98)], MIX, NOW), ["basketball_nba"], now=time.time())
+        b.handle([], ["basketball_nba"], now=time.time())
+        [row] = self.rows()
+        self.assertEqual((row["leg_ages"], row["checks"]), ("A 10s; B 0s; Pinnacle 0s", "3"))
+
+    def test_held_back_arbs_are_logged_with_the_reason(self):
+        cfg = self.cfg(MIX)
+        a = Alerter(cfg, dry_run=True)
+        a.max_per_hour, a.posted_at = 1, [1000.0]                                 # the hour's one arb went out
+        [arb] = find_arbs([mix_event(2.25, 1.98)], MIX, NOW)
+        for now in (1060, 1120, 1180):
+            self.assertEqual(a.handle([arb], ["basketball_nba"], now=now), 0)
+        [row] = self.rows()                                                       # once per stretch, not each check
+        self.assertEqual((row["reason"], row["stale_book"], row["leg_ages"], row["gone_at"], row["checks"]),
+                         ("capped", "A", "A 0s; B 0s; Pinnacle 0s", "", ""))
+        a.handle([arb], ["basketball_nba"], now=1180 + _arbbot.HELD_LOG_GAP + 1)  # held again much later
+        self.assertEqual([r["reason"] for r in self.rows()], ["capped", "capped"])
+        live = Alerter(cfg, dry_run=True)
+        live.live_cap = _arbbot.HourlyCap(1)
+        live.live_cap.times.append(1000.0)
+        [l_arb] = find_arbs([mix_event(2.25, 1.98, ev_id="live", start=STARTED)], MIX, NOW)
+        live.handle([l_arb], ["basketball_nba"], now=1060)
+        self.assertEqual(self.rows()[-1]["reason"], "live cap")
+        # Held-back rows aren't counted as alerted arbs anywhere.
+        a.handle([arb], ["basketball_nba"], now=1000 + 7200)                     # a new hour: alerted
+        a.handle([], ["basketball_nba"], now=1000 + 7260)
+        self.assertEqual(_arbbot.arbs_on(cfg, _arbbot.local_day(cfg, self.rows()[-1]["first_seen"])).split(" · ")[0],
+                         "💰 **Arbs:** 1 different")
+
+    def test_live_rules_log_what_they_held(self):
+        cfg = self.cfg(MIX, live_confirm_checks=2, live_max_age_alert=60, ev_enabled=False, outliers_enabled=False)
+        t = _arbbot.Trackers(cfg, self.args())
+
+        def check(secs, evs):
+            return _arbbot.scan_main(t, [stamped(e, secs) for e in evs], ["basketball_nba"], at(secs), kalshi=False)
+        check(0, [mix_event(2.25, 1.98, ev_id="blip", start=STARTED)])
+        res = check(60, [])                                                       # gone before its 2nd check
+        self.assertEqual(res.held, {"unconfirmed": 1})
+        self.assertIn("1 live, gone before it was confirmed", _arbbot.held_text(res.held))
+        [row] = self.rows()
+        self.assertEqual((row["reason"], row["seconds_open"], row["checks"], row["live"]), ("unconfirmed", "60", "1", "True"))
+        self.assertTrue(row["gone_at"])
+        old = stamped(mix_event(2.25, 1.98, ev_id="old", start=STARTED), 120)
+        age_book(age_book(old, "A", 70, at(120)), "B", 80, at(120))             # both bet prices over a minute old
+        res = _arbbot.scan_main(t, [old], ["basketball_nba"], at(120), kalshi=False)
+        self.assertEqual(res.held, {"old price": 1})
+        self.assertEqual((self.rows()[-1]["reason"], self.rows()[-1]["leg_ages"]), ("old price", "A 70s; B 80s; Pinnacle 0s"))
+        self.assertEqual(len(self.rows()), 2)                                     # (waiting isn't logged)
+
+    def test_prop_check_counts_against_the_arb_cap(self):
+        t = _arbbot.Trackers(self.cfg(MIX, max_arb_per_hour=1, ev_enabled=False, outliers_enabled=False), self.args())
+        main = _arbbot.scan_main(t, [mix_event(2.25, 1.98, ev_id="g1")], ["basketball_nba"], NOW, kalshi=False)
+        self.assertEqual(main.sent, 1)
+        prop = priced_prop({"Pinnacle": (2.0, 2.0), "DK": (2.20, 1.80), "FD": (1.80, 2.05)})
+        res = _arbbot.scan_props(t, [prop], {"p1"}, at(60))
+        self.assertEqual((res.n_arb, res.held), (0, {"capped": 1}))
+        self.assertEqual(_arbbot.held_text(res.held), " | held back: 1 over the hourly cap")
+        self.assertEqual([r["reason"] for r in _read(self.files["log_file"])], ["capped"])   # same arbs.csv
+
+    def test_only_arbs_log_held_alerts(self):
+        cfg = self.cfg(Config())
+        o = OutlierAlerter(cfg, dry_run=True)
+        o.max_per_hour, o.posted_at = 1, [1000.0]
+        o.handle(find_outliers([outlier_event(1.85, 1.95)], cfg, NOW), now=1060)
+        self.assertEqual(o.held_counts, {"capped": 1})
+        p = ParlayAlerter(cfg, dry_run=True)
+        p.max_per_hour, p.posted_at = 1, [1000.0]
+        legs = [ev_leg(f"g{i}", {"DK": 2.30}) for i in range(2)]
+        p.handle(find_parlays([replace(b, event_id=b.event_id) for b in legs], replace(cfg, parlay_min_ev_pct=1)),
+                 now=1060)
+        self.assertEqual(p.held_counts, {"capped": 1})
+        self.assertFalse(any(Path(self.files[k]).exists() for k in ("outlier_log_file", "parlay_log_file", "log_file")))
+
+
+class AccountSafeArbs(MixFiles):
+    def test_kalshi_off_price_against_a_normal_sportsbook_bet_ranks_higher(self):
+        def arb(books, home=2.25, ev_id="g"):
+            [a] = find_arbs([mix_event(home, 1.98, books=books, ev_id=ev_id)], MIX, NOW)
+            return a
+        safe, book = arb(("Kalshi", "FanDuel"), ev_id="safe"), arb(("DraftKings", "FanDuel"), ev_id="book")
+        self.assertEqual((safe.account_safe, book.account_safe), (True, False))
+        self.assertFalse(arb(("FanDuel", "Kalshi")).account_safe)                     # the off price at a sportsbook
+        self.assertFalse(replace(safe, legs=[replace(l, edge=None) for l in safe.legs]).account_safe)   # no fair
+        both_good = find_arbs([mix_event(2.25, 2.10, books=("Kalshi", "FanDuel"))], MIX, NOW)[0]
+        self.assertFalse(both_good.account_safe)                                    # FanDuel's bet beats fair too
+        a = Alerter(self.cfg(MIX), dry_run=True)
+        a.max_per_hour = 1
+        a.handle([book, safe], now=1000)
+        self.assertEqual(list(a.open), [safe.key])                                  # same %: the safe one
+        a = Alerter(self.cfg(MIX), dry_run=True)
+        a.max_per_hour = 1
+        slightly_smaller = arb(("Kalshi", "FanDuel"), home=2.23, ev_id="safe")
+        self.assertLess(book.profit_pct - slightly_smaller.profit_pct, _arbbot.ACCOUNT_SAFE_BONUS)
+        a.handle([book, slightly_smaller], now=1000)
+        self.assertEqual(list(a.open), [slightly_smaller.key])
+        a = Alerter(self.cfg(MIX), dry_run=True)
+        a.max_per_hour = 1
+        much_smaller = arb(("Kalshi", "FanDuel"), home=2.15, ev_id="safe")
+        a.handle([book, much_smaller], now=1000)
+        self.assertEqual(list(a.open), [book.key])                                  # a bonus, not a trump card
+        d = discord_payload(safe)["embeds"][0]["description"]
+        self.assertEqual(d.replace("Kalshi", "DraftKings"), discord_payload(book)["embeds"][0]["description"])   # rank only
+
+
+class ScanWiring(MixFiles):
+    """What run() does on each check, through scan_main / scan_props (the loop's own steps)."""
+
+    PRE = "2026-10-03T18:00:00Z"
+
+    def trackers(self, **kw):
+        return _arbbot.Trackers(self.cfg(Config(min_ev_pct=3, max_ev_pct=100, ev_max_odds=10, round_stakes=0),
+                                         **kw), self.args())
+
+    def main(self, t, evs, secs, **kw):
+        return _arbbot.scan_main(t, [stamped(e, secs) for e in evs], ["basketball_nba"], at(secs), **kw)
+
+    def game(self, stale_home, ev_id="e1"):
+        ev = outlier_event(stale_home, 3.3, start=self.PRE)
+        ev.update(id=ev_id, sport_key="basketball_nba")
+        return ev
+
+    def test_a_bet_that_grows_into_an_outlier_is_handed_over(self):
+        t = self.trackers(kalshi_check=False)
+        first = self.main(t, [self.game(1.36)], 0)                                 # +6.7%: a +EV bet
+        self.assertEqual((first.ev_sent, first.out_sent), (1, 0))
+        [key] = t.evs.open
+        second = self.main(t, [self.game(1.85)], 60)                               # +44%: an outlier now
+        self.assertEqual(second.evs, [])                                          # one card per bet
+        self.assertEqual((list(t.evs.open), list(t.outs.open)), ([], [key]))
+        self.assertEqual(t.outs.open[key].first_seen, at(0).timestamp())          # the same bet, handed over
+
+    def test_prop_bet_that_grows_into_an_outlier_is_handed_over(self):
+        t = self.trackers(kalshi_check=False)
+
+        def prop(over):
+            return priced_prop({"Pinnacle": (1.91, 1.91), "DK": (1.90, 1.92), "FD": (1.91, 1.91),
+                                "MGM": (1.92, 1.90), "Stale": (over, 1.70)})
+        self.assertEqual(_arbbot.scan_props(t, [prop(2.15)], {"p1"}, at(0)).n_ev, 1)
+        [key] = t.prop_evs.open
+        _arbbot.scan_props(t, [prop(2.60)], {"p1"}, at(60))
+        self.assertEqual((list(t.prop_evs.open), list(t.prop_outs.open)), ([], [key]))
+        self.assertEqual(t.prop_outs.open[key].first_seen, at(0).timestamp())
+
+    def test_a_book_that_moves_away_from_the_market_isnt_an_outlier(self):
+        t = self.trackers(kalshi_check=False, ev_enabled=False)
+        self.main(t, [self.game(1.25)], 0)                                         # in line with the others
+        self.assertEqual(self.main(t, [self.game(1.85)], 60).outs, [])            # jumped away: it's fast, not stale
+
+    def test_sharp_line_movement_reaches_the_confidence(self):
+        t = self.trackers(kalshi_check=False, outliers_enabled=False)
+
+        def pre(home, away):
+            ev = ev_event([("Home", home, None), ("Away", away, None)], {"B": [("Home", 2.20, None)]})
+            ev["sport_key"] = "basketball_nba"
+            return ev
+        self.main(t, [pre(2.02, 1.82)], 0)
+        self.main(t, [pre(1.91, 1.91)], 600)                                      # Pinnacle moved toward Home
+        [op] = t.evs.open.values()
+        self.assertTrue(any("moving this way" in n for n in op.arb.confidence_notes))
+
+    def test_kalshi_is_asked_and_used(self):
+        from unittest import mock
+        t = self.trackers(outliers_enabled=False)
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        ev["sport_key"] = "basketball_nba"
+        disagrees = {"e1": {"Home": (0.40, 0.39, 0.41), "Away": (0.60, 0.59, 0.61)}}
+        with mock.patch("arbbot.kalshi_fair", return_value=disagrees) as asked:
+            self.assertEqual(self.main(t, [ev], 0).evs, [])                         # Kalshi says 40%: skipped
+        self.assertEqual(asked.call_count, 1)
+        with mock.patch("arbbot.kalshi_fair", side_effect=AssertionError("network")):
+            self.assertEqual(len(self.main(t, [ev], 60, kalshi=False).evs), 1)
+
+    def test_closing_lines_follow_every_logged_bet(self):
+        t = self.trackers(kalshi_check=False, outliers_enabled=False)
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
+        ev["sport_key"] = "basketball_nba"
+        self.main(t, [ev], 0)
+        self.main(t, [ev], 60)
+        self.assertEqual(list(t.closing.tracked), ["e1|h2h|Home|"])                # logged -> followed to kickoff
+        self.assertEqual(t.closing.latest["e1|h2h|Home|"][0], 0.5)                 # and read on each check
+        p = priced_prop({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.80)})
+        _arbbot.scan_props(t, [p], {"p1"}, at(0))
+        _arbbot.scan_props(t, [p], {"p1"}, at(60))
+        prop_id = next(k for k in t.closing.tracked if k.startswith("p1"))
+        self.assertIn(prop_id, t.closing.latest)
+
+    def test_prop_check_uses_prop_settings_and_only_closes_its_own_games(self):
+        t = self.trackers(kalshi_check=False)
+
+        def prop(over, gid):
+            ev = priced_prop({"Pinnacle": (1.91, 1.91), "DK": (over, 1.80)})
+            ev["id"] = gid
+            return ev
+        self.assertEqual(_arbbot.scan_props(t, [prop(2.10, "p1")], {"p1"}, at(0)).n_ev, 0)   # 5%: props need 7%
+        self.assertEqual(_arbbot.scan_props(t, [prop(2.15, "p1"), prop(2.15, "p2")], {"p1", "p2"}, at(60)).n_ev, 2)
+        _arbbot.scan_props(t, [prop(2.15, "p1")], {"p1"}, at(120))                # only p1 was checked
+        self.assertEqual(sorted(op.arb.event_id for op in t.prop_evs.open.values()), ["p1", "p2"])
+
+    def test_every_cap_comes_from_the_settings(self):
+        t = _arbbot.Trackers(self.cfg(max_ev_per_hour=5, max_prop_per_hour=4, max_parlay_per_hour=3), self.args())
+        self.assertEqual((t.evs.max_per_hour, t.prop_evs.max_per_hour, t.parlays.max_per_hour), (5, 4, 3))
 
 
 if __name__ == "__main__":

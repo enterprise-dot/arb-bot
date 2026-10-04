@@ -9,8 +9,8 @@ Watches odds from many sportsbooks and pings Discord about two kinds of bets:
 ```
 💰 3.50% ARB | NBA | New York Knicks @ Boston Celtics (🔴 LIVE)
   Moneyline
+  • New York Knicks +145 on DraftKings  → stake $42.50  (bet first: +4.6% vs Pinnacle)
   • Boston Celtics -125 on FanDuel  → stake $57.50
-  • New York Knicks +145 on DraftKings  → stake $42.50
   Total $100 → returns ≥ $103.50 (+$3.50)
 ```
 
@@ -26,13 +26,23 @@ python arbbot.py --post-guide
 - **Pings you** the moment a gap appears. Each bet has a **tap-to-bet link** when the book provides one.
 - **Updates itself** if the prices shift while the gap is still open.
 - **Turns grey with "❌ GONE after 45s"** when the gap closes, so you know not to chase it.
+- **Lists the price that will move first.** When Pinnacle prices the line, 1️⃣ is the bet that beats
+  Pinnacle's fair odds ("Bet this one first: it's the price that will move"). If the other price is
+  gone by the time you get there and 1️⃣ is a good bet on its own, the card says "keep this one" and
+  what you'd stake on it alone. Without a Pinnacle price the card says to place them back to back.
+- **Shows how old the price was** when the alert went out ("⏱ price was 35s old when sent").
 - **Uses round stakes** ($57.50 / $42.50 instead of $57.65 / $42.35), which look like normal bets to the books.
   The headline edge is always for the stakes printed, after rounding.
-- **Live arbs are marked 🔴 LIVE** and need a bigger edge (1%). They can go to their own channel
-  (`DISCORD_LIVE_WEBHOOK_URL`) or be turned off (`ARB_LIVE=false`).
+- **Live arbs are marked 🔴 LIVE** and need a bigger edge (1%; 5% in locks mode). They can go to
+  their own channel (`DISCORD_LIVE_WEBHOOK_URL`) or be turned off (`ARB_LIVE=false`).
 
 **What else you get:**
-- **`arbs.csv`:** every gap and how long it stayed open. After a week, this tells you whether you can realistically catch them.
+- **`arbs.csv`:** every gap, how long it stayed open and for how many checks (`checks`), which bet
+  was the price that would move and by how much (`stale_book`, `stale_edge_pct`), every bet's edge
+  against Pinnacle (`leg_edges`) and how old each price was, Pinnacle's too (`leg_ages`). Arbs the
+  hourly caps or the live rules held back are logged too, with a `reason` (`capped`, `live cap`,
+  `old price`, `unconfirmed` = gone before a 2nd check found it); they're never counted as alerts. After a
+  week, this tells you whether you can realistically catch them.
 - **Bot health in Discord:** 🟢 online, 🔴 crashed, ⚠️ credits running low, and a 📊 daily summary.
 
 ## Your books
@@ -43,7 +53,17 @@ Arbs, +EV, outliers, parlays and lock-in hedges only ever point to those books, 
 odds and the others confirm the market price for outlier alerts, at no extra cost.
 
 Kalshi (an exchange) charges a fee per trade, so its prices are lowered by that fee before any
-comparison (`KALSHI_FEE_RATE`). Change settings without editing files:
+comparison (`KALSHI_FEE_RATE`).
+
+**New York:** New York's sportsbooks can't take bets on a game with a New York college team in it
+(Syracuse, Army, Buffalo, St. John's, Cornell, Columbia, Fordham, Stony Brook, ...). Set
+`US_STATE=ny` (or `NY_RULES=true`) and those games are never alerted at FanDuel, DraftKings, BetMGM,
+Caesars, BetRivers, Fanatics or Bally Bet: not as arbs, +EV, outliers, hedges, parlays or rows on a
+card's book list. Kalshi still counts. "Buffalo State" or "Albany State" aren't New York schools, so
+they aren't caught. College games played *in* New York between two out-of-state teams (the Pinstripe
+Bowl, a Madison Square Garden tournament) aren't caught yet: skip those yourself.
+
+Change settings without editing files:
 
 ```bash
 python arbbot.py --set MY_BOOKS=draftkings,fanduel --set EV_BOOKS=
@@ -89,20 +109,53 @@ the more likely that is. Bet fast, and expect the occasional void.
 
 ## Locks mode (default)
 
-The bot only sends alerts worth acting on: arbs that lock in **2%+** ($2 per $100, 3%+ when
-live), +EV bets of **5%+ at high confidence**, props at **8%+**, outliers at **15%+**, and 2-leg
-parlays at **15%+**, with at most 6 +EV, 6 prop and 2 parlay alerts an hour (the best ones go
-first). Set `ALERT_MODE=balanced` to use your own thresholds instead.
+The bot only sends alerts worth acting on: arbs that lock in **2%+** ($2 per $100, **5%+ when
+live**), +EV bets of **5%+ at high confidence**, props at **8%+**, outliers at **15%+** (**20%+
+when live**), and 2-leg parlays at **15%+**. At most 4 arb, 6 +EV, 6 prop, 6 outlier and 2 parlay
+alerts go out an hour, and **3 live alerts an hour in all**. Your own stricter settings in `.env`
+still win. Set `ALERT_MODE=balanced` to use your own thresholds instead (that's also the way to
+loosen any of these).
+
+## Alert mix: fewer live alerts, more for later today and tomorrow
+
+Live prices move in seconds, so live alerts are the ones most likely to be gone when you tap them.
+In locks mode:
+
+- **Live alerts are rationed.** Live arbs need 5%+, live outliers 20%+, and every live alert (arbs,
+  outliers, live +EV) shares one cap of 3 an hour (`LIVE_PER_HOUR`). Games that haven't started
+  never count toward it.
+- **Games that haven't started go first.** In each check, alerts for games that haven't started go
+  ahead of live ones, then the biggest edge, so a nearly full cap keeps the best. Across the hour
+  it's first come, first served: once the slots are used, new alerts wait for the next hour (if
+  they're still there). Arbs and prop arbs share the arb cap
+  (`MAX_ARB_PER_HOUR=4`), outliers and prop outliers the outlier cap (`MAX_OUTLIER_PER_HOUR=6`). An
+  arb whose price that will move is on Kalshi, with your sportsbook bets at normal prices, ranks
+  slightly higher: it's easier on your sportsbook accounts.
+- **Tonight's and tomorrow's games can be high confidence.** A +EV bet gets its "close to kickoff"
+  point for games within 24 hours (`CONFIDENT_HOURS`, was 12), so more +EV alerts for later today
+  and tomorrow pass the locks-mode "high confidence" bar. Props still need to be within 12 hours.
+- **A live alert has to still be there.** A new live alert only pings when two checks in a row (about
+  a minute apart) find it (`LIVE_CONFIRM_CHECKS=2`), and only when the price you're told to bet was
+  updated by its book in the last 60 seconds (`LIVE_MAX_AGE_ALERT=60`; Pinnacle's price can be
+  older). Ones that vanish within seconds never ping. Alerts already up, and games that haven't
+  started, aren't delayed. After a restart a live alert waits one more check, and `--once` (a single
+  look) never sends one.
+- **Each card shows how old the price was** when the alert went out (⏱).
+
+The console line after each check says what was held back and why, e.g.
+`held back: 2 live, waiting for another check, 1 over the live-alert cap`.
 
 ## How it keeps bets good
 
 - **Confidence on every +EV bet** (🟢 High / 🟡 Medium / 🟠 Low), from how tight Pinnacle's own
-  market is, whether the other books agree with Pinnacle, how close kickoff is, and whether the
-  edge is believable. Stakes scale 100% / 75% / 50%. `MIN_CONFIDENCE=medium` drops the low ones.
+  market is, whether the other books agree with Pinnacle, whether the game starts within 24 hours
+  (`CONFIDENT_HOURS`; props 12), and whether the edge is believable. Stakes scale 100% / 75% / 50%.
+  `MIN_CONFIDENCE=medium` drops the low ones.
 - **Shaky prices are skipped**: a wide Pinnacle market (over 8% margin, 12% for props), or Pinnacle
   and the rest of the market 10+ points apart (one of them is stale).
 - **Live arbs need both prices fresh**: priced within 60 seconds of each other, or it's usually
-  just one book lagging.
+  just one book lagging. In locks mode every live alert also needs two checks in a row and a price
+  under 60 seconds old (see "Alert mix" above).
 - **CLV tracking** shows whether the bets beat the closing line, broken down by bet type, market,
   book, sport and confidence (`--results`, and the daily summary card).
 - **Restarts don't repeat alerts**: open alerts are remembered, so an update edits the existing
@@ -301,7 +354,8 @@ A wrong API key stops it instead of restart-looping, and you'll get a 🔴 messa
 
 ## Before betting real money
 
-- **Check both prices yourself before you bet.** Live odds move in seconds. Place the
+- **Check both prices yourself before you bet.** Live odds move in seconds. Place 1️⃣ first
+  when the card says "Bet this one first": it's the price that will move. Otherwise place the
   harder leg first (the bigger price, or the book likelier to limit you).
 - **Books limit or close accounts** that look like they're betting arbs. Round your stakes,
   and don't only bet arbs.
