@@ -172,8 +172,9 @@ These are the SUPERSEDED rows, with what you said.
 - **Edge bars** (EV-01, EV-02, SC-15): "We just want like locks": locks mode, the default, asks for 5% on
   main lines and 8% on props. Then on Sunday: "It's barely sending any today for the whole NFL we want
   a lot of picks today can we get some sent" and "Literally no picks are coming in can u flood it like
-  yesterday", so today's remote.env uses balanced mode at 3% and 6%. The blueprint's 4% and 7% are still
-  the `MIN_EV_PCT` and `PROP_MIN_EV_PCT` defaults in balanced mode.
+  yesterday", so remote.env switched to balanced mode at 3% and 6%. On Monday: "I would do 7% for props /
+  I would also go 4% for normal / Instead of 3 / 3% is so common", so remote.env now uses the blueprint's
+  own 4% and 7% (EV-01, EV-02 and SC-15 are DONE).
 - **Cleaner cards and setup help** (OOS-1): "can you make the uh, notification on Discord like look a little
   cleaner, more spaced out?", "make it clear exactly what needs to be done right away?" and "can you give me
   like detailed instructions?"
@@ -251,8 +252,8 @@ York college rule.
 | FAIRRESULT-02 | GREEN | DONE | Give the final fair probability and fair odds. | The card's "Fair value +100 · 50.0% to win"; ev_bets.csv `fair_odds`. |
 | FAIRRESULT-01 | YELLOW | DONE | The fair-value result's form is up to the AI. | `SharpFair` per line (fair price, the sources in it, each source's own no-margin chances, the one left out) and `EVBet` (see "Data model"). |
 | FAIR-16 | GREEN | DONE | Fewer sources lower confidence or stake, never the EV. | Only stake multipliers (`ONE_SOURCE_STAKE`, `KALSHI_ONLY_STAKE`, `SINGLE_SOURCE_STAKE`, `CONSENSUS_STAKE`, `CONFIDENCE_STAKES`); the edge is never changed. |
-| EV-01 | GREEN | SUPERSEDED | At least 4.0% on moneylines, spreads and totals. | `MIN_EV_PCT=4` in balanced mode; locks mode (the default, as you asked) raises it to 5%; today's flood settings use 3%. |
-| EV-02 | GREEN | SUPERSEDED | At least 7.0% on player props. | `PROP_MIN_EV_PCT=7` in balanced mode; locks 8%; today's flood settings 6%. |
+| EV-01 | GREEN | DONE | At least 4.0% on moneylines, spreads and totals. | `MIN_EV_PCT=4` (remote.env, balanced mode, since Oct 5); locks mode raises it to 5%. |
+| EV-02 | GREEN | DONE | At least 7.0% on player props. | `PROP_MIN_EV_PCT=7` (remote.env, balanced mode, since Oct 5); locks 8%. |
 | EV-05 | GREEN | DONE | The EV bars are easy to change. | `MIN_EV_PCT`, `PROP_MIN_EV_PCT`, `SPORT_MIN_EV`, `PREGAME_CONFIRMED_EV_PCT` and `ALERT_MODE`, through `.env`, `--set` or remote.env. |
 | FRESH-01 | GREEN | DEVIATION | No hard expiry on DraftKings and FanDuel prices: show the price, you check it. | Cards show the price, its age and the price to skip at, but a book's price still has to be recent (`MAX_AGE_SECONDS`, `PREGAME_MAX_AGE_SECONDS`, `FAR_MAX_AGE_SECONDS`): an old stamp means the book took the market down. See "Deviations". |
 | FRESH-02 | YELLOW | NOT_FEASIBLE | Candidate: sharp prices at most 10 seconds old. | 10 seconds isn't possible on this feed. Pinnacle has its own limits (`SHARP_MAX_AGE_SECONDS`, `SHARP_PREGAME_MAX_AGE_SECONDS`, `SHARP_FAR_MAX_AGE_SECONDS`); empty means the same as every book (2 minutes live, 15 near kickoff, 3 hours further out). Open decision. |
@@ -318,7 +319,7 @@ York college rule.
 | SC-12 | GREEN | DONE | Work out defensible fair probabilities. | Power method, weighted blend, prop consensus of 4+ books with the book being judged left out. |
 | SC-13 | GREEN | DONE | Leave out unusable, stale or outlying references by the approved rules. | Old prices (`is_fresh`), wide margins (`MAX_SHARP_HOLD_PCT`), market gaps, Kalshi's liquidity rules, the odd source left out (`OUTLIER_SOURCE_PTS`). The numbers are open decisions. |
 | SC-14 | GREEN | DONE | Work out EV correctly. | `EVBet.ev_pct`; tests check exact values. |
-| SC-15 | GREEN | SUPERSEDED | Hold the 4% main-line and 7% prop bars. | As EV-01 and EV-02: locks 5% and 8%, today's flood settings 3% and 6%. |
+| SC-15 | GREEN | DONE | Hold the 4% main-line and 7% prop bars. | As EV-01 and EV-02: 4% and 7% now (remote.env); locks 5% and 8%. |
 | SC-16 | GREEN | DONE | Quarter Kelly, turned into units. | As ALERT-11. |
 | SC-17 | GREEN | DONE | Check prices again before alerting and drop what no longer qualifies. | As FRESH-06 to FRESH-08. |
 | SC-18 | GREEN | DONE | No duplicate spam; the +2.5 rule. | As ALERT-07. |
