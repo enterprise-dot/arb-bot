@@ -51,9 +51,28 @@ python arbbot.py --post-guide
   each price was, Pinnacle's too (`leg_ages`; `?` = not known, e.g. a player prop). Arbs the hourly
   caps or the live rules held back are logged too, with a `reason` (`capped`, `live cap`, `old
   price`, `unconfirmed` = gone before a 2nd check found it; `first_seen` is then when it was held
-  back, or for `unconfirmed` first found); they're never counted as alerts. After a week, this tells
-  you whether you can realistically catch them.
+  back, or for `unconfirmed` first found), and so are arbs whose alert never went out (`old data` =
+  its odds were too old by the time it was ready, `not sent` = Discord never took it; see "How it
+  keeps bets good"); they're never counted as alerts. After a week, this tells you whether you can
+  realistically catch them. It keeps the last 60 days (`LOG_KEEP_DAYS`).
 - **Bot health in Discord:** 🟢 online, 🔴 crashed, ⚠️ credits running low, and a 📊 daily summary.
+  Outages get one message when they start mattering and one when they're over (`HEALTH_ALERTS=true`):
+  - The Odds API not answering for a sport for 10 minutes (`ODDS_DOWN_MINUTES`): "Odds API not
+    answering for NFL since 3:05 PM (timeouts): no NFL alerts until it's back. Open alerts stay up."
+    Then "Odds API back for NFL after 12 min."
+  - Pinnacle missing from every game of a sport that other books are pricing, for 15 minutes
+    (`SHARP_DOWN_MINUTES`). Missing from the answers, not just an old price (an old price is normal).
+    Meanwhile that sport's main-line +EV is paused (there are no fair odds, so its open +EV cards
+    close, and post again once Pinnacle is back), Kalshi-only bets wait, props without a Pinnacle price
+    are at most 🟡 medium (so none in locks mode), and arbs and outliers carry on. Then a message when
+    Pinnacle is back.
+  - Kalshi unreachable for 30 minutes while there are games before kickoff (`KALSHI_DOWN_MINUTES`):
+    moneyline +EV goes out on Pinnacle alone. Then a message when it's back.
+  - After a pause for credits: "Credits available again: scanning resumed."
+  0 turns one of them off; `HEALTH_ALERTS=false` turns the messages off (the Pinnacle rules above
+  still apply while it's missing). A failure long after the last one, with nothing asked in between
+  (one at night, one in the morning), starts the clock again, and a prop request for a game that no
+  longer exists (404) counts as the Odds API answering.
 
 ## Your books
 
@@ -64,6 +83,18 @@ odds and the others confirm the market price for outlier alerts, at no extra cos
 
 Kalshi (an exchange) charges a fee per trade, so its prices are lowered by that fee before any
 comparison (`KALSHI_FEE_RATE`).
+
+**Tap-to-bet links.** Each book name on a card opens that book. When the feed has a link for the bet
+itself, it opens the bet in the book's bet slip (DraftKings and FanDuel send these for most bets);
+otherwise the market's link, then the game's page. BetMGM's links are per state, filled in from
+`US_STATE`. The feed also sends each book's own ids (`INCLUDE_SIDS=true`, no extra credits), so when
+DraftKings or FanDuel only sent the game's page (or nothing), the bot builds the bet-slip link
+itself: DraftKings `sportsbook.draftkings.com/event/<game id>?outcomes=<bet id>`, FanDuel
+`sportsbook.fanduel.com/addToBetslip?marketId=<market id>&selectionId=<bet id>`, and only when both
+ids are there. Each book's link logic is its own small function (`LINK_ADAPTERS` in arbbot.py), so
+one can change without touching the others; BetMGM and Caesars use the feed's links as they are.
+`python arbbot.py --once` ends with how each book's links came out, e.g. "Bet links per price:
+DraftKings 210 bet slip, 6 built from ids; FanDuel 220 bet slip".
 
 **New York:** New York's sportsbooks can't take bets on a game with a New York college team in it
 (Syracuse, Army, Buffalo, St. John's, Cornell, Columbia, Fordham, Stony Brook, ...). Set
@@ -88,12 +119,53 @@ outliers and parlays) to another channel; `DISCORD_OUTLIER_WEBHOOK_URL`,
 ## 🎯 Player props
 
 Passing/rushing/receiving yards and receptions (NFL), points/rebounds/assists/threes (NBA), and
-points/shots/assists (NHL). Props are priced per game, so they're checked every 30 minutes in the
-3 hours before kickoff, and the budget autopilot counts them. Fair odds come from Pinnacle when it
-prices the prop, otherwise from the median of at least 4 other books (the book being judged doesn't
-count, and BetOnline.ag and LowVig.ag count as one, since they share an owner), and the minimum
+points/shots/assists (NHL), plus, in the last 3 hours before kickoff, NHL goals and goalie saves and
+NFL alternate lines (`PROP_NEAR_MARKETS`, see below). Props are priced per game, so they're checked
+every 30 minutes in the 3 hours before kickoff, and the budget autopilot counts them. If The Odds API
+ever rejects an extra prop type, the bot asks again without it, says so once in the health channel,
+and keeps checking that sport's other props (if it rejects the usual ones too, the health channel says
+to check `PROP_MARKETS`, and that sport's props stop until a restart). Fair odds come from Pinnacle
+when it prices the prop, otherwise from the median of at least 4 other books (the book being judged
+doesn't count, and BetOnline.ag and LowVig.ag count as one, since they share an owner), and the
+minimum
 edge is 7%. Props appear as +EV, arb and outlier alerts. They're tracked for CLV and graded from box
 scores (see "Is it working?" below).
+
+**Alternate lines, exact line only.** US books often hang a different main line than Pinnacle (Allen
+249.5 passing yards at DraftKings, 245.5 at Pinnacle), but their alternate ladder ("250+", "245+"...)
+often has Pinnacle's exact number. Near kickoff the bot also asks for the NFL alternate passing,
+rushing and receiving yards and receptions, and when a book's alternate line sits at exactly the point
+Pinnacle prices (or the other books' main lines do), that price is judged against that fair price like
+any other (a Pinnacle-priced prop can be high confidence at the full stake, instead of a consensus
+price or nothing). It's the same bet as the main line at that point (one card, the better of the two
+prices, the main line's on a tie), the card says *(alternate line)* so you look for it in the book's
+alternate lines (so do a parlay's legs and an outlier's lock-in legs priced that way), and ev_bets.csv
+marks it in the `alt` column. Alternate lines never set the fair odds themselves (they're priced off
+each book's own main line, with more margin), and the bot never guesses a price between two points.
+The "book moved first" hold (outliers, and props judged against the other books) reads the book's main
+line at that point: an alternate price that pays more the first time it's seen isn't the book moving,
+but its main line moving away from the others still is. The props console line counts them: `alternate
+lines: 12 matched, 1 alerted` (matched = an alternate price with a fair price at exactly its line).
+
+**Credits:** NHL goals and saves add 2 credits per NHL game per near-kickoff check (about 7 checks:
+every 30 minutes in the last 3 hours, plus the closing check), the NFL alternates 4 per NFL game.
+They're paid for only with credits the day has to spare: the bot asks for them only when the next 24
+hours fit at full speed with them added, after the near-kickoff speed-up of main-line checks, so they
+never slow a live or main-line check. On a short day they wait (`--plan` and the "Budget:" line say
+so) and the usual props carry on. In the simulated October below, where the plan's credits are all
+used, that left them on about 1 near-kickoff check in 20 (about 200 credits; NHL ~80, NFL ~120), and
+live and main-line checks kept their pace (within 1%, the month's spare spending).
+`PROP_NEAR_SPARE_ONLY=false` asks for them on every near-kickoff check instead, paid for like the rest
+of the prop check: about 3,570 credits that month (NHL ~1,810, NFL ~1,760), so main-line checks came
+about 4-5% less often (3-6% by sport) and live checks 2-5 seconds further apart on average. To turn
+them off for good, put `PROP_NEAR_MARKETS=icehockey_nhl=;americanfootball_nfl=` in `.env` (or one
+sport only; with `--set`, quote it:
+`python3 arbbot.py --set "PROP_NEAR_MARKETS=icehockey_nhl=;americanfootball_nfl="`).
+
+**Overs or both sides** (`PROP_SIDES`): in locks mode only prop Overs are alerted, as the blueprint
+asks; in balanced and all mode both Overs and Unders are (as before). `PROP_SIDES=over` or
+`PROP_SIDES=both` picks for yourself whatever the mode. The Under's price is still used to work out the
+Over's fair odds, prop arbs still need both sides, and main-line Unders (totals) aren't affected.
 
 ## 📦 Parlays
 
@@ -122,10 +194,11 @@ the more likely that is. Bet fast, and expect the occasional void.
 
 The bot only sends alerts worth acting on: arbs that lock in **2%+** ($2 per $100, **5%+ when
 live**), +EV bets of **5%+ at high confidence** (before the game **3.5%+** when two sharp sources
-agree, see below), props at **8%+**, outliers at **15%+** (**20%+ when live**), and 2-leg parlays at
-**15%+**. At most 4 arb, 6 +EV, 6 prop, 6 outlier and 2 parlay alerts go out an hour, and **3 live
-alerts an hour in all**. Your own stricter settings in `.env` still win. Set `ALERT_MODE=balanced`
-to use your own thresholds instead (that's also the way to loosen any of these).
+agree, see below), props at **8%+** (Overs only, see "Player props"), outliers at **15%+** (**20%+
+when live**), and 2-leg parlays at **15%+**. At most 4 arb, 6 +EV, 6 prop, 6 outlier and 2 parlay
+alerts go out an hour, and **3 live alerts an hour in all**. Your own stricter settings in `.env`
+still win. Set `ALERT_MODE=balanced` to use your own thresholds instead (that's also the way to
+loosen any of these).
 
 **Pre-game bets from 3.5% when two sharp books agree.** Lines before the game are efficient, so few
 bets get to 5% against Pinnacle. A moneyline, spread or total for a game that starts within 24 hours
@@ -148,7 +221,9 @@ something to compare with), and every other check stays: Kalshi's usual check, y
 bets go first). Props, outliers and parlays don't get the lower edge (and these bets are never a
 parlay leg). The card says **✅✅ Two sharp books agree: Pinnacle and Kalshi** (or "Pinnacle and the
 other books") with a line on why the smaller edge is fine. The stake is the usual Kelly stake, so
-the smaller edge already makes it smaller. A bet that clears 5% anyway is a normal bet. Once a card
+the smaller edge already makes it smaller. A bet that clears 5% anyway is a normal bet, but it has to
+clear 5% by Pinnacle's own price too: one only Kalshi's blended-in price (below) lifts over 5% is still a
+confirmed bet, with every check above. Once a card
 is up, Kalshi or one of the books having no price for a check (or a restart) doesn't close it: it
 stays up quietly, with no new ping. If they disagree with Pinnacle instead, it closes as usual.
 
@@ -229,6 +304,27 @@ The console line after each check says what was held back and why, e.g.
   checks become how closely the other books agree and whether 6+ sportsbooks price it.
 - **Shaky prices are skipped**: a wide Pinnacle market (over 8% margin, 12% for props), or Pinnacle
   and the rest of the market 10+ points apart (one of them is stale).
+- **Old prices are ignored.** A price counts only if its book updated it in the last 2 minutes
+  (live, `MAX_AGE_SECONDS`), 15 minutes (within 2 hours of kickoff, `PREGAME_MAX_AGE_SECONDS`) or
+  3 hours (further out, `FAR_MAX_AGE_SECONDS`). The Odds API stamps a market each time it sees it,
+  so an old stamp usually means the book took the market down. Pinnacle's prices, which set the
+  fair odds, can have their own limits: `SHARP_MAX_AGE_SECONDS`, `SHARP_PREGAME_MAX_AGE_SECONDS` and
+  `SHARP_FAR_MAX_AGE_SECONDS` (empty = the same as every book, so nothing changes until you set
+  them). Markouts read Pinnacle by the same limits.
+- **Nothing goes out on odds that went stale while it waited.** Each check notes when its odds
+  arrived. A new alert, or a much better price's new ping, that's only ready once those odds are
+  older than 10 minutes (`SEND_MAX_DELAY_SECONDS=600`; live games 90 seconds,
+  `LIVE_SEND_MAX_DELAY_SECONDS=90`; 0 = no limit) isn't sent: the next check looks again and sends it
+  on its fresh odds, only if it still qualifies then. A check normally takes a second or two, so this
+  only matters when a pass is very slow or Discord makes the bot wait. When Discord asks the bot to
+  wait more than 10 seconds before posting a new alert (`DISCORD_MAX_WAIT_SECONDS=10`; 0 = always
+  wait), it doesn't: the console says "Discord didn't take it" and that alert goes out at the next
+  check instead, if it's still there. Edits (a price change, the ❌ GONE mark, "see the newer alert")
+  and health messages have no next check to go out at, so they always wait as long as Discord asks. An
+  alert is logged (`ev_bets.csv`, `outliers.csv`, so results) and followed (markouts) only once its
+  post went out, and `post_delay` in those files is the seconds from fetching its odds to that post
+  (the bot's real speed, to set these limits from). Parlays aren't checked this way (they're built
+  from alerts already up), but a bet waiting for the next check is never a parlay leg.
 - **Live arbs need both prices fresh**: priced within 60 seconds of each other, or it's usually
   just one book lagging. In locks mode every live alert also needs two checks in a row and a price
   under 60 seconds old (see "Alert mix" above).
@@ -243,14 +339,25 @@ The console line after each check says what was held back and why, e.g.
 ## +EV bets
 
 ```
-📈 +5.4% EV | NHL | Bruins @ Rangers (starts 7:00 PM)
-  Bruins ML +145 on DraftKings  → stake $10
-  Fair +132 → +130 (43.5%, Pinnacle no-vig, 1/1 sources)
+📈 +5.5% EV | NHL | Bruins @ Rangers (starts 7:00 PM)
+  Bruins ML +145 on DraftKings  → stake $10 (1u)
+  Fair +134 → +132 (43.1%, Pinnacle + Kalshi no-vig)
+  Sources 2/2 · Pinnacle 42.5% · Kalshi 45.0%
   Sharp: Pinnacle +125 / -145
 ```
 
 Each +EV card in Discord shows Pinnacle's prices on both sides, how the fair price has moved
 since the first alert, and a table of every book's price and edge on that bet.
+
+Below the line, a **Sources** line says which fair-price references apply to the bet and what each
+one gives this side once its margin is taken out, so you can compare them:
+"Sources 2/2 · Pinnacle 42.5% · Kalshi 45.0%". The references are the books in `SHARP_BOOKS`, plus
+Kalshi on a moneyline before the game in a sport Kalshi lists (`KALSHI_CHECK`; not live, even with
+`KALSHI_LIVE`, and not with a Kalshi weight of 0 in `SHARP_WEIGHTS`). One that applies but
+had no usable price says so ("Sources 1/2 · Pinnacle 42.5% · Kalshi: no usable price"); a missing
+Kalshi price never makes the stake smaller. Spreads and totals have Pinnacle only ("Sources 1/1"). A
+prop Pinnacle doesn't price says "Sources: median of 5 books (no Pinnacle price)". `ev_bets.csv`
+keeps the same line in its `sources` column.
 
 **How it works:** Pinnacle takes big bettors and keeps a thin margin, so its lines are the
 market's best guess at the real odds. The bot removes Pinnacle's margin (the "vig") to get each
@@ -264,13 +371,44 @@ shot, and this method takes more of it out there, so long shots don't look bette
 cost the same as one region.
 
 **Stakes** use the Kelly formula: bet more when the edge is bigger. It uses a quarter of full
-Kelly to soften the swings, and never more than 3% of `EV_BANKROLL` on one bet. Set `UNIT_SIZE`
-to see stakes in units too.
+Kelly to soften the swings, and never more than 3% of `EV_BANKROLL` on one bet.
+
+**Units.** Every bet card (+EV, outlier, parlay) shows the stake in dollars and in units, like
+"$15 (1.5u)". One unit is 1% of `EV_BANKROLL` ($10 with the usual $1,000, so 100 units is the whole
+bankroll), or `UNIT_SIZE` dollars if you set it. The unit only labels the stake: the dollars always
+come from `EV_BANKROLL`. To bet more or less, change the unit with
+`python arbbot.py --set UNIT_SIZE=20`: that also sets `EV_BANKROLL=2000`, so every stake grows with
+it. If you set `UNIT_SIZE` in `.env` and 100 units isn't `EV_BANKROLL` (say you edited just one of
+them), the bot warns you when it starts. The "online" message says what 1u is. Arb cards stay in
+dollars (their bets have to add up exactly). `ev_bets.csv` and `outliers.csv` have a `units` column.
 
 **More than one sharp book (optional).** List several in `SHARP_BOOKS` (for example
-`pinnacle,betfair_ex_eu`) and the bot blends their fair odds. Each alert shows how many sources
-priced it ("Sources 2/2"). If the sharps disagree by more than `SHARP_DISAGREE_PCT`, the line is
-skipped. If only one of them priced it, the stake is halved (`SINGLE_SOURCE_STAKE`).
+`pinnacle,betfair_ex_eu`) and the bot blends their fair odds. Each alert's Sources line lists them
+("Sources 2/2 · Pinnacle 50.0% · Betfair 49.1%"). If the sharps disagree by more than
+`SHARP_DISAGREE_PCT` (props: `SHARP_DISAGREE_PROP_PCT=4`), the line is skipped. If only one of them
+priced it, the stake is halved (`SINGLE_SOURCE_STAKE`).
+
+**One odd source is left out (3 or more sources).** When three or more sources price a line (sharp
+books, plus Kalshi on a pre-game moneyline), the bot checks each one against the middle of the
+others. If the farthest is more than 3 points of win chance away (`OUTLIER_SOURCE_PTS`; props 4,
+`OUTLIER_SOURCE_PROP_PTS`), it's left out of that line's fair price, and the rest must still agree
+within `SHARP_DISAGREE_PCT`. Only one is left out per line, and never Pinnacle: if Pinnacle is the odd
+one out, the line is skipped (whatever order `SHARP_BOOKS` lists them in; it's the source with the
+most weight, and a tie in weight goes to the more trusted one). The card's Sources line says so
+("Sources 2/3 · Pinnacle 50.0% · BetOnline 50.4% · LowVig left out (5.8 pts off)") and `ev_bets.csv`
+has an `excluded` column. Nothing is remembered between checks: a source left out counts again as soon
+as it's back within the limit.
+With just two sources, a gap over `SHARP_DISAGREE_PCT` (Kalshi: `KALSHI_MAX_GAP`) skips the line, as
+before. With today's settings (Pinnacle plus Kalshi) this never comes up.
+
+**How much each source counts.** The blueprint trusts Pinnacle most, then Circa (not in our odds
+feed), then Kalshi. So by default Pinnacle counts 0.5, Kalshi 0.15 and any other sharp book 0.15,
+shared out over the sources that price a line: Pinnacle + Kalshi is 77% Pinnacle, 23% Kalshi.
+`SHARP_WEIGHTS` changes them (for example `pinnacle=0.6,kalshi=0.2`); a source you leave out keeps its
+default, and 0 means it isn't used at all (a line only it prices then counts as having no sharp price).
+`SHARP_WEIGHTS_PROPS` does the same for player props (empty = `SHARP_WEIGHTS`). The bot warns you at
+startup if a weight puts any source above Pinnacle: that source then leads the fair odds, and with 3+
+sources Pinnacle can be the one left out.
 A prop Pinnacle doesn't price uses the median of at least 4 other books instead (not counting the
 book being judged; BetOnline.ag and LowVig.ag count as one), with a 30% smaller stake
 (`CONSENSUS_STAKE=0.7`).
@@ -289,12 +427,51 @@ price (contracts x price). When the stake is more than that, the card says "Kals
 $43 at this price; the rest would fill at a worse price", and a +EV or outlier stake is cut to
 what's there (rounded down the usual way). An arb with a Kalshi bet gets the same note, but its
 stakes stay as they are (its bets must stay balanced). See what it matches with
-`python arbbot.py --check-kalshi`.
+`python arbbot.py --check-kalshi` (it also prints Kalshi's own rules text for each sport's markets,
+when Kalshi's reply has it).
+
+**Kalshi in the fair price (`KALSHI_BLEND=true`).** When a pre-game moneyline passes those checks and
+Kalshi has a usable price for both teams, Kalshi's price also goes into the fair odds, at its weight
+(77% Pinnacle, 23% Kalshi by default). Pinnacle 50% and Kalshi 52% make a fair price of 50.5%. The
+card says "Pinnacle + Kalshi", and the edge and the stake use that price. Everything that checks a bet
+still uses Pinnacle's own price: the gap to Kalshi, "Kalshi agrees", confirmed pre-game bets, which
+way Pinnacle's line is moving, markouts and CLV. A bet at Kalshi uses Pinnacle's price alone (Kalshi
+can't vouch for itself, nor veto itself: when Kalshi's quote disagrees with the sharp books so much
+that the line gets no fair price, a bet at Kalshi still has Pinnacle's). Spreads, totals and props are
+Pinnacle only (Kalshi doesn't price them). A missing Kalshi price never makes a stake smaller.
+`ev_bets.csv` keeps both in `pinnacle_prob` and `kalshi_prob`, so the results can be compared with and
+without Kalshi. Note that moneyline edges logged from this change on are worked out slightly
+differently from earlier ones. `KALSHI_BLEND=false` goes back to Pinnacle alone.
+
+**Kalshi alone (`KALSHI_ONLY=true`).** Sometimes Pinnacle doesn't list a game's moneyline at all
+(often small college games) while it does list the sport's other games. Then a pre-game moneyline
+can be priced by Kalshi alone, when both teams have a usable Kalshi price and at least 3 other
+sportsbooks (not exchanges: Kalshi can't check itself) are within 10 points of it
+(`SHARP_CONSENSUS_MAX_GAP`). These bets are never more than 🟡 Medium (so never in locks mode),
+never at Kalshi itself, and bet half the usual stake (`KALSHI_ONLY_STAKE=0.5`). The card says "Kalshi
+(no Pinnacle price)" and "Sources 1/2 · Kalshi 52.0% (no Pinnacle price)"; the console line counts
+them ("Kalshi-only: 2"). A Pinnacle price that's just old doesn't count as missing (an old stamp
+usually means Pinnacle took the market down), and if Pinnacle has no moneylines at all in that
+sport, nothing goes out on Kalshi alone. Markouts don't re-check these (they'd need Kalshi's price),
+only whether the price was still there.
+
+**NFL ties.** An NFL game can end in a tie. Sportsbooks refund a moneyline bet then; Kalshi settles
+its market by its own rules. So a +EV, outlier or arb card with a Kalshi bet on an NFL moneyline adds
+one line: "Kalshi settles ties by its own rules; sportsbooks refund a tie." Ties are rare and the edge
+is worked out the same way; it's there so a tie doesn't surprise you. `--check-kalshi` shows Kalshi's
+wording.
+
+**One source, smaller stake (optional).** `ONE_SOURCE_STAKE` cuts the stake when Pinnacle alone sets
+the fair price (spreads, totals, props, moneylines without a usable Kalshi price). It's 1 (the full
+stake, as before) unless you change it; `ONE_SOURCE_STAKE=0.75` bets a quarter less on those.
 
 **Bigger edge, new alert.** Discord doesn't ping you when a message is edited. So if a bet's edge
 grows by 2.5 points or more while it's open (`REALERT_JUMP_PCT`), you get a fresh alert. For a live
 bet in locks mode that fresh alert follows the live rules (two checks in a row, a price under 60
-seconds old, one of the 3 live alerts an hour); until it can go, the card is just updated.
+seconds old, one of the 3 live alerts an hour); until it can go, the card is just updated. The same
+rule holds when a bet turns from +EV into an outlier or back (its old card points to the new one):
+the new card pings you only if its edge is 2.5 points better than the edge you were last pinged
+for; otherwise it goes up without the ping.
 
 **Is it working? (what hit)** Every +EV, outlier, prop and parlay alert is logged. As games
 finish, the bot grades them with the final scores (`ev_results.csv`) and posts each result to a
@@ -387,7 +564,26 @@ range. Each bet counts once, like everywhere else. ✅ = 50+ live bets and above
 end; ⚠️ = 50+ live bets and below 0 even at the high end: review that alert type. Pre-game and
 props get no ✅/⚠️: their checks can be hours apart and only alerts re-checked within an hour are
 measured, so CLV is the better test there (the cards say how many were measured). No extra
-credits, no extra pings. `MARKOUT_FILE=` (empty) turns it off.
+credits, no extra pings. `MARKOUT_FILE=` (empty) turns it off. `markouts.csv` keeps the last 60
+days (`LOG_KEEP_DAYS`, see "Candidate log"), so these summaries cover the last 60 days, not all time.
+
+**Candidate log (`candidates.csv`).** Every +EV and outlier bet that came within 1 point of its bar,
+and what happened to it, so the bars can be tuned from what nearly went out: `alerted` (with
+`post_delay`, the seconds from fetching its odds to its post), held back (`capped`, `live cap`, `old
+price`, `unconfirmed`, `deferred` = its odds were too old by sending time), or the check that stopped
+it: `sharp hold` (Pinnacle's margin too wide), `market gap` (Pinnacle and the other books too far
+apart), `kalshi gap` / `kalshi no` (Kalshi too far off, or says the price isn't good), `sharp no`
+(an outlier Pinnacle says isn't good), `sharp other line` / `sharp last price` (a prop Pinnacle prices
+at another point, or took down, says no edge), `confirm fail: ...` (a confirmed pre-game bet whose
+second source didn't agree), `low confidence`, `moved first` / `first look` (the price guard), or
+`under bar` (the best price on that side, within a point under the bar). Each row has the game,
+line, book, price, fair odds and where they came from, the Sources line, Kalshi's chance, the edge
+and the confidence. The same bet and decision is written at most every 15 minutes.
+`CANDIDATE_LOG_FILE=` (empty) turns it off; `--once`, `--demo` and `--dry-run` never write it.
+Once a day `candidates.csv`, `arbs.csv` and `markouts.csv` drop rows older than 60 days
+(`LOG_KEEP_DAYS`; 0 = keep everything). The bet logs (`ev_bets.csv`, `outliers.csv`, `parlays.csv`,
+`ev_results.csv`, `closing_lines.csv`) and `score_checks.csv` (its running "ESPN agreed on N of M" is
+how far it can be trusted) are never cut.
 
 **Good to know:**
 - **Pre-game only by default.** Live +EV is mostly the feeds updating at different times,
@@ -525,6 +721,19 @@ A wrong API key stops it instead of restart-looping, and you'll get a 🔴 messa
 - **Fund each sportsbook account with a card or bank account in the account holder's own name.**
   Books check that it matches, and a mismatch can freeze your winnings.
 - Make sure sports betting is legal where you are, and only use licensed books.
+
+## The blueprint
+
+Your friend's blueprint gives every requirement an ID (FAIR-09, STAKE-08, ...) and a colour: Green is
+fixed, Yellow and Red need your say. [docs/BLUEPRINT.md](docs/BLUEPRINT.md) lists every ID, what the bot
+does about it and which setting controls it, the choices made for you on the Yellow and Red ones ("Open
+decisions": tell Claude if you want any different), what can't be done on this odds feed, and where the
+bot follows your own requests instead. Print the Yellow and Red ones any time, with your current settings
+for each open decision (free, nothing is sent):
+
+```bash
+python arbbot.py --blueprint
+```
 
 ## Tests
 

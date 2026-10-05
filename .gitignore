@@ -7,6 +7,7 @@ outliers.csv
 closing_lines.csv
 markouts.csv
 score_checks.csv
+candidates.csv
 parlays.csv
 state/
 .update-skipped

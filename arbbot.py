@@ -33,7 +33,9 @@ import json
 import math
 import re
 import os
+import statistics
 import sys
+import textwrap
 import threading
 import time
 import unicodedata
@@ -74,6 +76,12 @@ SISTER_BOOKS = ({"betonlineag", "lowvig"},)
 # prices count in a consensus like any book's, but not toward its "6 sportsbooks price it" point.
 EXCHANGES = {"kalshi", "novig", "prophetx", "polymarket", "betfair_ex_eu", "betfair_ex_uk", "betfair_ex_au",
              "matchbook", "smarkets"}
+# Each fair-odds reference's weight in a blend, in the blueprint's trust order: Pinnacle, then Circa (not
+# in The Odds API's feed: kept for later), then Kalshi; any other sharp book OTHER_SOURCE_WEIGHT.
+# SHARP_WEIGHTS (props: SHARP_WEIGHTS_PROPS) can set any of them; one it doesn't list keeps its weight
+# here. They're shared out over the sources that price a line: Pinnacle + Kalshi = 0.77 / 0.23.
+SOURCE_WEIGHTS = {"pinnacle": 0.50, "circasports": 0.35, "kalshi": 0.15}
+OTHER_SOURCE_WEIGHT = 0.15
 
 # ALERT_MODE=locks floors: only alerts worth acting on.
 LOCKS = {
@@ -96,6 +104,8 @@ LOCKS = {
     # second sharp source agrees with Pinnacle's fair odds: Kalshi, or 4+ other sportsbooks, within
     # 1.5 points of win chance. It still needs high confidence and every other check.
     "pregame_confirmed_ev_pct": 3.5, "kalshi_confirm_pts": 1.5, "consensus_confirm_pts": 1.5,
+    # Player props: Overs only (PROP_SIDES=both to get the Unders too).
+    "prop_sides": "over",
 }
 
 # Confirmed pre-game bets (PREGAME_CONFIRMED_EV_PCT): main lines only, college games need this much
@@ -143,6 +153,15 @@ DEFAULT_PROP_MARKETS = {
     "icehockey_nhl": "player_points,player_shots_on_goal,player_assists",
     "baseball_mlb": "batter_hits,batter_total_bases,pitcher_strikeouts",
 }
+# More prop types asked for only in the last PROP_HOURS before kickoff, in the same request (each costs a
+# credit per game per check there). The Odds API rejecting one (422) only turns these off for that sport.
+DEFAULT_PROP_NEAR_MARKETS = {
+    "icehockey_nhl": "player_goals,player_total_saves",
+    # Alternate lines ("250+ yards" ladders): only ever a price to bet at exactly the line a fair price
+    # is for, never a fair price themselves (see base_market).
+    "americanfootball_nfl": "player_pass_yds_alternate,player_rush_yds_alternate,player_reception_yds_alternate,"
+                            "player_receptions_alternate",
+}
 
 
 # --------------------------------------------------------------------------- config
@@ -172,6 +191,19 @@ def set_env_value(path: Path, key: str, value: str) -> None:
     lines = [l for l in lines if _env_key(l) != key]
     lines.append(f"{key}={value}")
     path.write_text("\n".join(lines) + "\n")
+
+
+def with_unit_bankroll(changes: dict[str, str]) -> dict[str, str]:
+    """--set UNIT_SIZE=X also sets EV_BANKROLL to 100 x X, so changing the unit scales every stake
+    (100 units = the bankroll), unless the same command sets EV_BANKROLL itself. UNIT_SIZE=0 (1u =
+    1% of EV_BANKROLL) and a value that isn't a number (refused later) change nothing else."""
+    try:
+        unit = float(changes.get("UNIT_SIZE", ""))
+    except ValueError:
+        return changes
+    if not math.isfinite(unit) or unit <= 0 or "EV_BANKROLL" in changes:
+        return changes
+    return {**changes, "EV_BANKROLL": _plain(unit * 100)}
 
 
 def check_settings(changes: dict[str, str]) -> tuple[str, list[str]]:
@@ -343,6 +375,11 @@ class Config:
     live_per_hour: int = 0        # every new live alert together: arbs, outliers, live +EV
     max_age_seconds: int = 120    # live games: ignore prices not updated this recently
     pregame_max_age_seconds: int = 900  # pre-game lines can sit unchanged for a while
+    # The same three age limits for SHARP_BOOKS prices, the ones fair odds come from (None = the limit for
+    # every book: MAX_AGE_SECONDS live, PREGAME_MAX_AGE_SECONDS, FAR_MAX_AGE_SECONDS beyond PREGAME_HOURS).
+    sharp_max_age_seconds: int | None = None
+    sharp_pregame_max_age_seconds: int | None = None
+    sharp_far_max_age_seconds: int | None = None
     realert_jump_pct: float = 2.5  # send a fresh alert if the edge grows by this many points
     bankroll: float = 100.0
     round_stakes: float = 5       # round stakes to this many dollars (0 = exact cents)
@@ -359,7 +396,15 @@ class Config:
     ev_webhook_url: str = ""      # +EV (incl. props) channel; outliers and parlays fall back to it
     parlay_webhook_url: str = ""
     include_links: bool = True    # ask for bet-slip deep links where books support them
+    include_sids: bool = True     # ...and each book's own ids, to build a bet-slip link where it sent none (no credits)
     discord_mention: str = ""     # e.g. @everyone or <@USER_ID> to force a phone ping
+    # A new alert (or a much better price's re-alert) isn't posted on odds fetched longer ago than this by the
+    # time it's ready (a slow pass, Discord making the bot wait): the next check looks again and sends it on its
+    # fresh odds, only if it still qualifies. Seconds, before the game / live; 0 = no limit.
+    send_max_delay_seconds: int = 600
+    live_send_max_delay_seconds: int = 90
+    discord_max_wait_seconds: float = 10   # a new alert's post told to wait longer (429): don't, try at the next check
+                                           # (0 = wait); edits and status messages always wait
     status_webhook_url: str = ""  # health messages; defaults to the alerts webhook
     results_webhook_url: str = ""  # graded bets (what hit); defaults to the health channel
     results_minutes: int = 30     # look for finished games to grade this often (0 = daily only)
@@ -369,6 +414,14 @@ class Config:
     # trusted later; "off" doesn't ask ESPN (except to spot rain-shortened MLB games, always).
     free_scores: str = "shadow"
     low_credits: int = 5000       # warn on Discord below this many credits
+    # Outage messages in the health channel: one when a data source has been down this many minutes (what it
+    # means for the alerts), one when it's back. The Odds API not answering for a sport; the sharp book
+    # (SHARP_BOOKS) missing from every game of a sport other books price (while it is, props without its price
+    # are at most medium confidence and Kalshi-only bets wait); Kalshi unreachable. 0 = that one off.
+    health_alerts: bool = True
+    odds_down_minutes: int = 10
+    sharp_down_minutes: int = 15
+    kalshi_down_minutes: int = 30
     log_file: str = "arbs.csv"    # every arb with how long it lasted ("" = off)
     state_dir: str = "state"      # open alerts survive restarts (no duplicate posts) ("" = off)
     summary_hour: int = 9         # local hour for the daily Discord summary (-1 = off)
@@ -377,15 +430,31 @@ class Config:
     ev_enabled: bool = True
     bet_at_sharp: bool = False      # true only if you can actually bet at the sharp book
     sharp_books: str = "pinnacle"   # fair-odds references (blended if more than one)
-    sharp_weights: dict[str, float] = field(default_factory=dict)  # e.g. pinnacle=0.6; default equal
+    sharp_weights: dict[str, float] = field(default_factory=dict)  # e.g. pinnacle=0.6; unlisted: SOURCE_WEIGHTS
+    sharp_weights_props: dict[str, float] | None = None   # the same for player props (None = SHARP_WEIGHTS)
     sharp_disagree_pct: float = 3.0  # skip a line if two sharps' fair odds differ by more (points)
+    sharp_disagree_prop_pct: float = 4.0  # the same for player props
+    # With 3+ fair-odds references on a line (sharp books, Kalshi), one more than this many points from
+    # the middle of the others is left out (at most one; never the most trusted: then the line is skipped).
+    outlier_source_pts: float = 3.0
+    outlier_source_prop_pts: float = 4.0
     single_source_stake: float = 0.5  # stake multiplier when only 1 of several sharps priced it
+    one_source_stake: float = 1.0     # ...and when the one sharp listed priced it alone (no Kalshi in it; 1 = full)
     consensus_stake: float = 0.7      # stake multiplier when no sharp priced it (props: median of 4+ books)
     kalshi_check: bool = True         # cross-check moneylines against Kalshi's own (free) exchange prices
     kalshi_max_gap: float = 3.0       # skip a +EV bet when Kalshi's win chance differs by more (points; see kalshi_gap_limit)
     kalshi_max_spread: float = 3.0    # trust a Kalshi price only if its bid-ask spread is at most this (cents; college +2)
     kalshi_min_size: float = 100.0    # ...and at least this many contracts sit at the best bid and ask
     kalshi_live: bool = False         # also use Kalshi once a game has started (its in-game prices lag)
+    # Kalshi's own price goes into a pre-game moneyline's fair odds, next to the sharp book's (weight:
+    # SHARP_WEIGHTS' kalshi, else 0.15), when both teams have a usable quote. Only the edge, the stake and
+    # the card use it: every check (Kalshi's gap, confirmed bets, the sharp's history, CLV) uses the sharp's.
+    kalshi_blend: bool = True
+    # A pre-game moneyline no sharp book lists at all (while it lists other games in that sport) can be
+    # priced by Kalshi alone: the other sportsbooks must roughly agree, it's at most medium confidence
+    # (never in locks mode) and the stake is cut to KALSHI_ONLY_STAKE.
+    kalshi_only: bool = True
+    kalshi_only_stake: float = 0.5
     # A pre-game moneyline, spread or total under MIN_EV_PCT still goes out down to this edge (college
     # +1) when a second sharp source agrees with the sharp book's fair odds: Kalshi within
     # KALSHI_CONFIRM_PTS (moneylines), or the consensus of 4+ other sportsbooks within
@@ -403,7 +472,7 @@ class Config:
     sport_min_ev: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SPORT_MIN_EV))
     move_window_minutes: int = 60         # how far back to look for sharp line movement
     confidence_stakes: str = "1,0.75,0.5"  # stake multiplier for high, medium, low
-    unit_size: float = 0            # dollars per unit; > 0 shows stakes in units too
+    unit_size: float = 0            # dollars per unit (1u) on bet cards; 0 = EV_BANKROLL / 100 (100u = the bankroll)
     ev_books: str = ""              # only alert for these books ("" = every non-sharp book)
     min_ev_pct: float = 4.0
     max_ev_pct: float = 25.0        # above this it's almost always a stale line
@@ -418,16 +487,30 @@ class Config:
     closing_file: str = "closing_lines.csv"
     markout_file: str = "markouts.csv"   # every alert's price checked again a few minutes later ("" = off)
     score_check_file: str = "score_checks.csv"   # FREE_SCORES=shadow: ESPN's finals vs the Odds API's
+    # Every +EV or outlier bet that came within a point of its bar, and what happened to it: alerted (with how
+    # long the post took), held back (caps, live rules, old odds), or which check stopped it ("" = off).
+    candidate_log_file: str = "candidates.csv"
+    # Once a day, candidates.csv, arbs.csv and markouts.csv drop rows older than this many days (0 = keep all).
+    # The bet logs (ev_bets, outliers, parlays, results, closing lines) and score_checks.csv are never cut.
+    log_keep_days: int = 60
     # Player props (fetched per game, so they're budgeted separately and checked less often)
     props_enabled: bool = True
     prop_sports: list[str] = field(default_factory=lambda: [
         "americanfootball_nfl", "basketball_nba", "icehockey_nhl"])
     prop_markets: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_PROP_MARKETS))
+    # ...plus these near kickoff (PROP_HOURS), in the same request: sport -> markets ("" = none)
+    prop_near_markets: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_PROP_NEAR_MARKETS))
+    # ...paid for from spare credits only (never slowing a live or main-line check); false: like any near-kickoff
+    # prop check (a short day then slows live and main-line checks a little to pay for them)
+    prop_near_spare_only: bool = True
     prop_minutes: int = 30          # how often to check a game's props
     prop_hours: float = 3.0         # check every PROP_MINUTES this close to kickoff
     prop_early_hours: float = 24.0  # and every PROP_EARLY_MINUTES from this far out
     prop_early_minutes: int = 240
     prop_min_ev_pct: float = 7.0    # prop prices are noisier, so ask for more edge
+    # "over": prop Unders aren't alerted (+EV, outliers, so parlays too; prop arbs still need both sides),
+    # "both": Overs and Unders. "" = the mode's choice: locks over (the blueprint), otherwise both.
+    prop_sides: str = ""
     prop_min_books: int = 4         # without a sharp price, use the median of at least this many books
     consensus_min_books: int = 0    # (internal) consensus fallback for +EV; set for props only
     # Parlays built from current +EV bets
@@ -536,6 +619,9 @@ class Config:
             max_profit_pct=num("MAX_PROFIT_PCT", d.max_profit_pct, float),
             max_age_seconds=num("MAX_AGE_SECONDS", d.max_age_seconds, int),
             pregame_max_age_seconds=num("PREGAME_MAX_AGE_SECONDS", d.pregame_max_age_seconds, int),
+            sharp_max_age_seconds=num("SHARP_MAX_AGE_SECONDS", None, int),
+            sharp_pregame_max_age_seconds=num("SHARP_PREGAME_MAX_AGE_SECONDS", None, int),
+            sharp_far_max_age_seconds=num("SHARP_FAR_MAX_AGE_SECONDS", None, int),
             realert_jump_pct=num("REALERT_JUMP_PCT", d.realert_jump_pct, float),
             bankroll=num("BANKROLL", d.bankroll, float),
             round_stakes=num("ROUND_STAKES", d.round_stakes, float),
@@ -552,13 +638,21 @@ class Config:
             ev_webhook_url=e("DISCORD_EV_WEBHOOK_URL", ""),
             parlay_webhook_url=e("DISCORD_PARLAY_WEBHOOK_URL", ""),
             include_links=e("INCLUDE_LINKS", "true").lower() in ("1", "true", "yes"),
+            include_sids=(e("INCLUDE_SIDS") or "true").strip().lower() in ("1", "true", "yes"),
             discord_mention=e("DISCORD_MENTION", ""),
+            send_max_delay_seconds=num("SEND_MAX_DELAY_SECONDS", d.send_max_delay_seconds, int),
+            live_send_max_delay_seconds=num("LIVE_SEND_MAX_DELAY_SECONDS", d.live_send_max_delay_seconds, int),
+            discord_max_wait_seconds=num("DISCORD_MAX_WAIT_SECONDS", d.discord_max_wait_seconds, float),
             status_webhook_url=e("DISCORD_STATUS_WEBHOOK_URL", ""),
             results_webhook_url=e("DISCORD_RESULTS_WEBHOOK_URL", ""),
             results_minutes=num("RESULTS_MINUTES", d.results_minutes, int),
             prop_grading=(e("PROP_GRADING") or d.prop_grading).strip().lower(),
             free_scores=(e("FREE_SCORES") or d.free_scores).strip().lower(),
             low_credits=num("LOW_CREDITS", d.low_credits, int),
+            health_alerts=(e("HEALTH_ALERTS") or "true").strip().lower() in ("1", "true", "yes"),
+            odds_down_minutes=num("ODDS_DOWN_MINUTES", d.odds_down_minutes, int),
+            sharp_down_minutes=num("SHARP_DOWN_MINUTES", d.sharp_down_minutes, int),
+            kalshi_down_minutes=num("KALSHI_DOWN_MINUTES", d.kalshi_down_minutes, int),
             log_file=e("LOG_FILE", d.log_file),
             state_dir=e("STATE_DIR", d.state_dir),
             summary_hour=num("SUMMARY_HOUR", d.summary_hour, int),
@@ -566,14 +660,22 @@ class Config:
             ev_enabled=e("EV_ENABLED", "true").lower() in ("1", "true", "yes"),
             sharp_books=e("SHARP_BOOKS", d.sharp_books),
             sharp_weights=pairs("SHARP_WEIGHTS", float),
+            sharp_weights_props=pairs("SHARP_WEIGHTS_PROPS", float) if (e("SHARP_WEIGHTS_PROPS") or "").strip() else None,
             sharp_disagree_pct=num("SHARP_DISAGREE_PCT", d.sharp_disagree_pct, float),
+            sharp_disagree_prop_pct=num("SHARP_DISAGREE_PROP_PCT", d.sharp_disagree_prop_pct, float),
+            outlier_source_pts=num("OUTLIER_SOURCE_PTS", d.outlier_source_pts, float),
+            outlier_source_prop_pts=num("OUTLIER_SOURCE_PROP_PTS", d.outlier_source_prop_pts, float),
             single_source_stake=num("SINGLE_SOURCE_STAKE", d.single_source_stake, float),
+            one_source_stake=num("ONE_SOURCE_STAKE", d.one_source_stake, float),
             consensus_stake=num("CONSENSUS_STAKE", d.consensus_stake, float),
             kalshi_check=e("KALSHI_CHECK", "true").lower() in ("1", "true", "yes"),
             kalshi_max_gap=num("KALSHI_MAX_GAP", d.kalshi_max_gap, float),
             kalshi_max_spread=num("KALSHI_MAX_SPREAD", d.kalshi_max_spread, float),
             kalshi_min_size=num("KALSHI_MIN_SIZE", d.kalshi_min_size, float),
             kalshi_live=e("KALSHI_LIVE", "false").lower() in ("1", "true", "yes"),
+            kalshi_blend=(e("KALSHI_BLEND") or "true").strip().lower() in ("1", "true", "yes"),
+            kalshi_only=(e("KALSHI_ONLY") or "true").strip().lower() in ("1", "true", "yes"),
+            kalshi_only_stake=num("KALSHI_ONLY_STAKE", d.kalshi_only_stake, float),
             pregame_confirmed_ev_pct=num("PREGAME_CONFIRMED_EV_PCT", None, float),
             kalshi_confirm_pts=num("KALSHI_CONFIRM_PTS", d.kalshi_confirm_pts, float),
             consensus_confirm_pts=num("CONSENSUS_CONFIRM_PTS", d.consensus_confirm_pts, float),
@@ -601,15 +703,21 @@ class Config:
             closing_file=e("CLOSING_FILE", d.closing_file),
             markout_file=e("MARKOUT_FILE", d.markout_file),
             score_check_file=e("SCORE_CHECK_FILE", d.score_check_file),
+            candidate_log_file=e("CANDIDATE_LOG_FILE", d.candidate_log_file),
+            log_keep_days=num("LOG_KEEP_DAYS", d.log_keep_days, int),
             props_enabled=e("PROPS_ENABLED", "true").lower() in ("1", "true", "yes"),
             prop_sports=_csv(e("PROP_SPORTS", "")) or d.prop_sports,
             prop_markets={**d.prop_markets, **{k.strip(): v.strip().replace("|", ",") for k, v in
                           (x.split("=", 1) for x in e("PROP_MARKETS", "").split(";") if "=" in x)}},
+            prop_near_markets={**d.prop_near_markets, **{k.strip(): v.strip().replace("|", ",") for k, v in
+                               (x.split("=", 1) for x in e("PROP_NEAR_MARKETS", "").split(";") if "=" in x)}},
+            prop_near_spare_only=(e("PROP_NEAR_SPARE_ONLY") or "true").strip().lower() in ("1", "true", "yes"),
             prop_minutes=num("PROP_MINUTES", d.prop_minutes, int),
             prop_hours=num("PROP_HOURS", d.prop_hours, float),
             prop_early_hours=num("PROP_EARLY_HOURS", d.prop_early_hours, float),
             prop_early_minutes=num("PROP_EARLY_MINUTES", d.prop_early_minutes, int),
             prop_min_ev_pct=num("PROP_MIN_EV_PCT", d.prop_min_ev_pct, float),
+            prop_sides=(e("PROP_SIDES") or "").strip().lower(),
             prop_min_books=num("PROP_MIN_BOOKS", d.prop_min_books, int),
             parlays_enabled=e("PARLAYS_ENABLED", "true").lower() in ("1", "true", "yes"),
             parlay_max_legs=num("PARLAY_MAX_LEGS", d.parlay_max_legs, int),
@@ -635,8 +743,9 @@ class Config:
         cfg.check()
         return cfg.with_mode()
 
-    def check(self) -> None:
-        """Catch settings that would otherwise crash the bot later (raises ValueError naming one)."""
+    def check(self) -> list[str]:
+        """Catch settings that would otherwise crash the bot later (raises ValueError naming one).
+        Returns the warnings: settings that load but probably aren't what you meant (see warnings)."""
         for key, v in (("POLL_SECONDS", self.poll_seconds),
                        ("PROP_MINUTES", self.prop_minutes if self.props_enabled else 1)):
             if v < 1:
@@ -678,6 +787,9 @@ class Config:
                 raise ValueError(f"{key}={floor} should be 0 (off) or between 1 and {base_key} ({base})")
         if not 0 <= self.spare_use_pct <= 95:
             raise ValueError(f"SPARE_USE_PCT={self.spare_use_pct:g} should be between 0 (off) and 95")
+        if self.prop_sides not in ("", "over", "both"):
+            raise ValueError(f"PROP_SIDES={self.prop_sides} should be over or both (empty = the mode's choice: "
+                             f"over in locks mode, both otherwise)")
         if self.free_scores not in ("shadow", "off"):
             raise ValueError(f"FREE_SCORES={self.free_scores} should be shadow or off")
         if not 0 <= self.tax_rate < 1:
@@ -689,15 +801,68 @@ class Config:
                        ("CONSENSUS_CONFIRM_PTS", self.consensus_confirm_pts)):
             if v < 0:
                 raise ValueError(f"{key}={v:g} should be 0 or more (points of win chance, like 1.5)")
+        for key, v, same in (("SHARP_MAX_AGE_SECONDS", self.sharp_max_age_seconds, "MAX_AGE_SECONDS"),
+                             ("SHARP_PREGAME_MAX_AGE_SECONDS", self.sharp_pregame_max_age_seconds,
+                              "PREGAME_MAX_AGE_SECONDS"),
+                             ("SHARP_FAR_MAX_AGE_SECONDS", self.sharp_far_max_age_seconds, "FAR_MAX_AGE_SECONDS")):
+            if v is not None and v < 0:
+                raise ValueError(f"{key}={v} should be empty (the same as {same}) or a number of seconds, like 300")
+        if self.log_keep_days < 0:
+            raise ValueError(f"LOG_KEEP_DAYS={self.log_keep_days} should be 0 (keep everything) or a number of days, "
+                             f"like 60")
+        for key, v in (("ODDS_DOWN_MINUTES", self.odds_down_minutes), ("SHARP_DOWN_MINUTES", self.sharp_down_minutes),
+                       ("KALSHI_DOWN_MINUTES", self.kalshi_down_minutes)):
+            if v < 0:
+                raise ValueError(f"{key}={v} should be 0 (off) or a number of minutes, like 15")
+        for key, v in (("SEND_MAX_DELAY_SECONDS", self.send_max_delay_seconds),
+                       ("LIVE_SEND_MAX_DELAY_SECONDS", self.live_send_max_delay_seconds),
+                       ("DISCORD_MAX_WAIT_SECONDS", self.discord_max_wait_seconds)):
+            if v < 0:
+                raise ValueError(f"{key}={v:g} should be 0 (no limit) or a number of seconds, like 60")
+        for key, v in (("ONE_SOURCE_STAKE", self.one_source_stake), ("KALSHI_ONLY_STAKE", self.kalshi_only_stake)):
+            if v < 0:
+                raise ValueError(f"{key}={v:g} should be a fraction of the normal stake, like 0.5 (1 = the full stake)")
+        for key, weights in (("SHARP_WEIGHTS", self.sharp_weights), ("SHARP_WEIGHTS_PROPS", self.sharp_weights_props or {})):
+            if bad := [k for k, w in weights.items() if w < 0]:
+                raise ValueError(f"{key}: {bad[0]}={weights[bad[0]]:g} should be 0 (not used) or more")
+        return self.warnings()
+
+    def warnings(self) -> list[str]:
+        """Settings that load but probably aren't what you meant, in plain English (the bot says
+        them at startup, in the console and the health channel)."""
+        out = []
+        if self.unit_size > 0 and not math.isclose(self.unit_size * 100, self.ev_bankroll):
+            unit = _plain(self.unit_size)
+            out.append(f"UNIT_SIZE={unit} but EV_BANKROLL={_plain(self.ev_bankroll)}: cards say 1u = "
+                       f"{money(self.unit_size)}, but stakes are still worked out from a {money(self.ev_bankroll)} "
+                       f"bankroll, not 100 units ({money(self.unit_size * 100)}). To make every bet scale with "
+                       f"your unit, run: python arbbot.py --set UNIT_SIZE={unit} (it sets "
+                       f"EV_BANKROLL={_plain(self.unit_size * 100)} too)")
+        for key, weights, prop in (("SHARP_WEIGHTS", self.sharp_weights, False),
+                                   ("SHARP_WEIGHTS_PROPS", self.sharp_weights_props or {}, True)):
+            pin = source_weight(self, "pinnacle", prop)
+            if over := [k for k, w in weights.items() if k != "pinnacle" and w > pin]:
+                out.append(f"{key} gives {', '.join(f'{k} ({_plain(weights[k])})' for k in over)} more weight than "
+                           f"Pinnacle ({_plain(pin)}): fair odds will lean on {'it' if len(over) == 1 else 'them'} "
+                           f"more than on Pinnacle, the sharpest book (the blueprint trusts Pinnacle most), and with "
+                           f"3+ sources Pinnacle can be the one left out as the odd one out (the heaviest never is)")
+        return out
+
+    def unit(self) -> float:
+        """Dollars per unit (1u) on bet cards: UNIT_SIZE, or 1% of EV_BANKROLL when that's 0 (100 units
+        = the bankroll). It only labels the stake: stakes are worked out in dollars from EV_BANKROLL."""
+        return self.unit_size if self.unit_size > 0 else self.ev_bankroll / 100
 
     def with_mode(self) -> "Config":
         """Apply ALERT_MODE. "locks" raises every bar to at least the levels below (your own
         stricter settings still win) and caps how many alerts go out per hour, live ones most.
         PREGAME_CONFIRMED_EV_PCT: in locks yours wins only when stricter, i.e. a higher edge, or 0
-        (off); left empty it's 3.5. Other modes: off unless you set it."""
+        (off); left empty it's 3.5. Other modes: off unless you set it. PROP_SIDES left empty: over in
+        locks (prop Unders aren't alerted), both otherwise."""
         confirmed = self.pregame_confirmed_ev_pct
         if self.alert_mode != "locks":
-            return self if confirmed is not None else replace(self, pregame_confirmed_ev_pct=0.0)
+            return replace(self, pregame_confirmed_ev_pct=0.0 if confirmed is None else confirmed,
+                           prop_sides=self.prop_sides or "both")
         L = LOCKS
         conf = max(self.min_confidence, L["min_confidence"], key=lambda c: CONFIDENCE_ORDER.get(c, 0))
         cap = lambda mine, lock: min(x for x in (mine, lock) if x) if (mine or lock) else 0
@@ -729,6 +894,7 @@ class Config:
                                       else confirmed and max(confirmed, L["pregame_confirmed_ev_pct"])),
             kalshi_confirm_pts=min(self.kalshi_confirm_pts, L["kalshi_confirm_pts"]),
             consensus_confirm_pts=min(self.consensus_confirm_pts, L["consensus_confirm_pts"]),
+            prop_sides=self.prop_sides or L["prop_sides"],
         )
 
     def bad_webhooks(self) -> list[str]:
@@ -792,8 +958,30 @@ class Config:
         pct = self.pregame_confirmed_ev_pct or 0.0
         return pct + (CONFIRM_COLLEGE_EXTRA if "ncaa" in sport_key else 0.0) if pct > 0 else 0.0
 
-    def prop_credits_per_call(self, sport: str) -> int:
-        return len(_csv(self.prop_markets.get(sport, ""))) * self.regions_billed()
+    def prop_request(self, sport: str, near: bool = False) -> str:
+        """The prop types one game's request asks for: PROP_MARKETS, plus PROP_NEAR_MARKETS when the game
+        is within PROP_HOURS of kickoff (near), each once."""
+        base = _csv(self.prop_markets.get(sport, "").replace("|", ","))
+        extra = _csv(self.prop_near_markets.get(sport, "").replace("|", ",")) if near else []
+        return ",".join(base + [m for m in dict.fromkeys(extra) if m not in base])
+
+    def prop_near_extra(self, sport: str) -> list[str]:
+        """The prop types only a game near kickoff asks for (PROP_NEAR_MARKETS not in PROP_MARKETS)."""
+        plain = _csv(self.prop_request(sport))
+        return [m for m in _csv(self.prop_request(sport, near=True)) if m not in plain]
+
+    def prop_types(self, sport: str) -> list[str]:
+        """The prop stats a sport's alerts can be on, each once: PROP_MARKETS and PROP_NEAR_MARKETS, an
+        alternate-lines market as its main one (it's graded the same way)."""
+        return list(dict.fromkeys(base_market(m) for m in _csv(self.prop_request(sport, near=True))))
+
+    def alerts_side(self, line, outcome: str) -> bool:
+        """May this side be alerted? Not a prop Under with PROP_SIDES=over (its prices still go into the
+        fair odds: the Over's no-vig price needs both sides)."""
+        return not (self.prop_sides == "over" and outcome == "Under" and is_prop(line))
+
+    def prop_credits_per_call(self, sport: str, near: bool = False) -> int:
+        return len(_csv(self.prop_request(sport, near))) * self.regions_billed()
 
     def for_props(self) -> "Config":
         """The same settings with the prop thresholds swapped in (prop markets carry more margin)."""
@@ -822,6 +1010,7 @@ class Leg:
     edge: float | None = None        # % better (+) or worse (-) than Pinnacle's fair odds (None: no fair price)
     room: float = 0.0                # a Kalshi bet bigger than Kalshi's order book holds at this price: the
                                      # dollars there (0 = enough, or not known); the card says so
+    alt: bool = False                # the price is on the book's alternate line at this point, not its main one
 
 
 @dataclass
@@ -1093,6 +1282,8 @@ class OddsAPI:
             params["regions"] = self.cfg.regions
         if self.cfg.include_links:
             params["includeLinks"] = "true"
+        if self.cfg.include_sids:
+            params["includeSids"] = "true"
         data, cost = self._request(f"/sports/{sport}/events/{event_id}/odds", params)
         try:   # (an empty answer still says when the game starts)
             hours = (_parse_time(data["commence_time"]) - datetime.now(timezone.utc)).total_seconds() / 3600
@@ -1127,6 +1318,8 @@ class OddsAPI:
             params["regions"] = self.cfg.regions
         if self.cfg.include_links:
             params["includeLinks"] = "true"
+        if self.cfg.include_sids:
+            params["includeSids"] = "true"
         data, cost = self._request(f"/sports/{sport}/odds", params)
         self.costs.add(kind, cost, self.cfg.credits_per_call(markets))
         return data
@@ -1134,19 +1327,63 @@ class OddsAPI:
 
 # --------------------------------------------------------------------------- detection
 
+def is_alt(key: str) -> bool:
+    """An alternate-lines market: player_pass_yds_alternate (or alternate_spreads/alternate_totals)."""
+    return key.endswith("_alternate") or key.startswith("alternate_")
+
+
+def base_market(key: str) -> str:
+    """The main market an alternate-lines market belongs to: player_pass_yds_alternate -> player_pass_yds,
+    alternate_spreads -> spreads (any other key: itself). A bet on an alternate line is the same bet as
+    the main market's at the same point: labels, grading, CLV and alerts use the main market's key."""
+    if key.endswith("_alternate"):
+        return key[:-len("_alternate")]
+    return key[len("alternate_"):] if key.startswith("alternate_") else key
+
+
+def book_offers(bm: dict, ev: dict, now: datetime, is_live: bool,
+                cfg: Config) -> list[tuple[dict, dict, tuple, bool, str | None]]:
+    """One book's prices to bet in one game, one per line and side: (market, outcome, (market, line),
+    alternate?, stamp). The line's market is the main one: the book's alternate line at exactly the same
+    point is the same bet, and the better price of the two is its offer, with that market's link (the
+    main market's on a tie). Fair odds never come from alternate lines (the references read main markets
+    only): they're priced off the book's own main line, with more margin. stamp: when the book last
+    changed the price (None for a prop: one stamp for every player's line). Fresh markets only."""
+    best: dict[tuple, tuple[dict, dict, tuple, bool, str | None]] = {}
+    start = _parse_time(ev["commence_time"])
+    for mkt in sorted(bm.get("markets", []), key=lambda m: is_alt(m["key"])):   # main markets first
+        if not is_fresh(mkt, bm, now, is_live, cfg, start):
+            continue
+        base, alt = base_market(mkt["key"]), is_alt(mkt["key"])
+        stamp = (mkt.get("last_update") or bm.get("last_update")) if _one_line(mkt, ev["home_team"]) else None
+        for oc in mkt.get("outcomes", []):
+            price = float(oc.get("price") or 0)
+            if price <= 1.0:
+                continue
+            k = (base, _line_for(base, oc, ev["home_team"]))
+            have = best.get((k, oc["name"]))
+            if have is None or price > float(have[1]["price"]):
+                best[(k, oc["name"])] = (mkt, oc, k, alt, stamp)
+    return list(best.values())
+
+
 def is_fresh(mkt: dict, bm: dict, now: datetime, live: bool, cfg: Config,
-             start: datetime | None = None) -> bool:
+             start: datetime | None = None, sharp: bool = False) -> bool:
     """Live prices must be recent; pre-game lines legitimately sit still for longer, and lines
-    for games a day or two out can go hours without moving."""
+    for games a day or two out can go hours without moving. (The stamp is when The Odds API last saw
+    the market, so an old one means a market taken down, not a price that just didn't change.)
+    sharp: a SHARP_BOOKS price for fair odds, held to the SHARP_* age limits where they're set."""
     updated = mkt.get("last_update") or bm.get("last_update")
     if not updated:
         return True
     if live:
-        limit = cfg.max_age_seconds
+        limit, mine = cfg.max_age_seconds, cfg.sharp_max_age_seconds
     elif start is not None and start - now > timedelta(hours=cfg.pregame_hours):
-        limit = cfg.far_max_age_seconds
+        limit, mine = cfg.far_max_age_seconds, cfg.sharp_far_max_age_seconds
     else:
-        limit = cfg.pregame_max_age_seconds
+        limit, mine = cfg.pregame_max_age_seconds, cfg.sharp_pregame_max_age_seconds
+    if sharp and mine is not None:
+        limit = mine
     return (now - _parse_time(updated)).total_seconds() <= limit
 
 
@@ -1156,6 +1393,86 @@ def _fill_links(obj: dict, state: str) -> None:
     link = obj.get("link")
     if link and "{state}" in link:
         obj["link"] = link.replace("{state}", state) if state else ""
+
+
+def _draftkings_link(ev: dict, bm: dict, mkt: dict, oc: dict) -> str:
+    """DraftKings' bet slip from its own ids (INCLUDE_SIDS): the game's id (the book's sid) and the bet's."""
+    game, bet = bm.get("sid"), oc.get("sid")
+    if not (game and bet):
+        return ""
+    q = functools.partial(urllib.parse.quote, safe="")
+    return f"https://sportsbook.draftkings.com/event/{q(str(game))}?outcomes={q(str(bet))}"
+
+
+def _fanduel_link(ev: dict, bm: dict, mkt: dict, oc: dict) -> str:
+    """FanDuel's bet slip from its own ids (INCLUDE_SIDS): the market's id and the bet's (selection)."""
+    market, bet = mkt.get("sid"), oc.get("sid")
+    if not (market and bet):
+        return ""
+    q = functools.partial(urllib.parse.quote, safe="")
+    return f"https://sportsbook.fanduel.com/addToBetslip?marketId={q(str(market))}&selectionId={q(str(bet))}"
+
+
+def _feed_link_only(ev: dict, bm: dict, mkt: dict, oc: dict) -> str:
+    """No link of its own: the feed's (BetMGM's per-state template filled in with US_STATE)."""
+    return ""
+
+
+# Each book's own link logic, one replaceable function per book: given a price the feed had no bet-slip link for
+# (none, or only the game's page), build one from the book's ids, or "" (the feed's link stands).
+LINK_ADAPTERS = {"draftkings": _draftkings_link, "fanduel": _fanduel_link,
+                 "betmgm": _feed_link_only, "williamhill_us": _feed_link_only}
+LINK_LEVELS = {"outcome": "bet slip", "market": "market page", "event": "game page", "ids": "built from ids",
+               "": "no link"}
+
+
+def link_level(ev: dict, bm: dict, mkt: dict, oc: dict, cfg: Config) -> tuple[str, str]:
+    """(the link for this price, where it's from): the feed's link for the bet itself ("outcome": opens it in
+    the slip), else the market's ("market"), else the game's page ("event"), with a per-state template filled
+    in from US_STATE (dropped without it). When that's only the game's page or nothing, the book's
+    LINK_ADAPTERS entry may build the bet-slip link from its own ids ("ids"). "" = no link at all."""
+    link, level = "", ""
+    for obj, where in ((oc, "outcome"), (mkt, "market"), (bm, "event")):
+        got = obj.get("link") or ""
+        if "{state}" in got:
+            got = got.replace("{state}", cfg.us_state) if cfg.us_state else ""
+        if got:
+            link, level = got, where
+            break
+    if level in ("", "event") and (build := LINK_ADAPTERS.get(bm.get("key"))):
+        if built := build(ev, bm, mkt, oc):
+            return built, "ids"
+    return link, level
+
+
+def book_link(ev: dict, bm: dict, mkt: dict, oc: dict, cfg: Config) -> str:
+    """The link a card sends you to for this price (see link_level)."""
+    return link_level(ev, bm, mkt, oc, cfg)[0]
+
+
+def link_levels(events: list[dict], cfg: Config) -> dict[str, dict[str, int]]:
+    """For --once: for each book alerts can send you to, how many of its prices' links are the bet in the slip,
+    the market's, the game's page, built from ids or none ({book name: {level: count}})."""
+    out: dict[str, dict[str, int]] = {}
+    sharp = set() if cfg.bet_at_sharp else set(_csv(cfg.sharp_books))
+    for ev in events:
+        for bm in ev.get("bookmakers", []):
+            if bm["key"] in sharp or not cfg.bettable(bm["key"]):
+                continue
+            mine = out.setdefault(bm.get("title", bm["key"]), {})
+            for mkt in bm.get("markets", []):
+                for oc in mkt.get("outcomes", []):
+                    level = link_level(ev, bm, mkt, oc, cfg)[1]
+                    mine[level] = mine.get(level, 0) + 1
+    return out
+
+
+def links_line(events: list[dict], cfg: Config) -> str:
+    """'Bet links per price: DraftKings 210 bet slip, 6 built from ids; FanDuel 220 bet slip' ("" with none)."""
+    parts = [f"{book} " + ", ".join(f"{n} {LINK_LEVELS[lv]}" for lv, n in sorted(levels.items(),
+                                                                                key=lambda x: list(LINK_LEVELS).index(x[0])))
+             for book, levels in sorted(link_levels(events, cfg).items()) if levels]
+    return "Bet links per price: " + "; ".join(parts) if parts else ""
 
 
 def apply_fees(events: list[dict], cfg: Config) -> list[dict]:
@@ -1287,27 +1604,21 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
         for bm in ev.get("bookmakers", []):
             if bm["key"] in sharp_only or not cfg.bettable(bm["key"], ev):
                 continue  # reference-only book (e.g. Pinnacle), or one you can't bet at
-            for mkt in bm.get("markets", []):
-                if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
-                    continue  # stale price, likely already moved
-                # When the book last changed the price (unknown for a prop: one stamp for every player).
-                ts = (mkt.get("last_update") or bm.get("last_update")) if _one_line(mkt, ev["home_team"]) else None
-                per_line: dict[tuple, int] = {}
-                for oc in mkt.get("outcomes", []):
-                    price = float(oc.get("price") or 0)
-                    if price <= 1.0:
-                        continue
-                    k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
-                    per_line[k] = per_line.get(k, 0) + 1
-                    slot = best.setdefault(k, {})
-                    cur = slot.get(oc["name"])
-                    title = bm.get("title", bm["key"])
-                    if cur is None or price > cur.price or (price == cur.price and title < cur.book):
-                        link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
-                        slot[oc["name"]] = Leg(oc["name"], price, title, link=link,
-                                               updated=_parse_time(ts) if ts else None)
-                for k, n in per_line.items():
-                    n_outcomes[k] = max(n_outcomes.get(k, 0), n)
+            per_line: dict[tuple, int] = {}
+            # Fresh prices only (a stale one has likely moved already); an alternate line at the same point
+            # as the main one is the same bet (book_offers: the better price).
+            for mkt, oc, k, alt, ts in book_offers(bm, ev, now, is_live, cfg):
+                price = float(oc["price"])
+                per_line[k] = per_line.get(k, 0) + 1
+                slot = best.setdefault(k, {})
+                cur = slot.get(oc["name"])
+                title = bm.get("title", bm["key"])
+                if cur is None or price > cur.price or (price == cur.price and title < cur.book):
+                    link = book_link(ev, bm, mkt, oc, cfg)
+                    slot[oc["name"]] = Leg(oc["name"], price, title, link=link,
+                                           updated=_parse_time(ts) if ts else None, alt=alt)
+            for k, n in per_line.items():
+                n_outcomes[k] = max(n_outcomes.get(k, 0), n)
 
         for (market, line), legs_by_name in best.items():
             legs = list(legs_by_name.values())
@@ -1437,6 +1748,24 @@ def money(x: float) -> str:
     return f"${x:,.0f}" if abs(x - round(x)) < 0.005 else f"${x:,.2f}"
 
 
+def _plain(x: float) -> str:
+    """A number as a setting is written: 1500, 1250.5 (never 1.5e+03)."""
+    return f"{x:.2f}".rstrip("0").rstrip(".")
+
+
+def units(stake: float, unit: float) -> str:
+    """A stake in units, at most one decimal: '1.5u', '12.5u', '105u' (a sliver under 0.05u: '<0.1u')."""
+    s = f"{stake / unit:.1f}"
+    if float(s) == 0 and stake > 0:
+        return "<0.1u"
+    return (s[:-2] if s.endswith(".0") else s) + "u"
+
+
+def stake_text(stake: float, unit: float) -> str:
+    """'$15 (1.5u)': the dollars to bet, then the same in units (just dollars without a unit size)."""
+    return f"{money(stake)} ({units(stake, unit)})" if unit > 0 else money(stake)
+
+
 def _fmt_secs(s: float) -> str:
     s = int(round(s))
     return f"{s}s" if s < 90 else f"{s // 60}m {s % 60:02d}s"
@@ -1455,7 +1784,8 @@ def _age_note(age: float | None, many: bool = False) -> str:
 def format_text(arb: Arb) -> str:
     status = "🔴 LIVE" if arb.is_live else f"starts {arb.commence_time}"
     rows = "\n".join(
-        f"  • {l.outcome} {odds(l.price)} on {l.book}  → stake {money(l.stake)}"
+        f"  • {l.outcome} {odds(l.price)} on {l.book}{' (alternate line)' if l.alt else ''}"
+        f"  → stake {money(l.stake)}"
         + (f"  (bet first: {l.edge:+.1f}% vs {arb.fair_from})" if i == 0 and arb.tagged else "")
         + (f"\n    {l.link}" if l.link else "")
         for i, l in enumerate(arb.legs)
@@ -1472,6 +1802,7 @@ SPORT_ICONS = [("americanfootball", "🏈"), ("basketball", "🏀"), ("icehockey
                ("soccer", "⚽"), ("mma", "🥊"), ("boxing", "🥊"), ("tennis", "🎾"), ("golf", "⛳")]
 GREY = 0x95A5A6
 DIVIDER = "\n\n───────────────\n"
+ALT_NOTE = " *(alternate line)*"   # after a pick priced on the book's alternate line (find it in its alt lines)
 
 
 def sport_icon(sport_key: str) -> str:
@@ -1532,7 +1863,9 @@ def discord_payload(arb: Arb, mention: str = "", gone_after: float | None = None
                 first += (f"\n     ↳ If the other price{'s are' if len(arb.legs) > 2 else ' is'} gone, keep this one: "
                           f"it's a good bet alone. Only betting this one? Bet **{money(arb.keep_stake)}**.")
         steps.append(f"{num} Open **{_link(l.book, l.link)}** → bet "
-                     f"**{money(l.stake)}** on **{what} {odds(l.price)}**{skip}{kalshi_room_line(l.room, '     ')}{first}")
+                     f"**{money(l.stake)}** on **{what} {odds(l.price)}**{ALT_NOTE if l.alt else ''}{skip}"
+                     f"{kalshi_room_line(l.room, '     ')}"
+                     f"{kalshi_tie_note(arb.sport_key, arb.market, l.book, '     ')}{first}")
     rounding = (f"\n*{arb.exact_pct:.2f}% with exact stakes; rounded to look like normal bets*"
                 if arb.exact_pct - arb.profit_pct >= 0.05 else "")
     if arb.tagged:
@@ -1557,9 +1890,14 @@ def discord_payload(arb: Arb, mention: str = "", gone_after: float | None = None
                  footer="ARB = bet every side at different books, profit locked in.", mention=mention)
 
 
-def _webhook(url: str, payload: dict, method: str = "POST", message_id: str | None = None) -> dict | None:
-    """POST a new message (returns it, incl. id) or PATCH an existing one."""
+def _webhook(url: str, payload: dict, method: str = "POST", message_id: str | None = None,
+             max_wait: float = 0) -> dict | None:
+    """POST a new message (returns it, incl. id) or PATCH an existing one. Discord asking to slow down
+    (429) is waited out up to 3 times, each wait at most max_wait seconds (0 = as long as it asks): a longer
+    one returns None at once. Only a new alert's post sets max_wait (DISCORD_MAX_WAIT_SECONDS): it has a
+    retry, at the next check. Edits (GONE marks, refreshes) and status messages have none, so they wait."""
     target = f"{url}/messages/{message_id}" if message_id else f"{url}?wait=true"
+    limit = max_wait
     req = urllib.request.Request(
         target, data=json.dumps(payload).encode(), method=method,
         headers={"Content-Type": "application/json", "User-Agent": "arbbot/3.0"},
@@ -1571,7 +1909,13 @@ def _webhook(url: str, payload: dict, method: str = "POST", message_id: str | No
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as e:
             if e.code == 429:  # Discord rate limit
-                time.sleep(float(e.headers.get("Retry-After", "1")))
+                try:
+                    wait = float(e.headers.get("Retry-After", "1"))
+                except (TypeError, ValueError):
+                    wait = 1.0
+                if limit and wait > limit:
+                    return None   # (Discord never took it: Alerter._discord marks it safe to send again)
+                time.sleep(wait)
                 continue
             raise
     return None
@@ -1596,6 +1940,17 @@ class OpenArb:
     checks: int = 1           # how many checks found it (live: the ones that confirmed it too)
     spotted: float = 0.0      # when a check first found it (live: before the checks that confirmed it); 0 = first_seen
     better: int = 0           # live: checks in a row that found a much better price not re-alerted yet
+    quiet: bool = False       # its post goes out without the ping (a hand-over that isn't much better): a retry too
+    sent: bool = False        # it went out (posted, or printed in a dry run), or the card it was handed over from
+                              # did: logged and followed from then on
+    deferred: bool = False    # its post is held: the odds were too old by the time it was ready (SEND_MAX_DELAY_SECONDS)
+    post_delay: float | None = None   # seconds from fetching its odds to the post that sent it (None: not known)
+    pinged_pct: float | None = None   # edge of the last post of this bet that went out WITH the ping (or its other
+                                      # card's, before a hand-over); None: none did yet
+    slots: tuple = ()         # the hourly-cap slots its first post took ((times list, time) pairs): given back if
+                              # it never goes out
+    prev: tuple = ()          # (message id, webhook) of the card it was handed over from (now a pointer to this
+                              # one): if it closes before its own post lands, that card says GONE
 
 
 def data_path(name: str) -> Path:
@@ -1628,6 +1983,111 @@ def append_csv(name: str, fields: list[str], row: dict) -> None:
             w.writerow(row)
     except OSError as e:
         print(f"  ! Couldn't write {path}: {e}", file=sys.stderr)
+
+
+CANDIDATE_FIELDS = ["time", "sport", "event_id", "matchup", "market", "line", "outcome", "book", "price", "fair_prob",
+                    "fair_from", "sources", "kalshi_prob", "ev_pct", "confidence", "decision", "post_delay"]
+
+
+class CandidateLog:
+    """CANDIDATE_LOG_FILE: the +EV and outlier bets that came within a point of their bar, and what happened
+    to each: "alerted" (with post_delay, seconds from fetching its odds to the post), held back ("capped",
+    "live cap", "old price", "unconfirmed", "deferred": its odds too old by sending time), or the check that
+    stopped it ("sharp hold", "market gap", "kalshi gap", "kalshi no", "sharp no", "sharp other line",
+    "sharp last price", "confirm fail: <why>", "low confidence", "moved first", "first look", "under bar").
+    The same bet and decision again within HELD_LOG_GAP seconds isn't written again. Off ("" or a run that
+    mustn't write the service's files) writes nothing."""
+
+    def __init__(self, cfg: Config):
+        self.name = cfg.candidate_log_file
+        self.last: dict[tuple, float] = {}   # (bet key, decision) -> when last written
+
+    def add(self, item, decision: str, now: float, post_delay: float | None = None) -> None:
+        if not self.name:
+            return
+        try:
+            key = (item.key, decision)
+            last = self.last.get(key)
+            if last is not None and now - last <= HELD_LOG_GAP:
+                return   # (a bet that stays in the same state gets a row every HELD_LOG_GAP seconds)
+            self.last[key] = now
+            if len(self.last) > 5000:
+                self.last = {k: t for k, t in self.last.items() if now - t <= HELD_LOG_GAP}
+            line = item.line
+            kq = getattr(item, "kalshi", None)
+            append_csv(self.name, CANDIDATE_FIELDS, {
+                "time": _utc(now), "sport": item.sport or item.sport_key, "event_id": item.event_id,
+                "matchup": item.matchup, "market": item.market,
+                "line": (f"{line[0]} {line[1]:g}" if line[1] is not None else line[0]) if is_prop(line)
+                        else "" if item.point is None else item.point,
+                "outcome": item.outcome, "book": item.book, "price": item.price,
+                "fair_prob": round(item.fair_prob, 4), "fair_from": item.sharp_book,
+                "sources": sources_line(item) if getattr(item, "refs", None) else "",
+                "kalshi_prob": round(kq[0], 4) if kq else "", "ev_pct": round(item.ev_pct, 2),
+                "confidence": getattr(item, "confidence", ""), "decision": decision,
+                "post_delay": "" if post_delay is None else round(post_delay, 1)})
+        except Exception as e:  # noqa: BLE001 - a diagnostics file must never get in the way of the alerts
+            print(f"  ! Candidate log: {e!r:.200}", file=sys.stderr)
+
+    def extend(self, rejects: list, now: float) -> None:
+        for item, why in rejects:
+            self.add(item, why, now)
+
+
+# Files cut to LOG_KEEP_DAYS once a day, and each one's time column. Nothing that grades bets or counts a
+# record (ev_bets, outliers, parlays, results, closing lines; score_checks.csv's running "ESPN agreed on N of
+# M" is a trust measure) is ever cut.
+PRUNED_LOGS = (("candidate_log_file", "time"), ("log_file", "first_seen"), ("markout_file", "first_seen"))
+
+
+def prune_csv(name: str, keep_days: float, now: datetime, column: str) -> int:
+    """Drop rows whose `column` time is over keep_days old, rewriting the file atomically (a temporary file,
+    then a rename: a crash halfway leaves the old file). A row whose time can't be read is kept. Returns
+    how many rows went."""
+    path = data_path(name)
+    if not name or keep_days <= 0 or not path.exists():
+        return 0
+    cut = now - timedelta(days=keep_days)
+    tmp = path.with_name(path.name + ".tmp")
+
+    def old(row: dict) -> bool:
+        try:
+            t = _parse_time(row.get(column) or "")
+        except (TypeError, ValueError):
+            return False
+        return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)) < cut
+    try:
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            fields, rows = reader.fieldnames or [], list(reader)
+        keep = [r for r in rows if not old(r)]
+        if len(keep) == len(rows):
+            return 0
+        with tmp.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(keep)
+        os.replace(tmp, path)
+        return len(rows) - len(keep)
+    except (OSError, csv.Error, UnicodeDecodeError) as e:
+        print(f"  ! Couldn't trim {path}: {e}", file=sys.stderr)
+        try:
+            tmp.unlink(missing_ok=True)   # (the old file is untouched)
+        except OSError:
+            pass
+        return 0
+
+
+def prune_logs(cfg: Config, now: datetime | None = None) -> dict[str, int]:
+    """LOG_KEEP_DAYS: cut candidates.csv, arbs.csv and markouts.csv to that many days (0 = keep all).
+    Returns {file: rows dropped} for the files that lost some."""
+    now = now or datetime.now(timezone.utc)
+    out = {}
+    for attr, column in PRUNED_LOGS:
+        name = getattr(cfg, attr)
+        if n := prune_csv(name, cfg.log_keep_days, now, column):
+            out[name] = n
+    return out
 
 
 LOG_FIELDS = ["first_seen", "gone_at", "seconds_open", "sport", "matchup", "market", "line",
@@ -1703,6 +2163,7 @@ class Alerter:
     on_log = None  # optional callback(row) after a row is logged
     on_open = None  # optional callback(item, first_seen) when a brand-new alert goes out (markouts)
     on_held = None  # optional callback(item, why, now) when the caps or live rules hold one back (weekly card)
+    on_candidate = None  # optional callback(item, decision, now, post_delay) for the candidate log (bets)
     log_on_open = False  # arbs are logged when they close, so the row has how long it lasted
     log_held = True      # arbs the caps or live rules held back go in the log too, with the reason
 
@@ -1723,7 +2184,11 @@ class Alerter:
         self.held_counts: dict[str, int] = {}    # alerts held back, by why (the console line)
         self.held_logged: dict[tuple, float] = {}  # (key, why) -> last time it was held back
         self.handed: dict[str, float] = {}  # key -> first_seen, for bets taken over from a sibling alerter
+        self.handed_pct: dict[str, float] = {}  # ...and the edge that sibling last alerted it at (with the ping)
+        self.handed_unsent: set[str] = set()    # ...whose old card never went out (never logged or followed either)
+        self.handed_msg: dict[str, tuple] = {}  # ...and that old card's (message id, webhook), now pointing here
         self.send_retryable = False
+        self._slots: list[tuple[list, float]] = []   # the cap slots the last capped() call took
         self.reset_stats()
         self._load_state()
 
@@ -1750,7 +2215,8 @@ class Alerter:
         if not path:
             return
         data = {k: {"message_id": op.message_id, "url": op.url, "first_seen": op.first_seen,
-                    "alerted_pct": op.alerted_pct, "best_pct": op.best_pct, "card": op.card, "checks": op.checks,
+                    "alerted_pct": op.alerted_pct, "pinged_pct": op.pinged_pct, "best_pct": op.best_pct,
+                    "card": op.card, "checks": op.checks,
                     "spotted": op.spotted,
                     "label": self.label(op.arb), "sport_key": op.arb.sport_key,
                     "event_id": op.arb.event_id, "commence_time": getattr(op.arb, "commence_time", ""),
@@ -1775,8 +2241,9 @@ class Alerter:
         op = OpenArb(arb, saved["first_seen"], now, max(saved.get("best_pct", 0), self.value(arb)),
                      message_id=saved.get("message_id"), url=saved.get("url", ""),
                      alerted_pct=saved.get("alerted_pct", self.value(arb)),
+                     pinged_pct=saved.get("pinged_pct", saved.get("alerted_pct", self.value(arb))),
                      card=self.card_hash(arb, saved["first_seen"]), checks=saved.get("checks", 1),
-                     spotted=saved.get("spotted") or 0.0)
+                     spotted=saved.get("spotted") or 0.0, sent=True)
         self.open[arb.key] = op
         if saved.get("card") != op.card and op.message_id:
             self._discord(self.payload(arb, first_seen=op.first_seen), op.message_id, op.url)
@@ -1837,8 +2304,10 @@ class Alerter:
 
     def capped(self, item, now: float) -> str:
         """Why an hourly cap holds this new alert back: "capped" (its own kind's cap), "live cap"
-        (the cap all live alerts share), or "" when both have room (the slots are then taken)."""
+        (the cap all live alerts share), or "" when both have room (the slots are then taken, and noted in
+        self._slots so an alert that never goes out can give them back)."""
         live = self.live_cap if getattr(item, "is_live", False) and self.live_cap else None
+        self._slots = []
         if self.max_per_hour:
             self.posted_at[:] = [t for t in self.posted_at if now - t < 3600]   # in place: it may be shared
             if len(self.posted_at) >= self.max_per_hour:
@@ -1847,8 +2316,10 @@ class Alerter:
             return "live cap"
         if self.max_per_hour:
             self.posted_at.append(now)
+            self._slots.append((self.posted_at, now))
         if live is not None:
             live.times.append(now)
+            self._slots.append((live.times, now))
         return ""
 
     def reping_waits(self, item, op: OpenArb, age: float | None, now: float) -> str:
@@ -1881,6 +2352,8 @@ class Alerter:
         self.held_counts[why] = self.held_counts.get(why, 0) + 1
         if self.on_held:
             self.on_held(item, why, now)
+        if self.on_candidate and why != "waiting":
+            self.on_candidate(item, why, now)
         if not self.log_held or why == "waiting" or not self.log_path():
             return
         last, self.held_logged[(item.key, why)] = self.held_logged.get((item.key, why)), now
@@ -1942,11 +2415,12 @@ class Alerter:
             return None
         url = url or self.cfg.webhook_url
         try:
-            if message_id:
+            if message_id:   # (an edit has no retry: a long "slow down" is waited out, as for status messages)
                 _webhook(url, payload, "PATCH", message_id)
                 return message_id
-            msg = _webhook(url, payload)
-            self.send_retryable = not msg   # rate-limited three times: Discord never took it
+            # A new alert's post: a longer wait than DISCORD_MAX_WAIT_SECONDS isn't waited out, the next check sends it.
+            msg = _webhook(url, payload, max_wait=self.cfg.discord_max_wait_seconds)
+            self.send_retryable = not msg   # rate-limited (3 times, or for too long): Discord never took it
             return msg.get("id") if msg else None
         except Exception as e:  # keep scanning even if Discord hiccups
             print(f"  ! Discord send failed: {e}", file=sys.stderr)
@@ -1956,11 +2430,63 @@ class Alerter:
             self.send_retryable = isinstance(e, urllib.error.URLError)
             return message_id
 
+    def data_age(self, item, fetched: dict[str, float] | None) -> float | None:
+        """Seconds since the odds this alert comes from were fetched (fetched: {event id: time.time() of the
+        fetch}, see fetched_at); None when that isn't known (the demo, tests), and then it's never held for it."""
+        t = fetched.get(getattr(item, "event_id", "")) if fetched else None
+        return None if t is None else max(0.0, time.time() - t)
+
+    def too_old(self, item, age: float | None) -> bool:
+        """Are these odds too old to post on now? SEND_MAX_DELAY_SECONDS before the game,
+        LIVE_SEND_MAX_DELAY_SECONDS once it's live (0 = no limit)."""
+        limit = (self.cfg.live_send_max_delay_seconds if getattr(item, "is_live", False)
+                 else self.cfg.send_max_delay_seconds)
+        return bool(limit) and age is not None and age > limit
+
+    def defer(self, op: OpenArb, age: float, now: float) -> None:
+        """Hold a pinging post whose odds are too old by now. The alert stays open and unsent; the next check
+        that finds it again sends it on its fresh odds (so only if it still qualifies then), and one that
+        doesn't find it closes it, never sent."""
+        op.retry = op.deferred = True
+        self.held_counts["old data"] = self.held_counts.get("old data", 0) + 1
+        if self.on_candidate:
+            self.on_candidate(op.arb, "deferred", now)
+        print(f"  ⏸ {self.label(op.arb)}: not sent, its odds were {_fmt_secs(age)} old by then "
+              f"(the next check looks again)", flush=True)
+
+    def not_taken(self, op: OpenArb) -> None:
+        """A post Discord didn't take (it asked the bot to wait longer than DISCORD_MAX_WAIT_SECONDS, or refused
+        it): the alert stays open and unsent, and the next check that finds it sends it. Counted for the console."""
+        self.held_counts["not sent"] = self.held_counts.get("not sent", 0) + 1
+        print(f"  ⏸ {self.label(op.arb)}: Discord didn't take it (busy or unreachable), not sent "
+              f"(the next check tries again)", flush=True)
+
+    def _went_out(self, op: OpenArb, now: float, fetched: dict[str, float] | None) -> None:
+        """An alert's post went out (or was printed, in a dry run): note how long after its odds were fetched,
+        then log it and follow it (markouts), unless that was done when its other card went out (a hand-over)."""
+        op.post_delay, op.deferred = self.data_age(op.arb, fetched), False
+        if self.on_candidate:
+            self.on_candidate(op.arb, "alerted", now, op.post_delay)
+        if not op.sent:
+            op.sent = True
+            if self.log_on_open:
+                self._log(op, now, None)
+            if self.on_open:
+                self.on_open(op.arb, op.first_seen)
+        self.stats["found"] += 1
+        if self.value(op.arb) > self.stats["best_pct"]:
+            self.stats["best_pct"], self.stats["best"] = self.value(op.arb), op.arb.matchup
+
     def handle(self, arbs: list[Arb], checked_sports: list[str] | None = None,
-               now: float | None = None, checked_events: "set[str] | Scope | None" = None) -> int:
+               now: float | None = None, checked_events: "set[str] | Scope | None" = None,
+               fetched: dict[str, float] | None = None) -> int:
         """Process one scan's arbs. checked_sports = sports whose odds were just fetched;
         open arbs in those sports that weren't found again are closed. checked_events narrows that
-        to the games (event ids) or, as a Scope, the bet types and games that were checked."""
+        to the games (event ids) or, as a Scope, the bet types and games that were checked.
+        fetched: when each game's odds were fetched ({event id: time.time()}): a new alert or a much better
+        price's re-alert isn't posted on odds older than SEND_MAX_DELAY_SECONDS (live:
+        LIVE_SEND_MAX_DELAY_SECONDS) by the time it's ready; the next check that finds it sends it then.
+        An alert is logged (bets) and followed (markouts) once its post went out."""
         now = now or time.time()
         new = 0
         seen = set()
@@ -1969,29 +2495,48 @@ class Alerter:
             fresh_age = getattr(arb, "age", None)   # (before a restored card puts back the age it was sent with)
             cur = self.open.get(arb.key) or self._restore(arb, now)
             handed = self.handed.pop(arb.key, None)
+            last_pct = self.handed_pct.pop(arb.key, None)
             if cur is None and handed is None and (why := self.capped(arb, now)):
                 self.note_held(arb, why, now)
                 continue  # an hourly cap is full; the best go first, so the best already went out
             if cur is None:
-                print(self.text(arb), flush=True)
                 first = handed or now
                 found = getattr(arb, "found", ())   # live: the checks that confirmed it count too
-                op = OpenArb(arb, first, now, self.value(arb), alerted_pct=self.value(arb),
+                # A bet handed over from its other card (+EV <-> outlier) is the same bet: like any re-alert,
+                # it pings only when its edge beats the edge it was last alerted at by REALERT_JUMP_PCT.
+                # Otherwise its new card goes up quietly, and that edge stays the one a re-alert must beat.
+                # (Nor does a bet kept up under MIN_CONFIDENCE, handed over from its other card, ping.)
+                jumped = last_pct is None or self.value(arb) >= last_pct + self.cfg.realert_jump_pct
+                quiet = getattr(arb, "kept", False) or not jumped
+                # (A handed-over bet whose other card went out was logged and followed then.)
+                op = OpenArb(arb, first, now, self.value(arb),
+                             alerted_pct=self.value(arb) if jumped else last_pct,
                              url=self.webhook_for(arb), checks=found[1] if found else 1,
-                             spotted=found[0] if found else first)
-                # (A bet kept up under MIN_CONFIDENCE, handed over from its other card, doesn't ping.)
-                mention = "" if getattr(arb, "kept", False) else self.mention()
-                op.message_id = self._discord(self.payload(arb, mention, first_seen=first), url=op.url)
-                op.card, op.retry = self.card_hash(arb, first), op.message_id is None and self.send_retryable
+                             spotted=found[0] if found else first, quiet=quiet,
+                             sent=handed is not None and arb.key not in self.handed_unsent,
+                             pinged_pct=last_pct, slots=tuple(self._slots) if handed is None else (),
+                             prev=self.handed_msg.pop(arb.key, ()))
                 self.open[arb.key] = op
-                if self.log_on_open and handed is None:   # a handed-over bet was logged already
-                    self._log(op, now, None)
-                if self.on_open and handed is None:       # ...and is already being followed
-                    self.on_open(arb, first)
-                self.stats["found"] += 1
-                if self.value(arb) > self.stats["best_pct"]:
-                    self.stats["best_pct"], self.stats["best"] = self.value(arb), arb.matchup
-                new += 1
+                age = self.data_age(arb, fetched)
+                if self.too_old(arb, age):
+                    self.defer(op, age, now)
+                else:
+                    print(self.text(arb), flush=True)
+                    if not jumped:
+                        print(f"  ↔ {self.label(arb)}: same bet as its other card, no new ping (not "
+                              f"{self.cfg.realert_jump_pct:g}+ points better than the {last_pct:.2f}% alerted)",
+                              flush=True)
+                    op.message_id = self._discord(self.payload(arb, "" if quiet else self.mention(),
+                                                               first_seen=first), url=op.url)
+                    op.retry = op.message_id is None and self.send_retryable
+                    if op.retry:
+                        self.not_taken(op)
+                op.card = self.card_hash(arb, first)
+                if not op.retry:
+                    if not quiet:
+                        op.pinged_pct = self.value(arb)
+                    self._went_out(op, now, fetched)
+                    new += 1
             else:
                 self.carry(cur.arb, arb)
                 card = self.card_hash(arb, cur.first_seen)
@@ -2004,7 +2549,10 @@ class Alerter:
                           and not getattr(arb, "kept", False))
                 if not better:
                     cur.better = 0
-                wait = self.reping_waits(arb, cur, fresh_age, now) if better else ""
+                age = self.data_age(arb, fetched)
+                # (A re-alert on odds too old to post waits too: the card is edited, and the next check may send it.)
+                wait = ("old data" if self.too_old(arb, age) else self.reping_waits(arb, cur, fresh_age, now)
+                        ) if better else ""
                 if better and not wait:
                     # Edits don't ping your phone, so a much better price gets a fresh alert
                     # (showing how old ITS price is).
@@ -2017,10 +2565,17 @@ class Alerter:
                     if cur.message_id:
                         self._discord({"embeds": [{"title": "⬆️ Better price: see the newer alert below",
                                                    "color": 0x95A5A6}]}, cur.message_id, cur.url)
+                    cur.deferred = False
                     cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=cur.first_seen),
                                                    url=cur.url)
                     cur.card, cur.retry = card, cur.message_id is None and self.send_retryable
+                    if cur.retry:
+                        self.not_taken(cur)
+                    else:
+                        cur.pinged_pct = self.value(arb)
                     cur.alerted_pct = self.value(arb)
+                    if not cur.sent and not cur.retry:   # (an alert held back until now goes out as this one)
+                        self._went_out(cur, now, fetched)
                     new += 1
                 elif changed or cur.retry:
                     # (A live bet's better price that the live rules hold back: edited, no new ping yet.)
@@ -2030,19 +2585,32 @@ class Alerter:
                               flush=True)
                     if cur.message_id:
                         self._discord(self.payload(arb, first_seen=cur.first_seen), cur.message_id, cur.url)
+                    elif cur.retry and self.too_old(arb, age):
+                        self.defer(cur, age, now)   # this check's odds are too old by now as well: the next one
                     elif cur.retry:
-                        # The first post never reached Discord (refused, rate limited): send it
-                        # again, with the ping, and keep its id so edits and the GONE mark reach it.
+                        # The first post never reached Discord (refused, rate limited) or was held for old
+                        # odds: send it now, with the ping, and keep its id so edits and the GONE mark reach it.
                         # A live one only while its price is still fresh enough for a new live alert
-                        # (LIVE_MAX_AGE_ALERT); until then it waits (it's still open, so it's logged).
+                        # (LIVE_MAX_AGE_ALERT); until then it waits (still open, not logged until it goes out).
                         limit = self.cfg.live_max_age_alert
                         if not (getattr(arb, "is_live", False) and limit and (fresh_age is None or fresh_age > limit)):
                             if hasattr(arb, "age"):
                                 arb.age = fresh_age   # how old the price is now, when it really goes out
                                 card = self.card_hash(arb, cur.first_seen)
-                            cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=cur.first_seen),
-                                                           url=cur.url)
+                            if cur.deferred:   # (never shown: it was held before its first post)
+                                print(self.text(arb), flush=True)
+                            cur.deferred = False   # (from here, a post Discord doesn't take is "not sent")
+                            cur.message_id = self._discord(self.payload(arb, "" if cur.quiet else self.mention(),
+                                                                        first_seen=cur.first_seen), url=cur.url)
                             cur.retry = cur.message_id is None and self.send_retryable
+                            if cur.retry:
+                                self.not_taken(cur)
+                            else:
+                                if not cur.quiet:   # its ping is the alert: a re-alert must beat the edge it showed
+                                    cur.alerted_pct = cur.pinged_pct = self.value(arb)
+                                    cur.better = 0
+                                self._went_out(cur, now, fetched)
+                                new += 1
                     cur.card = card
 
         checked = set(checked_sports) if checked_sports is not None else None
@@ -2067,6 +2635,9 @@ class Alerter:
                     continue
                 self._drop_restored(key, "Ignore this one. The prices moved while the bot was restarting.")
         self.handed.clear()
+        self.handed_pct.clear()
+        self.handed_unsent.clear()
+        self.handed_msg.clear()
         self._expire_restored(now)
         self._save_state()
         return new
@@ -2074,6 +2645,20 @@ class Alerter:
     def _close(self, key: str, now: float) -> None:
         op = self.open.pop(key)
         lasted = now - op.first_seen  # first seen -> first check where it was gone
+        if op.prev and not op.message_id:
+            # Handed over, and gone before its own card went up: the old card points at an alert that never
+            # came, so it's the one marked GONE.
+            self._discord(self.payload(op.arb, gone_after=lasted), *op.prev)
+        if not op.sent:
+            # Never went out (held for old odds, or Discord never took it): not an alert. An arb is logged with
+            # why ("old data", "not sent"), so it isn't counted as alerted; a bet was never logged.
+            print(f"  ❌ gone before it was sent: {self.label(op.arb)}", flush=True)
+            for times, t in op.slots:   # the hourly-cap slots it took go back: nobody saw it
+                if t in times:
+                    times.remove(t)
+            if not self.log_on_open:
+                self._log(op, now, lasted, "old data" if op.deferred else "not sent")
+            return
         print(f"  ❌ gone after {_fmt_secs(lasted)}: {self.label(op.arb)}", flush=True)
         if op.message_id:
             self._discord(self.payload(op.arb, gone_after=lasted), op.message_id, op.url)
@@ -2082,7 +2667,7 @@ class Alerter:
         if not self.log_on_open:
             self._log(op, now, lasted)
 
-    def _log(self, op: OpenArb, now: float, lasted: float | None) -> None:
+    def _log(self, op: OpenArb, now: float, lasted: float | None, reason: str = "") -> None:
         if not self.log_path():
             return
         row = {
@@ -2090,6 +2675,7 @@ class Alerter:
             "gone_at": "" if lasted is None else _utc(now),
             "seconds_open": "" if lasted is None else round(lasted),
             **self.row(op),
+            **({"reason": reason} if reason else {}),
         }
         append_csv(self.log_path(), self.log_fields, row)
         if self.on_log:
@@ -2145,6 +2731,124 @@ class Status:
             self.low_warned = False
 
 
+def fail_reason(e: BaseException) -> str:
+    """A failed request in a few words, for a health message: "timeouts", "HTTP 503", "can't connect"."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP {e.code}"
+    if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError) \
+            or "timed out" in str(e).lower():
+        return "timeouts"
+    if isinstance(e, (urllib.error.URLError, ConnectionError)):
+        return "can't connect"
+    return "bad answers"
+
+
+def kalshi_down_since() -> float | None:
+    """When Kalshi stopped answering (unreachable, or it asked the bot to slow down), if it hasn't answered
+    since: time.time(); None while it's fine."""
+    return _KALSHI_STATE.get("down_since")
+
+
+class Health:
+    """Outage messages in the health channel (HEALTH_ALERTS), one per outage and one when it's over:
+    - the Odds API not answering for a sport for ODDS_DOWN_MINUTES (that sport has no alerts meanwhile; its
+      open alerts stay up, since nothing looked at them);
+    - the sharp book (SHARP_BOOKS) missing from every game of a sport whose games other books price, for
+      SHARP_DOWN_MINUTES: missing from the answers, not just an old price (an old stamp is normal). While it
+      lasts, the sport is in sharp_down: its main-line +EV has no fair odds anyway, Kalshi-only bets wait,
+      and props without a sharp price are at most medium confidence (find_evs);
+    - Kalshi unreachable for KALSHI_DOWN_MINUTES while there are games before kickoff to use it on.
+    Each check is off at 0 minutes; HEALTH_ALERTS=false keeps sharp_down working, without the messages."""
+
+    def __init__(self, cfg: Config, status: "Status"):
+        self.cfg, self.status = cfg, status
+        self.odds_down: dict[str, list] = {}     # sport -> [first failure, why, said, last failure]
+        self.sharp_gone: dict[str, float] = {}   # sport -> since when no sharp book prices any of its games
+        self.sharp_last: dict[str, float] = {}   # sport -> when that was last seen
+        self.sharp_down: set[str] = set()        # ...for SHARP_DOWN_MINUTES or more
+        self.kalshi_said: float | None = None    # the start of the Kalshi outage that was said
+
+    def say(self, text: str) -> None:
+        if self.cfg.health_alerts:
+            self.status.send(text)
+
+    def _clock(self, t: float) -> str:
+        return datetime.fromtimestamp(t, ZoneInfo(self.cfg.timezone)).strftime("%-I:%M %p")
+
+    def odds(self, tried, answered: set[str], why: dict[str, str], now: float | None = None) -> None:
+        """One pass's Odds API requests: the sports it asked for (main lines or props), the ones that
+        answered at least once, and why the others failed. A failure more than twice ODDS_DOWN_MINUTES after
+        the last one (the sport wasn't asked for in between: overnight) starts the clock again."""
+        now = now or time.time()
+        limit = self.cfg.odds_down_minutes * 60
+        for sport in sorted(set(tried)):
+            if sport in answered:
+                down = self.odds_down.pop(sport, None)
+                if down and down[2]:
+                    self.say(f"✅ Odds API back for {short(sport)} after {round((now - down[0]) / 60)} min.")
+                continue
+            down = self.odds_down.setdefault(sport, [now, "no answer", False, now])
+            if not down[2] and now - down[3] > 2 * limit:
+                down[0] = now
+            down[1], down[3] = why.get(sport, down[1]), now
+            if limit and not down[2] and now - down[0] >= limit:
+                down[2] = True
+                self.say(f"⚠️ Odds API not answering for {short(sport)} since {self._clock(down[0])} ({down[1]}): "
+                         f"no {short(sport)} alerts until it's back. Open alerts stay up.")
+
+    def sharp(self, events: list[dict], checked, now: float | None = None) -> None:
+        """One pass's main-line odds, for the sports that answered: is the sharp book in them?"""
+        now = now or time.time()
+        refs = set(sharp_refs(self.cfg))
+        limit = self.cfg.sharp_down_minutes * 60
+        if not refs or not limit:
+            self.sharp_gone.clear()
+            self.sharp_down.clear()
+            return
+        name = " / ".join(_title(k) for k in sharp_refs(self.cfg))
+        for sport in sorted(set(checked)):
+            priced = {bm["key"] in refs for ev in events if ev.get("sport_key") == sport
+                      for bm in ev.get("bookmakers", []) if any(m.get("outcomes") for m in bm.get("markets", []))}
+            if True in priced:   # it prices at least one game: up
+                self.sharp_gone.pop(sport, None)
+                self.sharp_last.pop(sport, None)
+                if sport in self.sharp_down:
+                    self.sharp_down.discard(sport)
+                    self.say(f"✅ {name} prices back for {short(sport)}: +EV carries on as normal.")
+                continue
+            if not priced:
+                continue   # no book prices anything there: says nothing about the sharp book
+            since = self.sharp_gone.setdefault(sport, now)
+            if sport not in self.sharp_down and now - self.sharp_last.get(sport, now) > 2 * limit:
+                since = self.sharp_gone[sport] = now   # (last seen missing long ago, not since: a new look)
+            self.sharp_last[sport] = now
+            if sport not in self.sharp_down and now - since >= limit:
+                self.sharp_down.add(sport)
+                self.say(f"⚠️ No {name} prices for {short(sport)} for {round((now - since) / 60)} min (other books "
+                         f"have them): {short(sport)} main-line +EV is paused (its open +EV cards close, and post again "
+                         f"once {name} is back), props without a {name} price go out at medium confidence at most, "
+                         f"arbs and outliers carry on.")
+
+    def kalshi(self, pregame: bool, now: float | None = None) -> None:
+        """After a pass's Kalshi lookups: has Kalshi been unreachable for KALSHI_DOWN_MINUTES? pregame: the
+        pass had games before kickoff in a sport Kalshi lists (only then is it asked)."""
+        now = now or time.time()
+        since = kalshi_down_since()
+        if since is None:
+            if self.kalshi_said is not None:
+                self.say(f"✅ Kalshi reachable again after {round((now - self.kalshi_said) / 60)} min: moneylines are "
+                         f"checked against it again.")
+                self.kalshi_said = None
+            return
+        limit = self.cfg.kalshi_down_minutes * 60
+        if (self.kalshi_said is None and limit and pregame and kalshi_useful(self.cfg)
+                and now - since >= limit):
+            self.kalshi_said = since
+            name = " / ".join(_title(k) for k in sharp_refs(self.cfg)) or "the sharp book"
+            self.say(f"⚠️ Kalshi unreachable for {round((now - since) / 60)} min: moneyline +EV goes out on "
+                     f"{name} alone.")
+
+
 # --------------------------------------------------------------------------- +EV bets
 
 def ev_key(event_id: str, market: str, line, outcome: str) -> str:
@@ -2177,7 +2881,16 @@ class EVBet:
     stake: float = 0.0
     sources_used: int = 1
     sources_total: int = 1
-    unit_size: float = 0.0
+    # The sharp books' own fair win chance for this side and whose it is (with Kalshi blended in, fair_prob
+    # isn't theirs alone); None / "" when no sharp book priced the line.
+    sharp_prob: float | None = None
+    sharp_name: str = ""
+    left_out: tuple[str, float] | None = None   # a reference left out as the odd one out: (its name, points off)
+    kalshi_only: bool = False        # priced by Kalshi alone: no sharp book lists this moneyline (KALSHI_ONLY)
+    unit_size: float = 0.0           # dollars per unit (Config.unit()), for the card's "$15 (1.5u)"
+    # The fair-odds references that apply to this line (top trust first: SHARP_BOOKS, then Kalshi on a
+    # pre-game moneyline), each with its no-vig win chance for this side; None = no usable price.
+    refs: list[tuple[str, float | None]] = field(default_factory=list)
     sharp_quotes: list[tuple[str, list[float]]] = field(default_factory=list)  # (book, [this side, other side(s)])
     # Every book: (book, price, EV%, link, ok). ok = passes the +EV filters (odds cap, not a stale line).
     board: list[tuple[str, float, float, str, bool]] = field(default_factory=list)
@@ -2201,6 +2914,10 @@ class EVBet:
     confirm: tuple = ()              # ...that source: (its name on the card, its win chance, the usual edge floor,
                                      # the edge by the lower of the two chances); no chance or edge (None): the
                                      # card is up and the source has no price this check
+    alt: bool = False                # the price is on the book's alternate line at this point (an "X+" ladder),
+                                     # not its main one: the same bet, priced from main lines (book_offers)
+    alt_books: set[str] = field(default_factory=set)   # books on the board whose price is their alternate line's
+    hedge_alt: set[str] = field(default_factory=set)   # hedge outcomes priced on an alternate line
 
     def worst_ok_price(self, min_edge_pct: float = OK_EDGE_PCT) -> float:
         """Lowest price that still leaves min_edge_pct of edge against the fair price."""
@@ -2208,8 +2925,7 @@ class EVBet:
 
     @property
     def stake_label(self) -> str:
-        units = f" ({self.stake / self.unit_size:.2g}u)" if self.unit_size > 0 else ""
-        return f"{money(self.stake)}{units}"
+        return stake_text(self.stake, self.unit_size)
 
     @property
     def ev_pct(self) -> float:
@@ -2231,7 +2947,8 @@ class EVBet:
     def fingerprint(self) -> str:
         """Everything on the card that can change; a different value means the card gets edited."""
         hedge = ",".join(f"{o}:{bk}@{pr}" for o, bk, pr, _ in self.hedge)
-        return f"{self.key}|{self.book}@{self.price}|{self.fair_prob:.3f}|{self.stake}|{hedge}"
+        return (f"{self.key}|{self.book}@{self.price}|{self.fair_prob:.3f}|{self.stake}|{hedge}"
+                + ("|alt" if self.alt else ""))
 
     @property
     def pick(self) -> str:
@@ -2293,11 +3010,74 @@ def round_stake(stake: float, cap: float, cfg: Config) -> float:
     return min(r, float(math.floor(cap)) if cap >= 1 else round(cap, 2))
 
 
-def sharp_fair(ev: dict, cfg: Config, now: datetime, is_live: bool):
-    """Fair (no-vig) probabilities per line for one game, from the sharp book(s).
+def source_weight(cfg: Config, source: str, prop: bool = False) -> float:
+    """A fair-odds reference's weight in a blend: its SHARP_WEIGHTS (props: SHARP_WEIGHTS_PROPS, when
+    set), else its trust-order default (SOURCE_WEIGHTS, OTHER_SOURCE_WEIGHT). 0 = not a reference at all."""
+    mine = cfg.sharp_weights if not prop or cfg.sharp_weights_props is None else cfg.sharp_weights_props
+    return mine.get(source, SOURCE_WEIGHTS.get(source, OTHER_SOURCE_WEIGHT))
 
-    Returns (fair, sharp_name, n_used, raw_src, titles): fair[(market, line)][outcome] = prob.
-    """
+
+def sharp_refs(cfg: Config, prop: bool = False) -> list[str]:
+    """The SHARP_BOOKS that are fair-odds references for main lines (prop: props), as listed: every one
+    with a weight over 0."""
+    return [sk for sk in _csv(cfg.sharp_books) if source_weight(cfg, sk, prop) > 0]
+
+
+def top_trust_first(srcs, weights: dict[str, float]) -> list[str]:
+    """Fair-odds references, most trusted first: by weight, a tie by the trust order (SOURCE_WEIGHTS: Pinnacle
+    first), then as listed. The first is the one blend_refs never leaves out."""
+    return sorted(srcs, key=lambda s: (-weights[s], -SOURCE_WEIGHTS.get(s, OTHER_SOURCE_WEIGHT)))
+
+
+def blend_refs(probs: dict[str, dict[str, float]], weights: dict[str, float], agree_pts: float | None,
+               out_pts: float | None = None) -> tuple[dict[str, float] | None, list[str], tuple[str, float] | None]:
+    """One fair price from several references' no-vig win chances (source -> outcome -> chance, the same
+    outcomes each, top trust first), weighted, the weights shared out over the ones here.
+    out_pts: with 3 or more, the one farthest from the middle (median) of the others is left out when
+      it's more than this many win-% points away: one at most, the less trusted of a tie, and never the
+      top one (if that's the odd one out, there's no fair price at all). None: nobody is left out.
+      Nothing is remembered: a source left out counts again on the next check it's back within it.
+    agree_pts: with two or more (after that), they must all be within this many win-% points of each
+      other, or there's no fair price (None: not checked).
+    Returns (the fair price or None, the sources in it, (the one left out, its points off) or None)."""
+    srcs = list(probs)
+    names = list(probs[srcs[0]])
+    left_out = None
+    if out_pts is not None and len(srcs) >= 3:
+        off = {s: round(max(abs(probs[s][n] - statistics.median(probs[o][n] for o in srcs if o != s))
+                            for n in names) * 100, 6) for s in srcs}
+        worst = max(off.values())
+        if worst > out_pts:
+            odd = [s for s in srcs if off[s] == worst][-1]   # (a tie: the less trusted one goes)
+            if odd == srcs[0]:
+                return None, [], None   # the most trusted source is the odd one out: no fair price
+            srcs.remove(odd)
+            left_out = (odd, worst)
+    if agree_pts is not None and len(srcs) >= 2 and any(   # (in points, rounded as above: 3.0 apart is within 3)
+            round((max(probs[s][n] for s in srcs) - min(probs[s][n] for s in srcs)) * 100, 6) > agree_pts
+            for n in names):
+        return None, srcs, left_out   # the references disagree: no reliable fair price for this line
+    total = sum(weights[s] for s in srcs)
+    return {n: sum(probs[s][n] * weights[s] for s in srcs) / total for n in names}, srcs, left_out
+
+
+class SharpFair(NamedTuple):
+    """sharp_fair's answer for one game, per line: (market, line)."""
+    fair: dict[tuple, dict[str, float]]                # outcome -> the sharp books' blended no-vig win chance
+    names: dict[tuple, str]                            # whose: "Pinnacle", "Pinnacle + Betfair"
+    n_used: dict[tuple, int]                           # how many sharp books that is
+    raw_src: dict[tuple, dict[str, dict[str, float]]]  # each sharp book's prices (for display)
+    titles: dict[str, str]                             # book key -> its name
+    used: dict[tuple, dict[str, dict[str, float]]]     # each book in the fair price: its no-vig chances (top trust first)
+    left_out: dict[tuple, tuple[str, float]]           # a book left out as the odd one out: (its key, points off)
+
+
+def sharp_fair(ev: dict, cfg: Config, now: datetime, is_live: bool) -> SharpFair:
+    """Fair (no-vig) probabilities per line for one game, from the sharp book(s), blended by
+    source_weight (fair[(market, line)][outcome] = prob). A book with a weight of 0 for the line isn't
+    used at all: a line only it prices has no fair price (so a prop falls back to the other books).
+    Three or more that price a line: an odd one out is left out (OUTLIER_SOURCE_PTS, see blend_refs).
+    The rest must agree within SHARP_DISAGREE_PCT (props: the _PROP_ settings)."""
     sharp = _csv(cfg.sharp_books)
     books = {bm["key"]: bm for bm in ev.get("bookmakers", [])}
     # Each sharp book's no-vig probabilities, per line (and its raw prices, for display).
@@ -2310,8 +3090,9 @@ def sharp_fair(ev: dict, cfg: Config, now: datetime, is_live: bool):
             continue
         titles[sk] = bm.get("title", sk)
         for mkt in bm.get("markets", []):
-            if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
-                continue
+            if is_alt(mkt["key"]) or not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"]),
+                                                  sharp=True):
+                continue   # (alternate lines are never a fair price: see book_offers)
             groups: dict[tuple, dict[str, float]] = {}
             for oc in mkt.get("outcomes", []):
                 price = float(oc.get("price") or 0)
@@ -2319,7 +3100,7 @@ def sharp_fair(ev: dict, cfg: Config, now: datetime, is_live: bool):
                     k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
                     groups.setdefault(k, {})[oc["name"]] = price
             for k, outs in groups.items():
-                if len(outs) >= 2:
+                if len(outs) >= 2 and source_weight(cfg, sk, is_prop(k[1])) > 0:
                     names = list(outs)
                     raw_src.setdefault(k, {})[sk] = outs
                     per_src.setdefault(k, {})[sk] = dict(
@@ -2329,19 +3110,26 @@ def sharp_fair(ev: dict, cfg: Config, now: datetime, is_live: bool):
     fair: dict[tuple, dict[str, float]] = {}
     sharp_name: dict[tuple, str] = {}
     n_used: dict[tuple, int] = {}
+    used: dict[tuple, dict[str, dict[str, float]]] = {}
+    left_out: dict[tuple, tuple[str, float]] = {}
     for k, srcs in per_src.items():
         first = next(iter(srcs.values()))
         same = {sk: pr for sk, pr in srcs.items() if set(pr) == set(first)}  # same outcomes
-        if len(same) >= 2 and any(
-                max(pr[n] for pr in same.values()) - min(pr[n] for pr in same.values())
-                > cfg.sharp_disagree_pct / 100 for n in first):
-            continue  # the sharps disagree: no reliable fair price for this line
-        weights = {sk: cfg.sharp_weights.get(sk, 1.0) for sk in same}
-        total_w = sum(weights.values()) or 1.0
-        fair[k] = {n: sum(same[sk][n] * w for sk, w in weights.items()) / total_w for n in first}
-        sharp_name[k] = " + ".join(titles[sk] for sk in same)
-        n_used[k] = len(same)
-    return fair, sharp_name, n_used, raw_src, titles
+        prop = is_prop(k[1])
+        weights = {sk: source_weight(cfg, sk, prop) for sk in same}
+        top_first = top_trust_first(same, weights)
+        probs, srcs_in, out = blend_refs({sk: same[sk] for sk in top_first}, weights,
+                                         cfg.sharp_disagree_prop_pct if prop else cfg.sharp_disagree_pct,
+                                         cfg.outlier_source_prop_pts if prop else cfg.outlier_source_pts)
+        if probs is None:
+            continue
+        fair[k] = probs
+        sharp_name[k] = " + ".join(titles[sk] for sk in same if sk in srcs_in)
+        n_used[k] = len(srcs_in)
+        used[k] = {sk: same[sk] for sk in top_first if sk in srcs_in}
+        if out:
+            left_out[k] = out
+    return SharpFair(fair, sharp_name, n_used, raw_src, titles, used, left_out)
 
 
 @functools.lru_cache(maxsize=1 << 16)
@@ -2381,8 +3169,8 @@ def consensus_fair(ev: dict, cfg: Config, now: datetime, is_live: bool, skip: se
         if bm["key"] in skip or (out_vote is not None and _vote(bm["key"]) == out_vote):
             continue
         for mkt in bm.get("markets", []):
-            if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
-                continue
+            if is_alt(mkt["key"]) or not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
+                continue   # (alternate lines don't vote: each book hangs them off its own main line)
             for oc in mkt.get("outcomes", []):
                 price = float(oc.get("price") or 0)
                 if price > 1.0:
@@ -2597,10 +3385,22 @@ class PriceHistory:
         self.sharp = {k: v for k, v in self.sharp.items() if v[1] > now}
 
 
+def candidate(ev: dict, k: tuple, name: str, point, book: str, price: float, fair_p: float, src: str,
+              kalshi=None) -> SimpleNamespace:
+    """A price the candidate log notes before a bet was made of it (find_evs, find_outliers): the same
+    fields as an EVBet's that the log reads."""
+    return SimpleNamespace(key=ev_key(ev["id"], k[0], k[1], name), event_id=ev["id"],
+                           sport=ev.get("sport_title", ev.get("sport_key", "")), sport_key=ev.get("sport_key", ""),
+                           matchup=f"{ev['away_team']} @ {ev['home_team']}", market=k[0], line=k[1], outcome=name,
+                           point=point, book=book, price=price, fair_prob=fair_p, sharp_book=src, confidence="",
+                           kalshi=kalshi, refs=[], ev_pct=(fair_p * price - 1) * 100)
+
+
 def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
              history: SharpHistory | None = None, kalshi: dict | None = None,
              prices: PriceHistory | None = None, keep: set[str] | frozenset = frozenset(),
-             confirm_misses: dict[str, int] | None = None) -> list[EVBet]:
+             confirm_misses: dict[str, int] | None = None, alt_seen: set | None = None,
+             sharp_down: set[str] | frozenset = frozenset(), rejects: list | None = None) -> list[EVBet]:
     """+EV prices vs the sharp book's fair odds. With CONSENSUS_MIN_BOOKS (props), a line no sharp
     prices is judged against the median of the OTHER books instead (the book being judged, and its
     sister books, never count toward its own fair price), and rated on how much they agree.
@@ -2622,11 +3422,26 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
       whatever MIN_CONFIDENCE says. Every other check still applies. One that clears MIN_EV_PCT is a
       normal bet. One in `keep` whose only misses are CONFIRM_MISSING (a source missing this check,
       not disagreeing) stays up quietly. confirm_misses, when given, counts the ones that cleared the
-      lower edge but not the rest, by why (for the console)."""
+      lower edge but not the rest, by why (for the console).
+    Kalshi (pre-game moneylines, both teams with a usable quote): blended into the sharp books' fair
+      odds (KALSHI_BLEND), or the fair odds by itself on a game no sharp book lists (KALSHI_ONLY).
+    Alternate lines are prices to bet only, at exactly a line a fair price is for (book_offers): bet.alt.
+      alt_seen, when given, collects the ones that had a fair price at their line (for the console).
+    sharp_down: sports the sharp book has been missing from for SHARP_DOWN_MINUTES (Health): no Kalshi-only
+      bets there, and a line no sharp prices is at most medium confidence.
+    rejects, when given, collects (candidate, why) for the candidate log (CANDIDATE_LOG_FILE): each bet that
+      cleared the edge and a quality check then stopped, and the best price on each side that came within 1
+      point of the bar without clearing it ("under bar")."""
     if not cfg.ev_enabled:
         return []
     now = now or datetime.now(timezone.utc)
     sharp = _csv(cfg.sharp_books)
+    refs_for = {prop: sharp_refs(cfg, prop) for prop in (False, True)}   # the ones with a weight, main lines / props
+    # Games a sharp book lists a moneyline for, and the sports it does that in here: there it's up, so a
+    # game it doesn't list is one it skipped, not an outage (a Kalshi-only bet needs that).
+    sharp_ml = {ev["id"] for ev in events for bm in ev.get("bookmakers", []) if bm["key"] in refs_for[False]
+                and any(m.get("key") == "h2h" and m.get("outcomes") for m in bm.get("markets", []))}
+    sharp_up = {ev.get("sport_key") for ev in events if ev["id"] in sharp_ml}
     sharp_title = sharp[0].title() if sharp else "Sharp"
     allowed = cfg.ev_allowed()
     out: list[EVBet] = []
@@ -2635,6 +3450,10 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
         if confirm_misses is not None:
             confirm_misses[why] = confirm_misses.get(why, 0) + 1
 
+    def reject(item, why: str) -> None:   # (for the candidate log)
+        if rejects is not None:
+            rejects.append((item, why))
+
     for ev in events:
         is_live = _parse_time(ev["commence_time"]) <= now
         if (cfg.live_only and not is_live) or (is_live and not cfg.ev_live):
@@ -2642,8 +3461,9 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
         books = {bm["key"]: bm for bm in ev.get("bookmakers", [])}
         hours = (_parse_time(ev["commence_time"]) - now).total_seconds() / 3600
 
-        fair, sharp_name, n_used, raw_src, titles = sharp_fair(ev, cfg, now, is_live)
-        n_total = {k: len(sharp) for k in fair}
+        sf = sharp_fair(ev, cfg, now, is_live)
+        fair, sharp_name, n_used, raw_src, titles = sf[:5]
+        n_total = {k: len(refs_for[is_prop(k[1])]) for k in fair}
         # The rest of the market, as a sanity check on the sharp's price.
         market = consensus_fair(ev, replace(cfg, consensus_min_books=3), now, is_live, set(sharp), sisters=False)
         if history:
@@ -2665,58 +3485,131 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
         floor = cfg.confirmed_floor(ev.get("sport_key", "")) if not is_live and hours <= cfg.confident_hours else 0.0
         own: dict[str, dict[tuple, Consensus]] = {}   # book -> the other books' consensus (it's left out)
         agreeing: dict[str, dict[tuple, Consensus]] = {}   # book -> the consensus that may confirm its bet
+        # Kalshi's own price, a fair-odds reference on a pre-game moneyline when both teams have a usable
+        # quote (kalshi_fair's spread, size and add-up checks): {team: its win chance}.
+        ml, quotes = ("h2h", None), (kalshi or {}).get(ev["id"], {})
+        kp = ({t: quotes[t][0] for t in (ev["home_team"], ev["away_team"])}
+              if not is_live and kalshi_applies(cfg, ev.get("sport_key", ""), "h2h", is_live)
+              and ev["home_team"] in quotes and ev["away_team"] in quotes else None)
+        # KALSHI_BLEND: it goes into that line's fair odds with the sharp books' (by weight), for the edge,
+        # the stake and the card only. A bet at Kalshi keeps the sharps' (Kalshi can't confirm itself),
+        # and every check below still uses the sharps' own price.
+        # With 3+ references (2+ sharp books and Kalshi) an odd one out is left out, as in sharp_fair (only
+        # if sharp_fair left none out: one per line), and the rest must agree, or the line is skipped. With
+        # Kalshi and one sharp book, Kalshi's gap to it (below) is the test, as before.
+        blend: dict[tuple, dict[str, float]] = {}
+        blend_name: dict[tuple, str] = {}
+        blend_out: dict[tuple, tuple[str, float]] = {}   # one the blend left out (Kalshi, or a sharp book)
+        blend_dead: set[tuple] = set()   # lines the references with Kalshi in disagree on: no fair price, but a
+                                         # bet at Kalshi keeps the sharps' own (Kalshi can't veto its own price)
+        if cfg.kalshi_blend and kp and ml in fair and set(fair[ml]) == set(kp) and source_weight(cfg, "kalshi") > 0:
+            refs_ml = {**sf.used[ml], "kalshi": kp}
+            weights = {s: source_weight(cfg, s) for s in refs_ml}
+            mixed, srcs_in, odd = blend_refs({s: refs_ml[s] for s in top_trust_first(refs_ml, weights)},
+                                             weights, cfg.sharp_disagree_pct if len(refs_ml) >= 3 else None,
+                                             None if ml in sf.left_out else cfg.outlier_source_pts)
+            if mixed is None:
+                blend_dead.add(ml)   # they disagree: no fair price for this line (except a bet at Kalshi's)
+            else:
+                if odd:
+                    blend_out[ml] = odd
+                if "kalshi" in srcs_in:
+                    blend[ml] = mixed
+                    blend_name[ml] = " + ".join([titles[sk] for sk in sharp if sk in sf.used[ml] and sk in srcs_in]
+                                                + ["Kalshi"])
+        # KALSHI_ONLY: a moneyline no sharp book lists at all (absent, not just old: an old stamp means a market
+        # taken down) in a sport it's up in, priced by Kalshi alone. The market check below then compares it
+        # with 3+ sportsbooks, exchanges left out (Kalshi mustn't check itself); never a bet at Kalshi.
+        alone: dict[tuple, dict[str, float]] = {}
+        alone_check = None
+        if (cfg.kalshi_only and kp and ml not in fair and ev["id"] not in sharp_ml and ev.get("sport_key") in sharp_up
+                and ev.get("sport_key") not in sharp_down and source_weight(cfg, "kalshi") > 0):
+            alone_check = consensus_fair(ev, replace(cfg, consensus_min_books=3), now, is_live, set(sharp) | EXCHANGES,
+                                         sisters=False).get(ml)
+            if alone_check is not None and set(alone_check.probs) == set(kp):
+                alone[ml] = kp
 
         # Every soft-book price that beats fair by enough (and every price, for the board).
         offers: dict[tuple, list[tuple]] = {}
+        near: dict[tuple, tuple] = {}   # (line, side) -> (price, candidate): the best price just under the bar
         boards: dict[tuple, list[tuple[str, float, float, str, bool]]] = {}
+        alt_board: dict[tuple, set[str]] = {}   # (line, side) -> the books whose board price is an alternate line's
         for key, bm in books.items():
             if key in sharp or (allowed and key not in allowed) or not cfg.bettable(key, ev):
                 continue
             if cfg.consensus_min_books:
                 own[key] = consensus_fair(ev, cfg, now, is_live, set(sharp), leave_out=key)
-            for mkt in bm.get("markets", []):
-                if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
+            mains = None   # its main lines' prices, {(line, side): price}, when an alternate line is its offer
+            # Its fresh prices, one per line and side (an alternate line at the same point: the better price).
+            for mkt, oc, k, alt, stamp in book_offers(bm, ev, now, is_live, cfg):
+                if not cfg.alerts_side(k[1], oc["name"]):
+                    continue   # a prop Under with PROP_SIDES=over (the fair odds above still used it)
+                if k in blend_dead and key != "kalshi":
                     continue
-                # When the book last changed the price (unknown for a prop: one stamp for every player).
-                stamp = (mkt.get("last_update") or bm.get("last_update")) if _one_line(mkt, ev["home_team"]) else None
-                for oc in mkt.get("outcomes", []):
-                    k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
-                    price = float(oc.get("price") or 0)
-                    cons = None if k in fair else own.get(key, {}).get(k)   # no sharp price: the other books
-                    p = fair[k].get(oc["name"]) if k in fair else cons.probs.get(oc["name"]) if cons else None
-                    if p is None or price <= 1.0:
-                        continue
-                    ev_pct = (p * price - 1) * 100
-                    link = oc.get("link") or mkt.get("link") or bm.get("link") or ""
-                    ok = price <= cfg.ev_max_odds and ev_pct <= cfg.max_ev_pct
-                    waiting = False
-                    if cons and prices is not None:
-                        # A book that just moved away from the others makes ITS price look +EV against a
-                        # median that hasn't caught up: the outliers' test, at the +EV bar. mine/theirs
-                        # are unknown (a prop's stamp covers every player), so it works from anchors kept
-                        # across checks; the first look anchors too, so a jump after it is measured, and
-                        # so does each look's price, so a book that moves again is held again.
-                        hkey = (ev["id"], k, key, oc["name"])
-                        prev = prices.get(hkey)
-                        since, anchor = _leading(prev, now, price, p, ev_pct, cfg, None, [], is_live, bar=min_ev)
-                        prices.put(hkey, now, since, anchor or (price, p), (price, p))
-                        carded = ev_key(ev["id"], k[0], k[1], oc["name"]) in keep
-                        held = "moved first" if since is not None else "first look" if prev is None and not carded else ""
-                        if held == "moved first" and carded:
-                            # Its card is up: dropping it would post a false GONE, then a new alert once
-                            # the hold is over. It stays, as a quiet 🟡 card, while the others can follow.
-                            waiting = True
-                        elif held:
-                            if ok and ev_pct >= min_ev:
-                                prices.held[held] = prices.held.get(held, 0) + 1
-                            ok = False
-                    boards.setdefault((k, oc["name"]), []).append((bm.get("title", key), price, ev_pct, link, ok))
-                    if price > cfg.ev_max_odds or not ok:
-                        continue
-                    low = min(min_ev, floor) if floor and k[0] in MAIN_MARKETS and cons is None else min_ev
-                    if low <= ev_pct <= cfg.max_ev_pct:
-                        offers.setdefault((k, oc["name"]), []).append(
-                            (price, bm.get("title", key), link, oc.get("point"), key, stamp, p, cons, waiting))
+                price = float(oc["price"])
+                cons = None if k in fair or k in alone else own.get(key, {}).get(k)   # no sharp price: the other books
+                p = ((blend[k] if k in blend and key != "kalshi" else fair[k]).get(oc["name"]) if k in fair
+                     else alone[k].get(oc["name"]) if k in alone else cons.probs.get(oc["name"]) if cons else None)
+                if p is None:
+                    continue
+                if alt and alt_seen is not None:
+                    alt_seen.add((ev["id"], k, oc["name"], key))
+                ev_pct = (p * price - 1) * 100
+                link = book_link(ev, bm, mkt, oc, cfg)
+                # (Kalshi's price can't be both the fair odds and the bet.)
+                ok = price <= cfg.ev_max_odds and ev_pct <= cfg.max_ev_pct and not (k in alone and key == "kalshi")
+                waiting = False
+                if cons and prices is not None:
+                    # A book that just moved away from the others makes ITS price look +EV against a
+                    # median that hasn't caught up: the outliers' test, at the +EV bar. mine/theirs
+                    # are unknown (a prop's stamp covers every player), so it works from anchors kept
+                    # across checks; the first look anchors too, so a jump after it is measured, and
+                    # so does each look's price, so a book that moves again is held again.
+                    # (An alternate line's price is judged by the book's main line at that point, when it has
+                    # one, as outliers do: the main line is what the book moved, or didn't.)
+                    main_p = price
+                    if alt:
+                        if mains is None:
+                            mains = {(k2, o2["name"]): float(o2["price"]) for _, o2, k2, _, _ in book_offers(
+                                {**bm, "markets": [m for m in bm.get("markets", []) if not is_alt(m["key"])]},
+                                ev, now, is_live, cfg)}
+                        main_p = mains.get((k, oc["name"]))
+                    gp = price if main_p is None else main_p
+                    hkey = (ev["id"], k, key, oc["name"])
+                    prev = prices.get(hkey)
+                    since, anchor = _leading(prev, now, gp, p, (p * gp - 1) * 100, cfg, None, [], is_live, bar=min_ev)
+                    prices.put(hkey, now, since, anchor or (gp, p), (gp, p))
+                    carded = ev_key(ev["id"], k[0], k[1], oc["name"]) in keep
+                    held = "moved first" if since is not None else "first look" if prev is None and not carded else ""
+                    if held == "moved first" and carded:
+                        # Its card is up: dropping it would post a false GONE, then a new alert once
+                        # the hold is over. It stays, as a quiet 🟡 card, while the others can follow.
+                        waiting = True
+                    elif held:
+                        if ok and ev_pct >= min_ev:
+                            prices.held[held] = prices.held.get(held, 0) + 1
+                        if ok and rejects is not None and min_ev - 1 <= ev_pct <= cfg.max_ev_pct:
+                            reject(candidate(ev, k, oc["name"], oc.get("point"), bm.get("title", key), price, p,
+                                             "consensus of " + str(cons.votes) + " other books"), held)
+                        ok = False
+                boards.setdefault((k, oc["name"]), []).append((bm.get("title", key), price, ev_pct, link, ok))
+                if alt:
+                    alt_board.setdefault((k, oc["name"]), set()).add(bm.get("title", key))
+                if price > cfg.ev_max_odds or not ok:
+                    continue
+                low = min(min_ev, floor) if floor and k[0] in MAIN_MARKETS and k in fair else min_ev
+                if low <= ev_pct <= cfg.max_ev_pct:
+                    offers.setdefault((k, oc["name"]), []).append(
+                        (price, bm.get("title", key), link, oc.get("point"), key, stamp, p, cons, waiting, alt))
+                elif rejects is not None and low - 1 <= ev_pct < low and price > near.get((k, oc["name"]), (0,))[0]:
+                    src = (blend_name[k] if k in blend and key != "kalshi" else sharp_name[k] if k in fair
+                           else f"Kalshi (no {sharp_title} price)" if k in alone
+                           else f"consensus of {cons.votes} other books")
+                    near[(k, oc["name"])] = (price, candidate(ev, k, oc["name"], oc.get("point"), bm.get("title", key),
+                                                              price, p, src))
+        for side, (_, cand) in near.items():
+            if side not in offers:   # (one over the bar for this side is a candidate itself)
+                reject(cand, "under bar")
 
         for (k, name), lst in offers.items():
             lst.sort(key=lambda o: (-o[0], o[1]))   # best price; ties by book name, so it's stable
@@ -2725,19 +3618,42 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 lst = [o for o in lst if o[4] != "kalshi" or kalshi_still_there(kq, o[0], cfg)]
                 if not lst:
                     continue
-            price, book, link, point, book_key, stamp, p, cons, waiting = lst[0]
+            price, book, link, point, book_key, stamp, p, cons, waiting, alt = lst[0]
             # Under MIN_EV_PCT: only the confirmed floor let it in, so it must be confirmed below. Over it:
             # a normal bet, and the other books listed with it are the ones over it too, as always.
-            tier = CONFIRMED if (p * price - 1) * 100 < min_ev else ""
+            # (Where the confirmed tier applies, a bet with Kalshi blended in must clear MIN_EV_PCT by the
+            # sharp books' own price too, or it's a confirmed bet: the tier judges the sharps' price.)
+            p_sh = fair[k].get(name) if floor and k in fair else None
+            low_p = lambda q: min(q, p_sh) if p_sh is not None else q
+            tier = CONFIRMED if (low_p(p) * price - 1) * 100 < min_ev else ""
             if not tier:
-                lst = [o for o in lst if (o[6] * o[0] - 1) * 100 >= min_ev]
-            from_sharp = cons is None
+                lst = [o for o in lst if (low_p(o[6]) * o[0] - 1) * 100 >= min_ev]
+            kalshi_alone = k in alone
+            from_sharp = cons is None and not kalshi_alone
+            blended = from_sharp and k in blend and book_key != "kalshi"
+            left_out = None   # a reference left out of the fair price as the odd one out: (key, points off)
             if from_sharp:
                 fair_k, src, n_src, n_all = fair[k], sharp_name[k], n_used[k], n_total[k]
+                if blended:
+                    src = blend_name[k]
+                # (A bet at Kalshi uses the sharp books' price alone: the blend's choice doesn't apply.)
+                left_out = (blend_out.get(k) if book_key != "kalshi" else None) or sf.left_out.get(k)
+            elif kalshi_alone:
+                fair_k, src, n_src, n_all = alone[k], f"Kalshi (no {sharp_title} price)", 1, 1
             else:   # the median of the OTHER books (this one left out), named on the card
                 fair_k, n_src = cons.probs, cons.votes
                 src, n_all = "consensus of " + ", ".join(
                     "/".join(books[b].get("title", b) for b in vote) for vote in cons.books), n_src
+            # The fair-odds references for this line, top trust first, each with its no-vig win chance for
+            # this side (None: no usable price), for the card's Sources line. (Only the count of SHARP_BOOKS
+            # that priced it, n_src of n_all, sizes the stake.) Kalshi's quote can't be one for a bet at Kalshi.
+            refs = [(titles.get(sk) or _title(sk),
+                     _side_prob(raw_src.get(k, {}).get(sk), name, fair_k, cfg) if from_sharp else None)
+                    for sk in refs_for[is_prop(k[1])]]
+            # (Kalshi is one only before the game, with a weight: as for SHARP_BOOKS, 0 means not a reference.)
+            if (book_key != "kalshi" and not is_live and source_weight(cfg, "kalshi") > 0
+                    and kalshi_applies(cfg, ev.get("sport_key", ""), k[0], is_live)):
+                refs.append(("Kalshi", kq[0] if kq is not None else None))
             bet = EVBet(
                 event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
                 sport_key=ev.get("sport_key", ""), matchup=f"{ev['away_team']} @ {ev['home_team']}",
@@ -2747,38 +3663,50 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 book=book, price=price, link=link,
                 fair_prob=p, sharp_book=src, n_outcomes=len(fair_k),
                 also=[(b, pr) for pr, b, *_ in lst[1:]],
-                sources_used=n_src, sources_total=n_all, unit_size=cfg.unit_size,
+                sources_used=n_src, sources_total=n_all, unit_size=cfg.unit(),
+                sharp_prob=fair_k[name] if from_sharp else None, sharp_name=sharp_name[k] if from_sharp else "",
+                left_out=left_out and (titles.get(left_out[0]) or _title(left_out[0]), left_out[1]),
                 sharp_quotes=[(titles[sk], [outs[name]] + [pr for n, pr in outs.items() if n != name])
                               for sk, outs in raw_src.get(k, {}).items() if name in outs],
+                refs=refs,
                 board=sorted(boards.get((k, name), []), key=lambda r: (-r[1], r[0])),
-                age=max(0.0, (now - _parse_time(stamp)).total_seconds()) if stamp else None,
+                age=max(0.0, (now - _parse_time(stamp)).total_seconds()) if stamp else None, alt=alt,
+                alt_books=alt_board.get((k, name), set()),
             )
-            # Quality checks: skip prices whose fair value is shaky, rate the rest.
+            # Quality checks: skip prices whose fair value is shaky, rate the rest. They judge the sharp
+            # books' own price (with Kalshi blended in, bet.fair_prob isn't theirs alone).
+            p_own = bet.sharp_prob if from_sharp else bet.fair_prob
             hold = holds.get(k) if from_sharp else None
             gap = None
             if from_sharp and k in market and name in market[k].probs:
-                gap = abs(market[k].probs[name] - bet.fair_prob) * 100
+                gap = abs(market[k].probs[name] - p_own) * 100
+            elif kalshi_alone:   # (it exists: no Kalshi-only line without it)
+                gap = abs(alone_check.probs[name] - p_own) * 100
             if hold is not None and hold > cfg.max_sharp_hold_pct:
+                reject(bet, "sharp hold")
                 continue
             if gap is not None and gap > cfg.sharp_consensus_max_gap:
+                reject(bet, "market gap")
                 continue  # sharp and market far apart: one side is stale, can't trust either
             # Kalshi's exchange price is a second opinion on moneylines: if it disagrees with the
             # sharp book by more than KALSHI_MAX_GAP points, or says the price isn't good, skip it.
             kgap = None
             if kq is not None:
                 bet.kalshi = kq
-                if book_key != "kalshi":   # (for a bet at Kalshi, its quote only confirmed the price above)
-                    kgap = round(abs(bet.kalshi[0] - bet.fair_prob) * 100, 6)
+                if book_key != "kalshi" and not kalshi_alone:   # (at Kalshi, its quote only confirmed the price above)
+                    kgap = round(abs(bet.kalshi[0] - p_own) * 100, 6)
                     if kgap > kalshi_gap_limit(cfg, ev.get("sport_key", ""), hours):
                         if tier:
                             miss("Kalshi too far off")
+                        reject(bet, "kalshi gap")
                         continue
                     if bet.kalshi[0] * price < 1:
                         if tier:
                             miss("Kalshi says the price isn't good")
+                        reject(bet, "kalshi no")
                         continue
             agree, missed, doubt = None, None, ""
-            if not from_sharp:
+            if cons is not None:
                 missed = []
                 sportsbooks = [v for v in cons.books if any(b not in EXCHANGES for b in v)]
                 agree = Agreement(cons.spread[name], cons.full_spread[name],
@@ -2791,6 +3719,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 if cap is not None and (cap * price - 1) * 100 < min_ev:
                     if prices is not None:
                         prices.missed.append([f"{sharp_title}'s other line says no edge"])
+                    reject(bet, "sharp other line")
                     continue   # Over a higher point can't be likelier than the sharp's Over a lower one
                 why = f"{sharp_title} has another line"
                 # Its last price on this exact line, until kickoff (prop checks can be hours apart).
@@ -2798,16 +3727,25 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 if last is not None:
                     if (last[0] * price - 1) * 100 < min_ev:
                         prices.missed.append([f"{sharp_title}'s last price says no edge"])
+                        reject(bet, "sharp last price")
                         continue
                     if not doubt:   # never a lock until the sharp prices the line again
                         doubt = why = f"{sharp_title} took this line down"
-            move = history.record((ev["id"], k[0], k[1], name), now, bet.fair_prob) if history and from_sharp else None
+            move = history.record((ev["id"], k[0], k[1], name), now, p_own) if history and from_sharp else None
             bet.confidence, bet.confidence_notes = rate_confidence(hold, gap, hours, bet.ev_pct, is_prop(k[1]), move,
                                                                    kgap, cfg.confident_hours, agree, missed)
+            if kalshi_alone:   # one exchange's price is the whole fair price: at most medium, never a lock
+                bet.confidence = "medium" if bet.confidence == "high" else bet.confidence
+                bet.confidence_notes.append(f"only Kalshi prices it (no {sharp_title} line)")
+                bet.kalshi_only = True
             if doubt:   # at most medium: never a lock
                 bet.confidence = "medium" if bet.confidence == "high" else bet.confidence
                 bet.confidence_notes.append(doubt)
                 missed.append(why)
+            if cons is not None and ev.get("sport_key") in sharp_down:   # the sharp is missing from the whole sport
+                bet.confidence = "medium" if bet.confidence == "high" else bet.confidence
+                bet.confidence_notes.append(f"no {sharp_title} prices in this sport right now")
+                missed.append(f"{sharp_title} down")
             if waiting:   # its book just moved away from the others: up only because its card is
                 bet.confidence = "medium" if bet.confidence == "high" else bet.confidence
                 bet.confidence_notes.append(f"{book} just moved its price away from the other books")
@@ -2818,19 +3756,19 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 if k[0] != "h2h" and book_key not in agreeing:
                     agreeing[book_key] = consensus_fair(ev, replace(cfg, consensus_min_books=CONFIRM_MIN_BOOKS),
                                                         now, is_live, set(sharp), leave_out=book_key)
-                who, why, theirs = confirmed_by(k[0], name, bet.fair_prob, kq, book_key,
+                who, why, theirs = confirmed_by(k[0], name, p_own, kq, book_key,
                                                 agreeing.get(book_key, {}).get(k), cfg)
                 fails = [why] if why else []
                 # The sharp line since a check a window ago, or since the last check when they're further
                 # apart (and the move within the window that confidence uses): not against the bet.
                 then = history.before((ev["id"], k[0], k[1], name), now) if history else None
-                since = None if then is None else (bet.fair_prob - then) * 100
+                since = None if then is None else (p_own - then) * 100
                 if min([m for m in (move, since) if m is not None], default=0.0) <= -SHARP_MOVE_PTS:
                     fails.append("sharp line moving against it")
                 if bet.confidence != "high":   # never medium, whatever MIN_CONFIDENCE says
                     fails.append("not high confidence")
                 # The edge by the less generous of the two win chances: it must clear the floor by both.
-                lower = None if why or theirs is None else min(bet.fair_prob, theirs)
+                lower = None if why or theirs is None else min(p_own, theirs)
                 both = None if lower is None else (lower * price - 1) * 100
                 if both is not None and both < floor:
                     fails.append(f"under {floor:g}% by both")
@@ -2842,19 +3780,31 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                     bet.kept = True
                 elif fails:
                     miss(fails[0])
+                    reject(bet, f"confirm fail: {fails[0]}")
                     continue
                 if lower is not None:   # the other books listed with it clear the floor by both too
                     bet.also = [(bk, pr) for bk, pr in bet.also if (lower * pr - 1) * 100 >= floor]
                 bet.tier, bet.confirm = tier, (who, theirs, min_ev, both)
             least = CONFIDENCE_ORDER.get(cfg.min_confidence, 0)
-            if not from_sharp and bet.key in keep and (waiting or CONFIDENCE_ORDER[bet.confidence] < least):
+            if cons is not None and bet.key in keep and (waiting or CONFIDENCE_ORDER[bet.confidence] < least):
                 # Its card is up: it stays at medium, shown as 🟡 (no GONE), and pings nothing new.
                 least, bet.kept = min(least, CONFIDENCE_ORDER["medium"]), True
             if CONFIDENCE_ORDER[bet.confidence] < least:
+                reject(bet, "low confidence")
                 continue
             # Less certainty -> smaller bet (the edge itself isn't changed).
-            mult = cfg.single_source_stake if n_all > 1 and n_src == 1 else 1.0
-            if not from_sharp and cfg.consensus_stake < 1:
+            mult = 1.0
+            if kalshi_alone:
+                mult = cfg.kalshi_only_stake
+                if mult < 1:
+                    bet.confidence_notes.append(f"Kalshi's price alone: stake {round((1 - mult) * 100)}% smaller")
+            elif n_all > 1 and n_src == 1:
+                mult = cfg.single_source_stake
+            elif from_sharp and n_src == 1 and not blended:   # one sharp book alone (Kalshi not in it)
+                mult = cfg.one_source_stake
+                if mult < 1:
+                    bet.confidence_notes.append(f"one source: stake {round((1 - mult) * 100)}% smaller")
+            if cons is not None and cfg.consensus_stake < 1:
                 # No sharp price (usually a prop Pinnacle doesn't offer): the fair price is the
                 # median of other books, which is less certain, so the stake is smaller.
                 mult *= cfg.consensus_stake
@@ -2868,6 +3818,26 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
             out.append(bet)
 
     return sorted(out, key=lambda b: b.ev_pct, reverse=True)
+
+
+def _title(book_key: str) -> str:
+    """A book's name when the game's odds don't give it (it has no prices there): pinnacle -> Pinnacle,
+    betfair_ex_eu -> Betfair."""
+    return BOOK_TITLES.get(book_key) or book_key.split("_")[0].title()
+
+
+def _side_prob(outs: dict[str, float] | None, name: str, names, cfg: Config) -> float | None:
+    """One sharp book's no-vig win chance for this side, when its prices went into the line's fair
+    price (fresh, with the same outcomes: see sharp_fair), else None."""
+    if not outs or set(outs) != set(names):
+        return None
+    return dict(zip(outs, _novig(tuple(outs.values()), cfg.devig_method)))[name]
+
+
+def kalshi_applies(cfg: Config, sport_key: str, market: str, is_live: bool) -> bool:
+    """Is Kalshi one of a line's fair-odds references? Moneylines in the sports Kalshi has game markets
+    for (KALSHI_SERIES), before the game (during it too with KALSHI_LIVE), with KALSHI_CHECK on."""
+    return cfg.kalshi_check and market == "h2h" and sport_key in KALSHI_SERIES and (cfg.kalshi_live or not is_live)
 
 
 def confirmed_by(market: str, name: str, fair_prob: float, kq, book_key: str, agree: Consensus | None,
@@ -2937,13 +3907,35 @@ def confirm_lines(b: EVBet) -> tuple[str, str]:
     if b.tier != CONFIRMED or not b.confirm:
         return "", ""
     who, theirs, usual, both = b.confirm
-    agree = f"✅✅ Two sharp books agree: {b.sharp_book} and {who}"
+    sharp, mine = b.sharp_name or b.sharp_book, b.fair_prob if b.sharp_prob is None else b.sharp_prob
+    agree = f"✅✅ Two sharp books agree: {sharp} and {who}"
     if theirs is None:   # its card is up, and the second source has no price this check
         gone = "Kalshi has no price" if who == "Kalshi" else f"Fewer than {CONFIRM_MIN_BOOKS} other books price it"
         return agree, (f"A smaller edge than the usual {usual:g}% is OK here: both gave it almost the same chance "
-                       f"to win when it went out. {gone} right now ({b.sharp_book} {b.fair_prob:.1%}).")
+                       f"to win when it went out. {gone} right now ({sharp} {mine:.1%}).")
     return agree, (f"A smaller edge than the usual {usual:g}% is OK here: both give it almost the same chance to "
-                   f"win ({b.sharp_book} {b.fair_prob:.1%}, {who} {theirs:.1%}). At least +{both:.1f}% by both.")
+                   f"win ({sharp} {mine:.1%}, {who} {theirs:.1%}). At least +{both:.1f}% by both.")
+
+
+def sources_line(b: EVBet, bold: bool = False) -> str:
+    """How many of the fair-odds references that apply to this line priced it, and each one's no-vig
+    win chance for this side: "Sources 2/2 · Pinnacle 50.0% · Kalshi 52.0%". One that applies but had
+    no usable price says so ("Kalshi: no usable price"); when that's the top one, the line ends "(no
+    Pinnacle price)" instead. One left out as the odd one out isn't counted: "LowVig left out (4.1 pts
+    off)". None of them priced it (a prop): "Sources: median of 5 books (no Pinnacle price)". "" for a
+    bet that doesn't use them (outliers)."""
+    if not b.refs:
+        return ""
+    label = "**Sources**" if bold else "Sources"
+    top, top_p = b.refs[0]
+    if all(p is None for _, p in b.refs):
+        return f"{label}: median of {b.sources_used} books (no {top} price)"
+    gone, pts = b.left_out or ("", 0.0)
+    priced = [f"{t} {p:.1%}" for t, p in b.refs if p is not None and t != gone]
+    out = [f"{gone} left out ({pts:.1f} pts off)"] if b.left_out else []
+    missing = [f"{t}: no usable price" for t, p in b.refs[1:] if p is None]
+    return (f"{label} {len(priced)}/{len(b.refs)} · " + " · ".join(priced + out + missing)
+            + (f" (no {top} price)" if top_p is None else ""))
 
 
 def format_ev_text(b: EVBet) -> str:
@@ -2953,10 +3945,11 @@ def format_ev_text(b: EVBet) -> str:
     agree, why = confirm_lines(b)
     return (
         f"📈 +{b.ev_pct:.1f}% EV | {b.sport} | {b.matchup} ({status})\n"
-        f"  {b.pick} {odds(b.price)} on {b.book}  → stake {b.stake_label}"
+        f"  {b.pick} {odds(b.price)} on {b.book}{' (alternate line)' if b.alt else ''}  → stake {b.stake_label}"
         + (f"\n    {b.link}" if b.link else "")
-        + f"\n  Fair {_fair_line(b)} ({b.fair_prob:.1%}, {b.sharp_book} no-vig, "
-          f"{b.sources_used}/{b.sources_total} sources){sharp}{also}"
+        + f"\n  Fair {_fair_line(b)} ({b.fair_prob:.1%}, {b.sharp_book} no-vig"
+        + (f")\n  {sources_line(b)}" if b.refs else f", {b.sources_used}/{b.sources_total} sources)")
+        + f"{sharp}{also}"
         + (f"\n  Confidence: {b.confidence}" + (f" ({', '.join(b.confidence_notes)})" if b.confidence_notes else "")
            if b.confidence else "")
         + (f"\n  {agree}. {why}" if agree else "")
@@ -2988,9 +3981,10 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
                           f"Ignore this one. {b.book} moved and the value is gone. ({icon} {b.matchup})")
     parts = [
         f"👉 **DO THIS: bet this ONE side.** Good value, but it won't win every time.\n\n"
-        f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**\n"
+        f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**"
+        f"{ALT_NOTE if b.alt else ''}\n"
         f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**"
-        + kalshi_room_line(b.kalshi_room)
+        + kalshi_room_line(b.kalshi_room) + kalshi_tie_note(b.sport_key, b.market, b.book)
         + (f"\nConfidence: **{CONFIDENCE_BADGE[b.confidence]}**"
            + (f" · {', '.join(b.confidence_notes)}" if b.confidence_notes else "") if b.confidence else ""),
     ]
@@ -3004,6 +3998,7 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
                      f"so treat them as one bet, not separate ones.")
     details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}"
                f"{_age_note(b.age)}\n\n**Fair value** {_fair_line(b)} · {b.fair_prob:.1%} to win"
+               + (f"\n{sources_line(b, bold=True)}" if b.refs else "")
                + (f"\n**{b.sharp_quotes[0][0]}** {' / '.join(odds(x) for x in b.sharp_quotes[0][1])}"
                   if b.sharp_quotes else "")
                + (f" *(was {' / '.join(odds(x) for x in b.first_sharp_quotes[0][1])})*"
@@ -3021,7 +4016,14 @@ EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
                  "home_team", "away_team", "commence_time", "live", "market", "outcome", "point",
                  "n_outcomes", "book", "price", "fair_odds", "best_ev_pct", "stake", "player", "confidence",
                  "fair_from",   # whose fair odds: "Pinnacle", "consensus of DraftKings, ...", "median of 4 other books"
-                 "tier"]        # CONFIRMED: a confirmed pre-game bet, under MIN_EV_PCT ("" = any other)
+                 "tier",        # CONFIRMED: a confirmed pre-game bet, under MIN_EV_PCT ("" = any other)
+                 "units",       # the stake in units, as the card showed it ("$15 (1.5u)" -> 1.5)
+                 "sources",     # the card's Sources line: "Sources 2/2 · Pinnacle 50.0% · Kalshi 52.0%"
+                 "pinnacle_prob",   # the sharp books' own fair win chance (Pinnacle's no-vig), before any Kalshi
+                 "kalshi_prob",     # Kalshi's win chance for this side, when it had a usable quote ("" = none)
+                 "excluded",        # a reference left out of the fair price as the odd one out: "LowVig (4.1 pts off)"
+                 "alt",             # True: the price was on the book's alternate line at this point, not its main one
+                 "post_delay"]      # seconds from fetching the odds to the post that sent the alert ("" = not known)
 
 
 class EVAlerter(Alerter):
@@ -3076,6 +4078,11 @@ class EVAlerter(Alerter):
             "book": b.book, "price": b.price, "fair_odds": round(b.fair_odds, 3),
             "best_ev_pct": round(b.ev_pct, 2), "stake": b.stake, "player": b.player,
             "confidence": b.confidence, "fair_from": b.sharp_book, "tier": b.tier,
+            "units": round(b.stake / b.unit_size, 2) if b.unit_size > 0 else "", "sources": sources_line(b),
+            "pinnacle_prob": "" if b.sharp_prob is None else round(b.sharp_prob, 4),
+            "kalshi_prob": round(b.kalshi[0], 4) if b.kalshi else "",
+            "excluded": f"{b.left_out[0]} ({b.left_out[1]:.1f} pts off)" if b.left_out else "",
+            "alt": b.alt, "post_delay": "" if (pd := getattr(op, "post_delay", None)) is None else round(pd, 1),
         }
 
 
@@ -3103,6 +4110,10 @@ KALSHI_MIN_GAP = 0.2            # seconds between Kalshi calls (at most 5 a seco
 KALSHI_TIMEOUT = 5              # seconds to wait for Kalshi before giving up on it for this scan
 KALSHI_SCAN_SECONDS = 8         # stop asking Kalshi for more sports once a scan has spent this long on it
 KALSHI_COOLDOWNS = (60, 300, 900)   # after Kalshi can't be reached: leave it alone this long (grows)
+# A Kalshi failure this long after the last one, with nothing asked in between (a lookup that worked would
+# have ended the outage), is a new outage: its clock starts again (an outage keeps failing at least every
+# longest cooldown).
+KALSHI_QUIET_GAP = 2 * max(KALSHI_COOLDOWNS)
 COLLEGE_QUALIFIERS = {   # "Texas" mustn't claim "Texas Southern" / "Texas A&M" / "Texas State"...
     "state", "st", "tech", "am", "at", "southern", "northern", "eastern", "western", "central", "pine",
     "valley", "international", "intl", "atlantic", "gulf", "christian", "baptist", "oh", "fl", "city",
@@ -3235,6 +4246,15 @@ def _kalshi_pair(ev: dict, ms: list[dict], pro: bool) -> tuple[int, dict, dict] 
     return fits[0]
 
 
+def _kalshi_failed(now: float | None = None) -> None:
+    """Kalshi couldn't be reached (or asked the bot to slow down): note when the outage began, for the health
+    message. A failure long after the last one (KALSHI_QUIET_GAP: Kalshi wasn't asked in between) starts it again."""
+    now = now or time.time()
+    if "down_since" not in _KALSHI_STATE or now - _KALSHI_STATE.get("last_fail", now) > KALSHI_QUIET_GAP:
+        _KALSHI_STATE["down_since"] = now
+    _KALSHI_STATE["last_fail"] = now
+
+
 def _kalshi_fetch(url: str) -> dict:
     """One Kalshi GET, at most 5 a second. When Kalshi says "too many requests" (429), wait 1, 2,
     then 4 seconds and retry; after that, leave Kalshi alone for 2 minutes."""
@@ -3250,6 +4270,7 @@ def _kalshi_fetch(url: str) -> dict:
                 raise
             if wait is None:
                 _KALSHI_STATE["pause_until"] = time.time() + 120
+                _kalshi_failed()   # (for the health message)
                 raise
             time.sleep(wait)
     raise RuntimeError("unreachable")
@@ -3288,12 +4309,14 @@ def _kalshi_get(query: str) -> dict:
                 continue
             _KALSHI_STATE["host"] = bases.index(base)
             _KALSHI_STATE["fails"] = 0
+            _KALSHI_STATE.pop("down_since", None)
             return data
         if last is None and page_error is not None:
             raise page_error   # every address said the page doesn't exist: not an outage
         wait = KALSHI_COOLDOWNS[min(_KALSHI_STATE["fails"], len(KALSHI_COOLDOWNS) - 1)]
         _KALSHI_STATE["fails"] += 1
         _KALSHI_STATE["pause_until"] = time.time() + wait
+        _kalshi_failed()   # (for the health message)
         raise last or RuntimeError("no Kalshi address to try")
     return _cached("kalshi:" + query, fetch, ttl=30)
 
@@ -3535,6 +4558,15 @@ def kalshi_room_line(room: float, indent: str = "") -> str:
     return f"\n{indent}↳ Kalshi only has about {about} at this price; the rest would fill at a worse price."
 
 
+def kalshi_tie_note(sport_key: str, market: str, book: str, indent: str = "") -> str:
+    """The card's settlement note on a bet at Kalshi on an NFL moneyline: an NFL game can end in a tie,
+    which sportsbooks refund, while Kalshi settles it by its own market rules (--check-kalshi prints
+    them). Only a note: the edge is worked out the same way. "" for any other bet."""
+    if sport_key != "americanfootball_nfl" or market != "h2h" or not book.lower().startswith("kalshi"):
+        return ""
+    return f"\n{indent}↳ Kalshi settles ties by its own rules; sportsbooks refund a tie."
+
+
 def check_kalshi(cfg: Config, api: "OddsAPI", now: datetime | None = None) -> None:
     """Show how the bot reads Kalshi for the next two days of games (free: Kalshi and the
     Odds API's schedule both cost nothing)."""
@@ -3569,6 +4601,11 @@ def check_kalshi(cfg: Config, api: "OddsAPI", now: datetime | None = None) -> No
                   f"bid {m.get('yes_bid_dollars')} ask {m.get('yes_ask_dollars')} "
                   f"(sizes {m.get('yes_bid_size_fp')} / {m.get('yes_ask_size_fp')})")
             print(f"  fields: {', '.join(sorted(m))[:400]}")
+            for field_name, what in (("rules_primary", "rules"), ("rules_secondary", "more rules")):
+                # How Kalshi settles these markets (an NFL tie: sportsbooks refund one), when it says.
+                text = next((str(x[field_name]) for x in markets if x.get(field_name)), "")
+                if text:
+                    print(f"  {what}: {' '.join(text.split())[:600]}")
             if _kalshi_num(m, "yes_bid_size_fp") is None:
                 print("  ⚠️ Kalshi's reply doesn't say how many contracts are on offer (yes_bid_size_fp), so every "
                       "game is skipped. The bot needs an update for Kalshi's new format.")
@@ -3675,10 +4712,17 @@ def check_upcoming(cfg: Config, api: "OddsAPI", now: datetime | None = None) -> 
 # --------------------------------------------------------------------------- outliers
 
 def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
-                  history: PriceHistory | None = None, kalshi: dict | None = None) -> list[EVBet]:
+                  history: PriceHistory | None = None, kalshi: dict | None = None,
+                  alt_seen: set | None = None, rejects: list | None = None) -> list[EVBet]:
     """One book's price far above what every other book thinks (e.g. +400 where the rest
     are around -400). Usually a book that hasn't moved yet. Fair odds here are the median of
-    all the OTHER books' no-vig prices, so it works even when Pinnacle is slow or missing."""
+    all the OTHER books' no-vig prices, so it works even when Pinnacle is slow or missing.
+    The median comes from main lines only; a book's alternate line at exactly the same point is a
+    price to bet (the better of its two, see book_offers). alt_seen, when given, collects the
+    alternate-line prices that had such a median (for the console). rejects, when given, collects
+    (candidate, why) for the candidate log: a price within 1 point of the bar under it ("under bar"), one
+    over it whose book just moved away from the others ("moved first"), and one the sharp book or Kalshi
+    says isn't good ("sharp no", "kalshi no")."""
     if not cfg.outliers_enabled:
         return []
     now = now or datetime.now(timezone.utc)
@@ -3692,16 +4736,23 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
             continue
         # Live prices move in seconds, so a live outlier needs a bigger edge (OUTLIER_LIVE_MIN_PCT).
         bar = max(cfg.outlier_min_pct, cfg.outlier_live_min_pct) if is_live else cfg.outlier_min_pct
-        # (market, line) -> book key -> {outcome: price}, fresh full markets only
+        # (market, line) -> book key -> {outcome: price}, fresh full main markets only
         lines: dict[tuple, dict[str, dict[str, float]]] = {}
+        alts: dict[tuple, dict[str, tuple[float, str]]] = {}   # (line, outcome) -> book -> its alternate line's
+                                                               # (price, link), when better than its main line's
         titles: dict[str, str] = {}
         links: dict[tuple, str] = {}
         points: dict[tuple, float | None] = {}
         stamps: dict[tuple, datetime] = {}   # (line, book) -> when that book last moved it (props: unknown)
         for bm in ev.get("bookmakers", []):
             titles[bm["key"]] = bm.get("title", bm["key"])
+            for mkt, oc, k, alt, _ in book_offers(bm, ev, now, is_live, cfg):
+                if alt:   # a price to bet, never one of the prices the median comes from
+                    alts.setdefault((k, oc["name"]), {})[bm["key"]] = (float(oc["price"]),
+                                                                       book_link(ev, bm, mkt, oc, cfg))
+                    points[(k, oc["name"])] = oc.get("point")
             for mkt in bm.get("markets", []):
-                if not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
+                if is_alt(mkt["key"]) or not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
                     continue
                 stamp = mkt.get("last_update") or bm.get("last_update")
                 if not _one_line(mkt, ev["home_team"]):
@@ -3712,7 +4763,7 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                         continue
                     k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
                     lines.setdefault(k, {}).setdefault(bm["key"], {})[oc["name"]] = price
-                    links[(k, bm["key"], oc["name"])] = oc.get("link") or mkt.get("link") or bm.get("link") or ""
+                    links[(k, bm["key"], oc["name"])] = book_link(ev, bm, mkt, oc, cfg)
                     points[(k, oc["name"])] = oc.get("point")
                     if stamp:
                         stamps[(k, bm["key"])] = _parse_time(stamp)
@@ -3724,53 +4775,83 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
             names = set().union(*full.values()) if full else set()
             full = {bk: o for bk, o in full.items() if set(o) == names}
             probs = {bk: dict(zip(o, devig(list(o.values()), cfg.devig_method))) for bk, o in full.items()}
+            def offer(b: str, nm: str) -> tuple[float | None, str, bool]:
+                """Book b's price to bet on side nm of this line: (price, link, alternate?). Its main line's,
+                or its alternate line's at the same point when that pays more (None: neither)."""
+                main, a = full.get(b, {}).get(nm), alts.get((k, nm), {}).get(b)
+                if a is not None and (main is None or a[0] > main):
+                    return a[0], a[1], True
+                return main, links.get((k, b, nm), ""), False
+
             for name in names:
-                for bk, o in full.items():
+                if not cfg.alerts_side(k[1], name):
+                    continue   # a prop Under with PROP_SIDES=over (de-vigging the Over above still used it)
+                # Every book with a price to bet: those in the median, and those with only an alternate line here.
+                sellers = list(full) + sorted(b for b in alts.get((k, name), {}) if b not in full)
+                for bk in sellers:
                     others = sorted(probs[ob][name] for ob in probs if ob != bk)
                     if len(others) < cfg.outlier_min_books:
                         continue
                     mid = len(others) // 2
                     fair_p = others[mid] if len(others) % 2 else (others[mid - 1] + others[mid]) / 2
-                    price = o[name]
+                    price, link, alt = offer(bk, name)
+                    if alt and alt_seen is not None:
+                        alt_seen.add((ev["id"], k, name, bk))
                     edge = (fair_p * price - 1) * 100
                     # A real outlier is a book that hasn't caught up. A book that just moved AWAY
                     # from the others (in a live game: it reacted to a goal first) is probably the
                     # right one, and the rest are behind: betting it is no edge at all.
+                    # That test reads the book's main line at this point when it has one, whichever price
+                    # is the bet: its alternate line paying more isn't the book moving (alternate lines
+                    # are only asked for near kickoff, so the first one seen isn't a move from the main
+                    # line's price). With only an alternate line here (its main line moved to another
+                    # point), that price is what the book's price here moved to.
+                    main_p = full.get(bk, {}).get(name)
+                    gp = price if main_p is None else main_p
                     hkey = (ev["id"], k, bk, name)
-                    since, anchor = _leading(history.get(hkey) if history else None, now, price, fair_p, edge, cfg,
-                                             stamps.get((k, bk)),
+                    since, anchor = _leading(history.get(hkey) if history else None, now, gp, fair_p,
+                                             (fair_p * gp - 1) * 100, cfg, None if main_p is None else stamps.get((k, bk)),
                                              sorted(t for (kk, ob), t in stamps.items() if kk == k and ob != bk and ob in full),
                                              is_live)
                     if history:
                         history.put(hkey, now, since, anchor)
                     leading = since is not None
                     if bk in reference_only or not cfg.bettable(bk, ev) or edge < bar or leading:
+                        if (rejects is not None and bk not in reference_only and cfg.bettable(bk, ev)
+                                and edge >= bar - 1):   # (the candidate log)
+                            rejects.append((candidate(ev, k, name, points.get((k, name)), titles[bk], price, fair_p,
+                                                      f"median of {len(others)} other books"),
+                                            "under bar" if edge < bar else "moved first"))
                         continue
+                    kq = kalshi.get(ev["id"], {}).get(name) if kalshi and k[0] == "h2h" else None
                     # And when the sharp book prices this line, it has to agree the price is good.
                     sp = sharp.get(k, {}).get(name)
-                    if sp is not None and (sp * price - 1) * 100 < cfg.min_ev_pct:
-                        continue
+                    no = "sharp no" if sp is not None and (sp * price - 1) * 100 < cfg.min_ev_pct else ""
                     # So does Kalshi's exchange price, when there is one (before the game only, unless KALSHI_LIVE).
-                    kq = kalshi.get(ev["id"], {}).get(name) if kalshi and k[0] == "h2h" else None
-                    if kq is not None and (not kalshi_still_there(kq, price, cfg) if bk == "kalshi"
-                                           else (kq[0] * price - 1) * 100 < cfg.min_ev_pct):
+                    if not no and kq is not None and (not kalshi_still_there(kq, price, cfg) if bk == "kalshi"
+                                                      else (kq[0] * price - 1) * 100 < cfg.min_ev_pct):
+                        no = "kalshi no"
+                    if no:
+                        if rejects is not None:
+                            rejects.append((candidate(ev, k, name, points.get((k, name)), titles[bk], price, fair_p,
+                                                      f"median of {len(others)} other books", kq), no))
                         continue
-                    board = sorted(((titles[b], oo[name], (fair_p * oo[name] - 1) * 100,
-                                     links.get((k, b, name), ""), True)
-                                    for b, oo in full.items() if b not in reference_only and cfg.bettable(b, ev)),
-                                   key=lambda r: (-r[1], r[0]))
+                    board = sorted(((titles[b], pr, (fair_p * pr - 1) * 100, ln, True)
+                                    for b in sellers if b not in reference_only and cfg.bettable(b, ev)
+                                    for pr, ln, _ in [offer(b, name)]), key=lambda r: (-r[1], r[0]))
                     bet = EVBet(
                         event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
                         sport_key=ev.get("sport_key", ""), matchup=f"{ev['away_team']} @ {ev['home_team']}",
                         home_team=ev["home_team"], away_team=ev["away_team"],
                         commence_time=ev["commence_time"], is_live=is_live,
                         market=k[0], line=k[1], outcome=name, point=points.get((k, name)),
-                        book=titles[bk], price=price, link=links.get((k, bk, name), ""),
+                        book=titles[bk], price=price, link=link,
                         fair_prob=fair_p, sharp_book=f"median of {len(others)} other books",
                         n_outcomes=n_out, sources_used=len(others), sources_total=len(others),
-                        unit_size=cfg.unit_size, board=board, kalshi=kq,
+                        unit_size=cfg.unit(), board=board, kalshi=kq, alt=alt,
+                        alt_books={titles[b] for b in sellers if offer(b, name)[2]},
                     )
-                    if (at := stamps.get((k, bk))) is not None:
+                    if not alt and (at := stamps.get((k, bk))) is not None:
                         bet.age = max(0.0, (now - at).total_seconds())
                     bet.stake = kelly_stake(fair_p, price, cfg)
                     if sp is None and cfg.consensus_stake < 1:
@@ -3782,16 +4863,19 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                     if bk == "kalshi":
                         cap_to_kalshi(bet, kq, cfg)
                     # The board shows every book you have; parlays stick to EV_BOOKS like +EV bets.
-                    bet.parlay_books = {titles[b] for b in full if (not ev_allowed or b in ev_allowed)
+                    bet.parlay_books = {titles[b] for b in sellers if (not ev_allowed or b in ev_allowed)
                                         and cfg.bettable(b, ev)}
                     # Can the other side(s) be bet elsewhere to lock in a profit?
                     hedge = []
                     for other in sorted(names - {name}):
-                        cands = [(oo[other], b) for b, oo in full.items()
-                                 if b != bk and b not in reference_only and cfg.bettable(b, ev)]
+                        cands = [(pr, b, ln, a) for b in set(full) | set(alts.get((k, other), {}))
+                                 if b != bk and b not in reference_only and cfg.bettable(b, ev)
+                                 for pr, ln, a in [offer(b, other)] if pr is not None]
                         if cands:
-                            pr, b = max(cands)
-                            hedge.append((other, titles[b], pr, links.get((k, b, other), "")))
+                            pr, b, ln, a = max(cands)
+                            hedge.append((other, titles[b], pr, ln))
+                            if a:
+                                bet.hedge_alt.add(other)
                     if len(hedge) == len(names) - 1:
                         margin = 1 / price + sum(1 / h[2] for h in hedge)
                         if margin < 1:
@@ -3896,7 +4980,8 @@ def hand_over(evs: list[EVBet], outs: list[EVBet], ev_alr: "EVAlerter", out_alr:
               now: float | None = None) -> None:
     """A bet that turns from +EV into an outlier (or back) is the same bet: retire its old card
     with a pointer instead of a false "GONE", and let the other alerter post it without logging
-    it twice. Call right before both handle() calls (and the live rules).
+    it twice, and without the ping unless its edge is REALERT_JUMP_PCT better than the edge it was
+    last alerted at (the re-alert rule). Call right before both handle() calls (and the live rules).
 
     Not when the new alert is live and the old card went out before the game started: that card
     says nothing about a live price, so it closes as usual and the live bet is a new live alert (two
@@ -3916,9 +5001,16 @@ def hand_over(evs: list[EVBet], outs: list[EVBet], ev_alr: "EVAlerter", out_alr:
                 continue
             op = src.open.pop(k)
             dst.handed[k] = op.first_seen
+            if op.pinged_pct is not None:   # (no post of this bet pinged yet: the new card is the alert)
+                dst.handed_pct[k] = op.pinged_pct
+            if not op.sent:    # ...and it was never logged or followed: the new card's post does that
+                dst.handed_unsent.add(k)
             if op.message_id:
                 src._discord(_gone_card(note, f"{op.arb.pick} {odds(op.arb.price)} at {op.arb.book} · "
                                               f"{op.arb.matchup}"), op.message_id, op.url)
+                dst.handed_msg[k] = (op.message_id, op.url)
+            elif op.prev:   # (its own card never went up: the card before it is still the one pointing here)
+                dst.handed_msg[k] = op.prev
         for k in [k for k in src.restored if k in keys and k not in dst.open]:
             if k in live and before_kickoff(src.restored[k].get("first_seen", now),
                                             src.restored[k].get("commence_time", "")):
@@ -3926,8 +5018,11 @@ def hand_over(evs: list[EVBet], outs: list[EVBet], ev_alr: "EVAlerter", out_alr:
                 continue
             saved = src.restored.pop(k)
             dst.handed[k] = saved.get("first_seen", time.time())
+            if saved.get("pinged_pct", saved.get("alerted_pct")) is not None:
+                dst.handed_pct[k] = saved.get("pinged_pct", saved.get("alerted_pct"))
             if saved.get("message_id"):
                 src._discord(_gone_card(note, saved.get("label", "")), saved["message_id"], saved.get("url", ""))
+                dst.handed_msg[k] = (saved["message_id"], saved.get("url", ""))
 
 
 def without_outliers(evs: list[EVBet], outs: list[EVBet]) -> list[EVBet]:
@@ -3945,16 +5040,19 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
                           f"Ignore this one. {b.book} fixed its price. ({icon} {b.matchup})")
     parts = [
         f"👉 **DO THIS NOW, before {b.book} fixes its price.**\n\n"
-        f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**\n"
-        f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**" + kalshi_room_line(b.kalshi_room),
+        f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**"
+        f"{ALT_NOTE if b.alt else ''}\n"
+        f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**" + kalshi_room_line(b.kalshi_room)
+        + kalshi_tie_note(b.sport_key, b.market, b.book),
     ]
     if b.related:
         parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}.")
     if b.hedge:
-        legs = [(b.pick, b.book, b.price, b.link)] + [(o, bk, pr, ln) for o, bk, pr, ln in b.hedge]
-        margin = sum(1 / pr for _, _, pr, _ in legs)
+        legs = ([(b.pick, b.book, b.price, b.link, b.alt)]
+                + [(o, bk, pr, ln, o in b.hedge_alt) for o, bk, pr, ln in b.hedge])
+        margin = sum(1 / pr for _, _, pr, _, _ in legs)
         lines = [f"• Open **{_link(bk, ln)}** → bet **{money(round(100 / pr / margin, 2))}** on {o} {odds(pr)}"
-                 for o, bk, pr, ln in legs]
+                 f"{ALT_NOTE if alt else ''}" for o, bk, pr, ln, alt in legs]
         parts.append(f"🔒 **Want a sure profit instead?** Place all of these for **+{b.hedge_pct:.1f}% "
                      f"guaranteed** (per $100 total):\n" + "\n".join(lines))
     details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}"
@@ -4037,8 +5135,7 @@ class Parlay:
 
     @property
     def stake_label(self) -> str:
-        units = f" ({self.stake / self.unit_size:.2g}u)" if self.unit_size > 0 else ""
-        return f"{money(self.stake)}{units}"
+        return stake_text(self.stake, self.unit_size)
 
 
 def _parlay_leg_keys(key: str) -> tuple[str, list[str]]:
@@ -4082,7 +5179,7 @@ def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = froze
             for combo in itertools.combinations(legs, n):
                 if len({b.event_id for b, _, _ in combo}) < n:
                     continue  # same game: legs are correlated and books price them differently
-                p = Parlay(book, list(combo), unit_size=cfg.unit_size)
+                p = Parlay(book, list(combo), unit_size=cfg.unit())
                 if p.ev_pct >= cfg.parlay_min_ev_pct:
                     found[p.key] = p
     # Parlays already posted are re-scored from today's prices directly, even if their legs
@@ -4099,7 +5196,7 @@ def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = froze
                 break
             legs.append((by_key[lk], rows[0][1], rows[0][2]))
         else:
-            p = Parlay(book, legs, unit_size=cfg.unit_size)
+            p = Parlay(book, legs, unit_size=cfg.unit())
             if p.key == key and p.ev_pct >= cfg.parlay_min_ev_pct:
                 found[key] = p
     # Parlays already posted that still qualify first (replacing one with a slightly better
@@ -4119,7 +5216,8 @@ def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = froze
 
 
 def format_parlay_text(p: Parlay) -> str:
-    legs = "\n".join(f"  {i}. {b.pick} {odds(pr)}  ({b.matchup})" for i, (b, pr, _) in enumerate(p.legs, 1))
+    legs = "\n".join(f"  {i}. {b.pick} {odds(pr)}{' (alternate line)' if p.book in b.alt_books else ''}  ({b.matchup})"
+                     for i, (b, pr, _) in enumerate(p.legs, 1))
     return (f"📦 PARLAY +{p.ev_pct:.1f}% EV | {len(p.legs)} legs at {p.book} | pays {odds(p.price)}"
             f"  → stake {p.stake_label}\n{legs}")
 
@@ -4131,7 +5229,8 @@ def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None
                           "Ignore this one. A leg's price moved and the parlay isn't worth it anymore.")
     nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
     legs = "\n".join(
-        f"{nums[i] if i < 4 else '•'} **{_link(b.pick, ln)} {odds(pr)}**\n     {sport_icon(b.sport_key)} {b.matchup} · "
+        f"{nums[i] if i < 4 else '•'} **{_link(b.pick, ln)} {odds(pr)}**{ALT_NOTE if p.book in b.alt_books else ''}"
+        f"\n     {sport_icon(b.sport_key)} {b.matchup} · "
         + ("🔴 LIVE" if b.is_live else f"<t:{int(_parse_time(b.commence_time).timestamp())}:t>")
         for i, (b, pr, ln) in enumerate(p.legs))
     worst = (1 + OK_EDGE_PCT / 100) / p.fair_prob
@@ -5665,7 +6764,7 @@ def check_props(cfg: Config, now: datetime | None = None) -> None:
             print(f"  ({note})")
         print("  ✅ box score checks out" if not problems else "  ⚠️ " + "; ".join(problems)
               + " (props in games like this are left for you to check)")
-        for market in _csv(cfg.prop_markets.get(sport, "").replace("|", ",")):
+        for market in cfg.prop_types(sport):
             terms = BOX_STATS.get((_family(sport), market))
             label = MARKET_NAMES.get(market, market)
             if not terms:
@@ -5977,13 +7076,20 @@ def _saved_markout(d: dict) -> Markout:
     return m
 
 
-def _fresh_quotes(ev: dict, cfg: Config, now: datetime, is_live: bool) -> dict[tuple, dict[str, dict[str, float]]]:
-    """Every fresh price in one game: {(market, line): {book title: {outcome: price}}}."""
+def _fresh_quotes(ev: dict, cfg: Config, now: datetime, is_live: bool,
+                  offers: bool = False) -> dict[tuple, dict[str, dict[str, float]]]:
+    """Every fresh main-line price in one game: {(market, line): {book title: {outcome: price}}} (the
+    prices fair odds come from). offers: each book's price to bet instead, the better of its main and
+    alternate line at the same point (book_offers), as its alert would have read it."""
     out: dict[tuple, dict[str, dict[str, float]]] = {}
     start = _parse_time(ev["commence_time"])
     for bm in ev.get("bookmakers", []):
+        if offers:
+            for _, oc, k, _, _ in book_offers(bm, ev, now, is_live, cfg):
+                out.setdefault(k, {}).setdefault(bm.get("title", bm["key"]), {})[oc["name"]] = float(oc["price"])
+            continue
         for mkt in bm.get("markets", []):
-            if not is_fresh(mkt, bm, now, is_live, cfg, start):
+            if is_alt(mkt["key"]) or not is_fresh(mkt, bm, now, is_live, cfg, start):
                 continue
             for oc in mkt.get("outcomes", []):
                 price = float(oc.get("price") or 0)
@@ -6011,7 +7117,7 @@ def _markout_fair(m: Markout, ev: dict, cfg: Config, now: datetime, is_live: boo
     straight with the edge on the card: Pinnacle's no-vig price (+EV), the consensus of 4+ other
     books with sister books as one vote (a +EV prop Pinnacle doesn't price), or the median of the
     other books (outliers). The alerted book never counts. None when that yardstick can't price it
-    now (the source is never swapped)."""
+    now (the source is never swapped), and always for a Kalshi-only bet (Kalshi's price isn't read here)."""
     k = (m.market, m.line)
     if m.ref == "sharp":
         if "sharp" not in cache:
@@ -6033,7 +7139,7 @@ def _markout_fair(m: Markout, ev: dict, cfg: Config, now: datetime, is_live: boo
             return None
         mid = len(others) // 2
         return others[mid] if len(others) % 2 else (others[mid - 1] + others[mid]) / 2
-    return None   # an arb: the arb itself is the yardstick (are all its legs still there?)
+    return None   # an arb: the arb itself is the yardstick (are all its legs still there?); or Kalshi alone
 
 
 def who_moved(price0: float, fair0: float, price1: float | None, fair1: float) -> str:
@@ -6122,10 +7228,13 @@ class MarkoutTracker:
                     arb_id=f"{item.key}|{int(first_seen)}"))
         else:
             ref = ("median" if item.sharp_book.startswith("median")
-                   else "consensus" if item.sharp_book.startswith("consensus") else "sharp")
+                   else "consensus" if item.sharp_book.startswith("consensus")
+                   else "kalshi" if getattr(item, "kalshi_only", False) else "sharp")
+            # (fair0: the price the later readings are measured by, the sharp books' own, without Kalshi.)
+            fair0 = item.fair_prob if getattr(item, "sharp_prob", None) is None else item.sharp_prob
             self.pending.append(Markout(**base, outcome=item.outcome, point=item.point, pick=item.pick,
                                         book=item.book, price=item.price, skip=item.worst_ok_price(),
-                                        edge=item.ev_pct, ref=ref, fair0=item.fair_prob,
+                                        edge=item.ev_pct, ref=ref, fair0=fair0,
                                         confidence=item.confidence, tier=item.tier))
         self.dirty = True
 
@@ -6150,7 +7259,7 @@ class MarkoutTracker:
                 if not ms:
                     continue
                 is_live = _parse_time(ev["commence_time"]) <= now
-                quotes = _fresh_quotes(ev, self.cfg, now, is_live)
+                quotes = _fresh_quotes(ev, self.cfg, now, is_live, offers=True)   # (the book's price to bet)
             except Exception as e:  # noqa: BLE001 - measuring alerts must never stop them
                 print(f"  ! Markouts: {e!r:.200}", file=sys.stderr)
                 continue
@@ -6436,6 +7545,11 @@ def markout_books_line(cfg: Config, min_bets: int = 10) -> str:
             f"Worst: {worst['name']} ({worst['mean']:+.1f}% later, {worst['n']} bets)")
 
 
+def markout_span(cfg: Config) -> str:
+    """How far back markouts.csv goes: "last 60 days" (LOG_KEEP_DAYS cuts it), or "all time"."""
+    return f"last {cfg.log_keep_days} days" if cfg.log_keep_days else "all time"
+
+
 def markout_summary(cfg: Config) -> str:
     """The daily summary's 📏 section ("" with no markouts yet)."""
     groups = markout_breakdown(cfg)["Alert type"]
@@ -6443,7 +7557,7 @@ def markout_summary(cfg: Config) -> str:
         return ""
     note = _pregame_note(cfg)
     return ("📏 **Did the edge hold?** (each alert's price a few minutes later, against the same fair odds "
-            "its card used; all time)\n" + "\n".join(markout_line(g) for g in groups) + markout_books_line(cfg)
+            f"its card used; {markout_span(cfg)})\n" + "\n".join(markout_line(g) for g in groups) + markout_books_line(cfg)
             + (f"\n{note}" if note else ""))
 
 
@@ -6827,6 +7941,7 @@ def next_reset(cfg: Config, now: datetime) -> datetime:
 
 LIVE, PREGAME, EARLY, FAR = "live", "pregame", "early", "far"
 PROP_NEAR, PROP_EARLY = "prop_near", "prop_early"   # prop checks near kickoff / further out
+PROP_NEAR_X = "prop_near_x"   # what PROP_NEAR_MARKETS add to the near-kickoff prop checks: paid from spare credits only
 # The pre-game check of a sport that also has a live check (LIVE_MARKETS split): the other bet
 # types of its later games, every PREGAME_WITH_LIVE_EVERY live checks (default: every live check,
 # at POLL_SECONDS). Before the split these came with every live check, and they're the pre-game bets
@@ -6838,8 +7953,10 @@ STEP = 300  # seconds per slice when forecasting the next 24h
 # Spare credits buy faster pre-game checks in this order, each down to its floor: the pre-game
 # checks of sports with a live game first (down to every live check: only when
 # PREGAME_WITH_LIVE_EVERY is above 1), then near kickoff (the bets most worth acting on), later
-# today, early props, props near kickoff, and 1-2 days out last (rarely a locks alert).
-SPARE_ORDER = (PRE_LIVE, PREGAME, EARLY, PROP_EARLY, PROP_NEAR, FAR)
+# today, early props, props near kickoff, and 1-2 days out last (rarely a locks alert). The extra
+# prop types near kickoff (PROP_NEAR_MARKETS, all or nothing) come right after the near-kickoff
+# speed-up: they never slow a live or main-line check, nor take from those two speed-ups.
+SPARE_ORDER = (PRE_LIVE, PREGAME, PROP_NEAR_X, EARLY, PROP_EARLY, PROP_NEAR, FAR)
 LANE_KINDS = {"live": "odds:live", "pre": "odds:pre", "all": "odds"}   # CostBook kinds of the checks
 
 
@@ -6854,6 +7971,8 @@ def merge_events(events: list[dict]) -> list[dict]:
             by_id[ev.get("id")] = ev
             out.append(ev)
             continue
+        if ev.get("_fetched_at") and have.get("_fetched_at"):   # (its odds are as old as the older check's)
+            have["_fetched_at"] = min(have["_fetched_at"], ev["_fetched_at"])
         books = {bm.get("key"): bm for bm in have.setdefault("bookmakers", [])}
         for bm in ev.get("bookmakers", []):
             mine = books.get(bm.get("key"))
@@ -6863,6 +7982,22 @@ def merge_events(events: list[dict]) -> list[dict]:
             keys = {m.get("key") for m in mine.setdefault("markets", [])}
             mine["markets"].extend(m for m in bm.get("markets", []) if m.get("key") not in keys)
     return out
+
+
+def stamp_fetched(got):
+    """Note on each game in an odds answer (a list of games, or one game's dict) when it arrived, as
+    time.time(): an alert isn't posted on odds that are too old by then (see Alerter.handle). Returns it."""
+    at = time.time()
+    for ev in (got if isinstance(got, list) else [got]):
+        if isinstance(ev, dict):
+            ev["_fetched_at"] = at
+    return got
+
+
+def fetched_at(events: list[dict]) -> dict[str, float]:
+    """When each game's odds were fetched, {event id: time.time()}, for Alerter.handle. Games with no time
+    (the demo, tests) aren't in it, so their alerts are never held for old odds."""
+    return {ev["id"]: ev["_fetched_at"] for ev in events if ev.get("_fetched_at") and ev.get("id")}
 
 
 class Scheduler:
@@ -6888,12 +8023,18 @@ class Scheduler:
         self.props_ok: dict[str, float] = {}    # event id -> last prop check that worked
         self.odds_ok: dict[str, float] = {s: 0.0 for s in cfg.sports}  # sport -> last good odds check
         self.bad_prop_sports: set[str] = set()  # sports whose prop request the API rejected
+        self.bad_near_sports: set[str] = set()  # ...and whose near-kickoff extras (PROP_NEAR_MARKETS) it rejected
+        self.notices: list[str] = []            # messages for the health channel (run() sends them)
+        self.failures: dict[str, str] = {}      # sport -> why its last failed request failed (run() reads, clears)
+        self.props_answered: set[str] = set()   # sports a prop request got a "no such game" (404) from: the API is up
         self.scale = 1.0         # slow-down for live and near-kickoff checks
         self.extra_scale = 1.0   # slow-down for early/far-out checks (stretched first)
         self.side_scale = 1.0    # early props and 1-2 days out: slowed this much more, before the rest
         self.live_scale = 1.0    # extra slow-down for live checks alone (LIVE_MAX_STRETCH: before the rest)
         self.speed: dict[str, float] = {}   # tier -> how much faster than normal (spare credits)
         self.spare = 0.0         # credits the faster pre-game pace plans to spend in the next 24h
+        self.near_extras = True  # near-kickoff prop checks ask for PROP_NEAR_MARKETS too: only when the day's
+                                 # credits cover them after the live and main-line checks (update_budget)
         self.demand: dict[str, float] = {}  # tier -> credits in the next 24h at full speed
         self.forecast = 0.0      # credits the next 24h would cost at full speed
         self.allowance = 0.0     # credits we can afford per day
@@ -6984,16 +8125,34 @@ class Scheduler:
     def prop_cost(self, sport: str, hours: float, today: bool = False) -> float:
         """Credits one prop check of a game this many hours away costs (measured per hours-to-start
         bucket). For today's games it's never put below the near-kickoff cost: books post the day's
-        props by game-day morning, so overnight's free empty answers say little about the afternoon."""
+        props by game-day morning, so overnight's free empty answers say little about the afternoon.
+        Near kickoff the request carries PROP_NEAR_MARKETS too (until the API rejects them): see near_costs."""
+        if hours <= self.cfg.prop_hours:
+            return sum(self.near_costs(sport))
         formula = self.cfg.prop_credits_per_call(sport)
         book = getattr(self.api, "costs", None)
         if not book:
             return formula
-        near = book.estimate(f"props:{sport}:near", formula)
-        if hours <= self.cfg.prop_hours:
-            return near
         est = book.estimate(prop_cost_kind(sport, hours, self.cfg.prop_hours), formula)
-        return max(est, near) if today else est
+        # (That floor is for the same prop types: an earlier check doesn't ask for PROP_NEAR_MARKETS.)
+        return max(est, self.near_costs(sport)[0]) if today else est
+
+    def near_costs(self, sport: str) -> tuple[float, float]:
+        """One near-kickoff prop check of a game: (the plain request's credits, what PROP_NEAR_MARKETS add on
+        top; 0 once the API rejected them). Measured when it can be (each prop-type count has its own
+        average), the one from the other when only one of the two requests has been made yet."""
+        formula = self.cfg.prop_credits_per_call(sport)
+        with_f = self.cfg.prop_credits_per_call(sport, near=sport not in self.bad_near_sports)
+        book = getattr(self.api, "costs", None)
+        if not book or not formula:
+            return formula, with_f - formula
+        kind = f"props:{sport}:near"
+        if with_f == formula:
+            return book.estimate(kind, formula), 0.0
+        n_plain, n_with = book.calls(kind, formula), book.calls(kind, with_f)
+        with_x = book.estimate(kind, with_f) if n_with or not n_plain else book.estimate(kind, formula) * with_f / formula
+        plain = book.estimate(kind, formula) if n_plain or not n_with else with_x * formula / with_f
+        return plain, max(0.0, with_x - plain)
 
     def refresh_events(self, force: bool = False) -> None:
         now = time.time()
@@ -7055,7 +8214,9 @@ class Scheduler:
         first (up to LIVE_MAX_STRETCH), then early checks (up to EXTRA_MAX_STRETCH), then early props
         and 1-2 days out further (up to EXTRA_MAX_STRETCH again), then the rest (near kickoff, and
         the pre-game checks of sports with a live game, last). On a day with room to spare, spend the
-        spare on faster pre-game checks (SPARE_ORDER), never on faster live ones."""
+        spare on faster pre-game checks (SPARE_ORDER), never on faster live ones. The extra prop types near
+        kickoff (PROP_NEAR_MARKETS) are asked for only on a day that fits at full speed with them, after the
+        near-kickoff speed-ups (near_extras): they never slow a live or main-line check."""
         cfg = self.cfg
         remaining = self.api.remaining if self.api.remaining is not None else cfg.monthly_credits
         reserve = 0.02 * remaining  # small cushion for forecast misses
@@ -7063,7 +8224,7 @@ class Scheduler:
         self.overrun = self._overrun()
 
         cost = {lane: self.lane_cost(lane) for lane in LANE_KINDS}
-        demand = dict.fromkeys((LIVE, PRE_LIVE, PREGAME, EARLY, FAR, PROP_NEAR, PROP_EARLY), 0.0)
+        demand = dict.fromkeys((LIVE, PRE_LIVE, PREGAME, EARLY, FAR, PROP_NEAR, PROP_NEAR_X, PROP_EARLY), 0.0)
         for step in range(0, 86400, STEP):
             t = now + timedelta(seconds=step)
             if seconds_until_active(cfg, t):
@@ -7071,17 +8232,19 @@ class Scheduler:
             for sport in cfg.sports:
                 for lane, st in self.lanes(sport, t):
                     demand[st] += STEP * cost[lane] / self.base_interval(st)
-            near, early = self._prop_rates(t)
+            near, near_x, early = self._prop_rates(t)
             demand[PROP_NEAR] += STEP * near
+            demand[PROP_NEAR_X] += STEP * near_x
             demand[PROP_EARLY] += STEP * early
         self.demand = demand
         live = demand[LIVE]
-        core = live + demand[PRE_LIVE] + demand[PREGAME] + demand[PROP_NEAR]
+        spare_only = cfg.prop_near_spare_only   # (false: the extras are paid for like the rest of the prop check)
+        core = live + demand[PRE_LIVE] + demand[PREGAME] + demand[PROP_NEAR] + (0.0 if spare_only else demand[PROP_NEAR_X])
         extra = demand[EARLY] + demand[FAR] + demand[PROP_EARLY]
         self.forecast = core + extra
         a, cap = self.allowance, max(1.0, cfg.extra_max_stretch)
         fits = lambda need: need <= a * (1 + 1e-9)   # (a slow-down worked out to fit exactly still fits)
-        self.live_scale, self.speed, self.spare = 1.0, {}, 0.0
+        self.live_scale, self.speed, self.spare, self.near_extras = 1.0, {}, 0.0, not spare_only
         # Only with the split: otherwise the live check also carries the sport's upcoming games, and
         # slowing it would slow their pre-game checks too.
         stretch = max(1.0, cfg.live_max_stretch or 1.0) if self.split else 1.0
@@ -7099,7 +8262,8 @@ class Scheduler:
             self.scale = self.extra_scale = 1.0
             r = self.overrun   # (spare spending shrinks if credits go faster than the calls cost)
             self._spend_spare(a * cfg.spare_use_pct / 100 / r - (core + extra),
-                              a / r - (core + extra) if cfg.spare_use_pct else 0.0)
+                              a / r - (core + extra) if cfg.spare_use_pct else 0.0, a / r - (core + extra))
+            self.forecast += demand[PROP_NEAR_X] if self.near_extras and spare_only else 0.0
         elif fits(core + extra / cap):
             self.scale, self.extra_scale = 1.0, extra / (a - core)   # only early checks slow down
         elif fits(core + (extra - side) / cap + side / cap ** 2):
@@ -7161,11 +8325,13 @@ class Scheduler:
                 f"resets and pre-game checks keep their pace. Until that eases, live alerts work from older prices "
                 f"and take longer to confirm. (Said once a day.)")
 
-    def _spend_spare(self, budget: float, room: float = 0.0) -> None:
+    def _spend_spare(self, budget: float, room: float = 0.0, whole: float = 0.0) -> None:
         """Credits the day can spare go to faster pre-game checks, in SPARE_ORDER, each tier down to
         its floor (*_MIN_MINUTES) before the next one gets any. First, the pre-game checks of sports
         with a live game, down to every live check: they may use the day's whole share (room, not
-        just SPARE_USE_PCT of it), since before LIVE_MARKETS they came with every live check."""
+        just SPARE_USE_PCT of it), since before LIVE_MARKETS they came with every live check.
+        The extra prop types near kickoff (PROP_NEAR_X) are all or nothing: on (near_extras) when what's
+        left of the day's whole share at full speed (whole) after the speed-ups before them covers them."""
         cfg = self.cfg
         rates = {PRE_LIVE: (cfg.poll_seconds * cfg.pregame_with_live_every / 60, cfg.poll_seconds / 60),
                  PREGAME: (cfg.pregame_minutes, cfg.pregame_min_minutes),
@@ -7174,8 +8340,18 @@ class Scheduler:
                  PROP_NEAR: (cfg.prop_minutes, cfg.prop_min_minutes),
                  FAR: (cfg.far_minutes, cfg.far_min_minutes)}
         for tier in SPARE_ORDER:
+            if tier == PROP_NEAR_X:
+                d = self.demand.get(PROP_NEAR_X, 0.0)
+                if not self.cfg.prop_near_spare_only:
+                    continue   # (paid for with the near-kickoff prop checks: on already)
+                if d <= whole - self.spare:
+                    self.near_extras = True
+                    budget -= d
+                continue
             base, floor = rates[tier]
             d = self.demand.get(tier, 0.0)
+            if tier == PROP_NEAR and self.near_extras:   # (a faster near-kickoff prop check asks for them too)
+                d += self.demand.get(PROP_NEAR_X, 0.0)
             have = max(budget, room) if tier == PRE_LIVE else budget
             if not d or have <= 0 or floor <= 0 or floor >= base:
                 continue
@@ -7207,19 +8383,21 @@ class Scheduler:
             return self.cfg.prop_minutes * 60 * self.scale / self.speed.get(PROP_NEAR, 1.0)
         return self.cfg.prop_early_minutes * 60 * self.extra_scale * self.side_scale / self.speed.get(PROP_EARLY, 1.0)
 
-    def _prop_rates(self, t: datetime) -> tuple[float, float]:
-        """Credits per second on props at time t at full speed: (near kickoff, early)."""
-        near = early = 0.0
+    def _prop_rates(self, t: datetime) -> tuple[float, float, float]:
+        """Credits per second on props at time t at full speed: (near kickoff, what PROP_NEAR_MARKETS add to
+        those, early)."""
+        near = near_x = early = 0.0
         tz = ZoneInfo(self.cfg.timezone)
         day = t.astimezone(tz).date()
         for sport, _, start in self._prop_slots(t):
             hours = (start - t).total_seconds() / 3600
-            cost = self.prop_cost(sport, hours, start.astimezone(tz).date() == day)
             if start - t <= timedelta(hours=self.cfg.prop_hours):
-                near += cost / (self.cfg.prop_minutes * 60)
+                plain, extra = self.near_costs(sport)
+                near += plain / (self.cfg.prop_minutes * 60)
+                near_x += extra / (self.cfg.prop_minutes * 60)
             else:
-                early += cost / (self.cfg.prop_early_minutes * 60)
-        return near, early
+                early += self.prop_cost(sport, hours, start.astimezone(tz).date() == day) / (self.cfg.prop_early_minutes * 60)
+        return near, near_x, early
 
     def props_due(self, now: datetime) -> list[tuple[str, str]]:
         ts = time.time()
@@ -7238,21 +8416,55 @@ class Scheduler:
                     and ts - self.last_props.get(gid, 0) >= 60]                     # retry a failure each minute
         return out
 
-    def fetch_props(self, games: list[tuple[str, str]]) -> tuple[list[dict], set[str]]:
+    def fetch_props(self, games: list[tuple[str, str]], now: datetime | None = None) -> tuple[list[dict], set[str]]:
         """Prop odds per game, plus the ids of games whose request worked (a failed request
-        must not count as "looked and the bet is gone")."""
+        must not count as "looked and the bet is gone"). A game within PROP_HOURS of kickoff also
+        asks for PROP_NEAR_MARKETS while the day's credits cover them (near_extras, see update_budget);
+        if the API rejects that request (422), the game is asked again
+        without them and the sport stops asking for them until a restart (said once, here and in
+        the health channel). Only a rejected plain request stops the sport's props (then it's PROP_MARKETS
+        that's wrong, not the extras, and that's what's said)."""
+        cfg = self.cfg
+        now = now or datetime.now(timezone.utc)
+        starts = {gid: start for sport in {s for s, _ in games} for gid, start in self.games.get(sport, [])}
+
         def one(item):
             sport, gid = item
+            plain = cfg.prop_request(sport)
+            near = (sport not in self.bad_near_sports and self.near_extras and gid in starts
+                    and starts[gid] - now <= timedelta(hours=cfg.prop_hours))
+            ask = cfg.prop_request(sport, near)
+            rejected = False   # the near-kickoff extras were rejected (the answer is the plain request's)
             try:
-                return item, self.api.event_odds(sport, gid, self.cfg.prop_markets[sport])
+                if ask != plain:
+                    try:
+                        return item, stamp_fetched(self.api.event_odds(sport, gid, ask)), False
+                    except urllib.error.HTTPError as e:
+                        if e.code != 422:
+                            raise
+                        rejected = True
+                return item, stamp_fetched(self.api.event_odds(sport, gid, plain)), rejected
             except Exception as e:  # noqa: BLE001 - reported below
-                return item, e
+                return item, e, rejected
 
         events: list[dict] = []
         ok: set[str] = set()
         with ThreadPoolExecutor(max_workers=min(8, len(games))) as pool:
-            for (sport, gid), result in pool.map(one, games):
+            for (sport, gid), result, rejected in pool.map(one, games):
                 self.last_props[gid] = time.time()
+                plain_rejected = isinstance(result, urllib.error.HTTPError) and result.code == 422
+                if rejected and not plain_rejected and sport not in self.bad_near_sports:
+                    self.bad_near_sports.add(sport)
+                    extra = ", ".join(cfg.prop_near_extra(sport))
+                    print(f"! The extra {sport} props near kickoff ({extra}) were rejected (422): check "
+                          f"PROP_NEAR_MARKETS. Asking without them until restart; its other props carry on.",
+                          file=sys.stderr)
+                    self.notices.append(f"⚠️ The Odds API rejected the extra {short(sport)} prop types ({extra}): "
+                                        f"check PROP_NEAR_MARKETS. Regular {short(sport)} props continue.")
+                if isinstance(result, urllib.error.HTTPError) and result.code == 404:
+                    self.props_answered.add(sport)   # (that game is gone, e.g. an old id: not an outage)
+                elif isinstance(result, Exception):
+                    self.failures[sport] = fail_reason(result)
                 if isinstance(result, urllib.error.HTTPError):
                     if result.code in (401, 429):
                         raise result
@@ -7262,6 +8474,8 @@ class Scheduler:
                         self.bad_prop_sports.add(sport)
                         print(f"! Props for {sport} rejected (422): check PROP_MARKETS for it. "
                               f"Skipping {sport} props until restart.", file=sys.stderr)
+                        self.notices.append(f"⚠️ The Odds API rejected the {short(sport)} prop request: check "
+                                            f"PROP_MARKETS. No {short(sport)} props until a restart.")
                     else:
                         print(f"! Props error for {sport} {gid}: {result.code}", file=sys.stderr)
                 elif isinstance(result, Exception) or not isinstance(result, dict):
@@ -7352,11 +8566,13 @@ class Scheduler:
             sport, lane = job
             try:
                 if lane == "live":   # LIVE_MARKETS for every game: live ones, and upcoming ones for free
-                    return job, self.api.odds(sport, until, markets=self.lane_markets(lane), kind=LANE_KINDS[lane])
-                if lane == "pre":    # the other bet types, games that haven't started
-                    return job, self.api.odds(sport, until, markets=self.lane_markets(lane), since=since[sport],
-                                              kind=LANE_KINDS[lane])
-                return job, self.api.odds(sport, until)
+                    got = self.api.odds(sport, until, markets=self.lane_markets(lane), kind=LANE_KINDS[lane])
+                elif lane == "pre":    # the other bet types, games that haven't started
+                    got = self.api.odds(sport, until, markets=self.lane_markets(lane), since=since[sport],
+                                        kind=LANE_KINDS[lane])
+                else:
+                    got = self.api.odds(sport, until)
+                return job, stamp_fetched(got)
             except Exception as e:  # noqa: BLE001 - reported below
                 return job, e
 
@@ -7370,6 +8586,8 @@ class Scheduler:
                     self.last_live[sport] = ts
                 else:
                     self.last_odds[sport] = ts
+                if isinstance(result, Exception):
+                    self.failures[sport] = fail_reason(result)
                 if isinstance(result, urllib.error.HTTPError):
                     if result.code in (401, 429):
                         raise result
@@ -7449,7 +8667,7 @@ Optional: also place the 🔒 bets it lists to lock in a guaranteed profit.
 📦 **PARLAY** (purple)
 One ticket with 2-3 +EV bets from different games, all at the same book. Every leg must win. Bigger payout, wins less often, so the stake is small.
 
-🏦 **Kalshi** prices in alerts already include Kalshi's trading fee. If Kalshi doesn't have enough on offer at that price for the whole stake, the card says so (a +EV or outlier stake is cut to what's there).
+🏦 **Kalshi** prices in alerts already include Kalshi's trading fee. If Kalshi doesn't have enough on offer at that price for the whole stake, the card says so (a +EV or outlier stake is cut to what's there). On an NFL moneyline the card also notes that Kalshi settles a tie by its own rules (sportsbooks refund one).
 
 ⏱ **Price age** on a card: how long the book had shown that price when the alert went out. A live alert only goes out once two checks in a row (about a minute apart) find it and the price is under a minute old, so it's less likely to be gone when you tap. Before a game, a price can sit unchanged for hours: that's normal. Player props don't show one: the book doesn't say when each player's line last moved.
 
@@ -7464,7 +8682,7 @@ As games finish, the bot posts what hit: ✅ won, ❌ lost, ➖ push, with the p
 **Every time**
 1. Tap the book name to open it. Check the price matches the alert, or is better.
 2. Worse than the "skip" price? Don't bet.
-3. Bet the exact amount shown. Don't go bigger.
+3. Bet the exact amount shown (the "1.5u" next to it is the same amount in units). Don't go bigger.
 4. 🟢 in "Every book" means that book's price is also good to bet.
 5. Books sometimes cancel bets on obvious mistakes and refund the money. With an arb, the other bet still stands, so you're left with one normal bet."""
 
@@ -7550,11 +8768,27 @@ def mode_line(cfg: Config) -> str:
         confirmed = (f" (pre-game {pct:g}%+ when Kalshi or 4+ other books agree with Pinnacle)"
                      if 0 < pct < cfg.min_ev_pct else "")
         return (f"Alert mode: LOCKS: arbs {cfg.min_profit_pct:g}%+ (live {cfg.min_live_profit_pct:g}%+), "
-                f"+EV {cfg.min_ev_pct:g}%+ {cfg.min_confidence}-confidence only{confirmed}, props {cfg.prop_min_ev_pct:g}%+, "
+                f"+EV {cfg.min_ev_pct:g}%+ {cfg.min_confidence}-confidence only{confirmed}, props {cfg.prop_min_ev_pct:g}%+"
+                f"{' (Overs only)' if cfg.prop_sides == 'over' else ''}, "
                 f"outliers {cfg.outlier_min_pct:g}%+ (live {live_out:g}%+), parlays {cfg.parlay_min_ev_pct:g}%+"
                 + (f"; at most {caps}" if caps else "")
                 + (f"; live alerts need {' and '.join(rules)}" if rules else ""))
-    return f"Alert mode: {cfg.alert_mode.upper()} (thresholds as set in .env)"
+    return (f"Alert mode: {cfg.alert_mode.upper()} (thresholds as set in .env)"
+            + ("; player props: Overs only (PROP_SIDES=over)" if cfg.prop_sides == "over" else ""))
+
+
+def unit_line(cfg: Config) -> str:
+    """What one unit is on the bet cards ("1u = $10"), and where that comes from."""
+    where = "UNIT_SIZE" if cfg.unit_size > 0 else f"1% of EV_BANKROLL {money(cfg.ev_bankroll)}"
+    return f"Stakes in units: 1u = {money(cfg.unit())} ({where})"
+
+
+def online_message(cfg: Config) -> str:
+    """The health channel's message when the bot starts."""
+    return (f"🟢 Arb bot online: watching {', '.join(short(s) for s in cfg.sports)} ({cfg.markets}). "
+            f"Bet cards show stakes in units too: 1u = {money(cfg.unit())}."
+            + (f" Using {len(REMOTE_USED)} settings pushed for you ({REMOTE_ENV}); {mode_line(cfg)}"
+               if REMOTE_USED else ""))
 
 
 def print_plan(cfg: Config, sched: Scheduler) -> None:
@@ -7591,6 +8825,10 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
         print(f"\nProps: {len(prop_games)} games in the next 24h ({', '.join(short(s) for s in cfg.prop_sports)}): "
               f"every {cfg.prop_early_minutes // 60}h from {cfg.prop_early_hours:g}h out, "
               f"every {cfg.prop_minutes}m in the last {cfg.prop_hours:g}h.")
+        near = [f"{short(s)} {', '.join(cfg.prop_near_extra(s))}" for s in cfg.prop_sports
+                if cfg.prop_markets.get(s) and cfg.prop_near_extra(s)]
+        if near:
+            print(f"  In the last {cfg.prop_hours:g}h they also ask for (PROP_NEAR_MARKETS): {'; '.join(near)}.")
     day = WEEKDAYS[now.astimezone(tz).weekday()]
     w = cfg.budget_weights.get(day, 1.0)
     avg = sum(cfg.budget_weights.get(d, 1.0) for d in WEEKDAYS) / 7
@@ -7654,6 +8892,9 @@ def pace_lines(cfg: Config, sched: Scheduler) -> list[str]:
     if faster:
         lines.append(f"→ Spare credits (~{sched.spare:,.0f} in the next 24h) buy faster pre-game checks: "
                      f"{', '.join(faster)}. Live checks never go faster than {cfg.poll_seconds}s.")
+    if sched.demand.get(PROP_NEAR_X) and not sched.near_extras:
+        lines.append("→ The extra prop types near kickoff (PROP_NEAR_MARKETS) wait: the next 24h's credits don't "
+                     "cover them after live and near-kickoff checks at full speed. The usual props carry on.")
     if sched.overrun > 1.05 and max(sched.scale, sched.extra_scale, sched.live_scale) <= 1.01:
         lines.append(f"→ Credits are going {sched.overrun:.1f}× as fast as the checks should cost (the API doesn't "
                      f"say what each one cost), so less goes to faster pre-game checks.")
@@ -7661,8 +8902,10 @@ def pace_lines(cfg: Config, sched: Scheduler) -> list[str]:
 
 
 def pace_state(sched: Scheduler) -> tuple:
-    """The check rates update_budget sets: (scale, extra_scale, live_scale, side_scale, speed)."""
-    return sched.scale, sched.extra_scale, sched.live_scale, sched.side_scale, dict(sched.speed)
+    """The check rates update_budget sets: (scale, extra_scale, live_scale, side_scale, near-kickoff prop
+    extras on (1) or not (0), speed)."""
+    return (sched.scale, sched.extra_scale, sched.live_scale, sched.side_scale, float(sched.near_extras),
+            dict(sched.speed))
 
 
 def pace_changed(old: tuple, sched: Scheduler) -> bool:
@@ -7699,11 +8942,16 @@ def cost_lines(cfg: Config, sched: Scheduler) -> list[str]:
             f = cfg.prop_credits_per_call(sport)
             if not f:
                 continue
-            buckets = [("near kickoff", "near")] + [(f"up to {h}h out", f"{h}h") for h in PROP_COST_HOURS
-                                                     if h > cfg.prop_hours]
-            if book and any(book.calls(f"props:{sport}:{b}", f) for _, b in buckets):
+            # (Near kickoff the request carries PROP_NEAR_MARKETS too, unless the API rejected them.)
+            near_f = cfg.prop_credits_per_call(sport, near=sport not in sched.bad_near_sports)
+            buckets = [("near kickoff", "near", near_f)] + [(f"up to {h}h out", f"{h}h", f) for h in PROP_COST_HOURS
+                                                             if h > cfg.prop_hours]
+            if book and any(book.calls(f"props:{sport}:{b}", bf) for _, b, bf in buckets):
                 lines.append(f"{short(sport)} props per game: "
-                             + ", ".join(f"{one(f'props:{sport}:{b}', f)} {label}" for label, b in buckets))
+                             + ", ".join(f"{one(f'props:{sport}:{b}', bf)} {label}" for label, b, bf in buckets))
+            elif near_f != f:
+                lines.append(f"{short(sport)} props per game: {near_f} near kickoff, {f} earlier "
+                             f"(formula; measured once props are checked)")
             else:
                 lines.append(f"{short(sport)} props per game: {f} (formula; measured once props are checked)")
     return lines
@@ -7813,7 +9061,12 @@ class Trackers:
         self.held = HeldTally(cfg, None if off else held_path(cfg))
         for a in (self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs, self.prop_outs, self.parlays):
             a.on_held = self.held.add
+        # Bets that came close and what happened to them (CANDIDATE_LOG_FILE; not for --once, --demo or --dry-run).
+        self.candidates = CandidateLog(replace(cfg, candidate_log_file="") if off else cfg)
+        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs):
+            a.on_candidate = self.candidates.add
         self.sharp_history = SharpHistory(cfg.move_window_minutes)
+        self.sharp_down: set[str] = set()   # sports the sharp book is missing from (Health; run() keeps it)
         self.price_history = PriceHistory()
         # +EV props no sharp prices: spots a book that moved first on news. Its own memory: outliers
         # store the same keys against a different bar and fair price.
@@ -7858,7 +9111,8 @@ class Trackers:
 
 HELD_LABELS = {"waiting": "live, waiting for another check", "unconfirmed": "live, gone before it was confirmed",
                "old price": "live, price too old", "capped": "over the hourly cap",
-               "live cap": "over the live-alert cap"}
+               "live cap": "over the live-alert cap", "old data": "odds too old by sending time (checked again)",
+               "not sent": "Discord didn't take it (tried again next check)"}
 
 
 def take_held(*alerters: Alerter) -> dict[str, int]:
@@ -7896,6 +9150,7 @@ def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: d
     def clock() -> datetime:
         return now or datetime.now(timezone.utc)
     take_held(t.arbs, t.outs, t.evs)
+    close["fetched"] = fetched_at(events)   # (no post on odds too old by the time it's ready)
     at = clock()
     arbs = find_arbs(events, cfg, at)
     # An arb with a Kalshi bet waits for Kalshi's quotes (asked below anyway), so its card can say when
@@ -7907,11 +9162,13 @@ def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: d
     if kq is None:
         kq = kalshi_fair(events, cfg, clock()) if kalshi else {}   # free: Kalshi's own prices as a second opinion
     at = clock()
-    outs = find_outliers(events, cfg, at, history=t.price_history, kalshi=kq)
+    rejects: list = []   # (for the candidate log)
+    outs = find_outliers(events, cfg, at, history=t.price_history, kalshi=kq, rejects=rejects)
     misses: dict[str, int] = {}
     up = set(t.evs.open) | set(t.evs.restored)   # +EV cards up: a confirmed one stays while a source is only missing
     evs = without_outliers(find_evs(events, cfg, at, history=t.sharp_history, kalshi=kq, keep=up,
-                                    confirm_misses=misses), outs)
+                                    confirm_misses=misses, sharp_down=t.sharp_down, rejects=rejects), outs)
+    t.candidates.extend(rejects, at.timestamp())
     hand_over(evs, outs, t.evs, t.outs, at.timestamp())
     kept = {id(b) for b in t.screen(t.bet_live, outs + evs, scope, at.timestamp(), (t.outs, t.evs))}
     post_outs, post_evs = [b for b in outs if id(b) in kept], [b for b in evs if id(b) in kept]
@@ -7938,20 +9195,31 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
     take_held(t.prop_arbs, t.prop_outs, t.prop_evs)
     t.prop_prices.held, t.prop_prices.missed = {}, []
     carded = {k for a in (t.prop_evs, t.prop_outs) for k in (*a.open, *a.restored)}
-    p_outs = find_outliers(prop_events, cfg, at, history=t.price_history)
+    alt_seen: set = set()   # alternate-line prices with a fair price at exactly their line
+    rejects: list = []      # (for the candidate log)
+    p_outs = find_outliers(prop_events, cfg, at, history=t.price_history, alt_seen=alt_seen, rejects=rejects)
     p_evs = without_outliers(find_evs(prop_events, t.prop_cfg, at, history=t.sharp_history, prices=t.prop_prices,
-                                      keep=carded), p_outs)
+                                      keep=carded, alt_seen=alt_seen, sharp_down=t.sharp_down, rejects=rejects), p_outs)
+    t.candidates.extend(rejects, ts)
     t.prop_prices.prune(at)
     hand_over(p_evs, p_outs, t.prop_evs, t.prop_outs, ts)
     note_related([(p_outs, t.prop_outs, checked), (p_evs, t.prop_evs, checked),
                   ([], t.outs, set()), ([], t.evs, set())], ts)
-    n_arb = t.prop_arbs.handle(find_arbs(prop_events, cfg, at), checked_events=checked, now=ts)
-    n_out = t.prop_outs.handle(p_outs, checked_events=checked, now=ts)
-    n_ev = t.prop_evs.handle(p_evs, checked_events=checked, now=ts)
+    fetched = fetched_at(prop_events)
+    n_arb = t.prop_arbs.handle(find_arbs(prop_events, cfg, at), checked_events=checked, now=ts, fetched=fetched)
+    n_out = t.prop_outs.handle(p_outs, checked_events=checked, now=ts, fetched=fetched)
+    n_ev = t.prop_evs.handle(p_evs, checked_events=checked, now=ts, fetched=fetched)
     t.closing.observe(prop_events, at)
     t.closing.finalize(at)
+    # Alternate lines (PROP_NEAR_MARKETS), when this check had any: (prices matched to a fair price at
+    # their exact line, new alerts from one), for the console.
+    alt = None
+    if any(is_alt(m.get("key", "")) for ev in prop_events for bm in ev.get("bookmakers", [])
+           for m in bm.get("markets", [])):
+        alt = (len(alt_seen), sum(1 for a in (t.prop_evs, t.prop_outs) for k, op in a.open.items()
+                                  if k not in carded and op.arb.alt))
     return SimpleNamespace(n_arb=n_arb, n_out=n_out, n_ev=n_ev, held=take_held(t.prop_arbs, t.prop_outs, t.prop_evs),
-                           prices_held=dict(t.prop_prices.held), missed=list(t.prop_prices.missed))
+                           prices_held=dict(t.prop_prices.held), missed=list(t.prop_prices.missed), alt=alt)
 
 
 def confirmed_text(sent: int, misses: dict[str, int]) -> str:
@@ -7964,6 +9232,19 @@ def confirmed_text(sent: int, misses: dict[str, int]) -> str:
     why = ", ".join(f"{c} {r}" for r, c in sorted(misses.items(), key=lambda x: (-x[1], x[0])))
     return (f" | ✅✅ confirmed pre-game: {sent} sent"
             + (f", {n} near miss{'es' if n != 1 else ''} ({why})" if n else ""))
+
+
+def kalshi_only_text(evs: list["EVBet"]) -> str:
+    """The console line's count of +EV bets priced by Kalshi alone (KALSHI_ONLY): " | Kalshi-only: 2", or ""."""
+    n = sum(b.kalshi_only for b in evs)
+    return f" | Kalshi-only: {n}" if n else ""
+
+
+def alt_text(alt: tuple[int, int] | None) -> str:
+    """The props console line's count of alternate lines: " | alternate lines: 12 matched, 1 alerted" (matched:
+    an alternate-line price with a fair price at exactly its line; alerted: new alerts priced on one).
+    "" when the check had no alternate lines."""
+    return f" | alternate lines: {alt[0]} matched, {alt[1]} alerted" if alt else ""
 
 
 def prop_guard_text(prices_held: dict[str, int], missed: list[list[str]], sharp: str = "Pinnacle") -> str:
@@ -7983,17 +9264,24 @@ def prop_guard_text(prices_held: dict[str, int], missed: list[list[str]], sharp:
     return out
 
 
+def parlay_bets(*alerters: Alerter) -> list:
+    """The bets parlays are built from: every open card of these alerters, outliers too (a leg that grew
+    into an outlier is still the same bet; find_parlays applies the +EV price limits to every leg). Not a bet
+    whose own post is held because its odds were too old by then: those odds are too old for a parlay too."""
+    return [op.arb for a in alerters for op in a.open.values() if not op.deferred]
+
+
 def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     t = Trackers(cfg, args)
     alerter, ev_alerter, out_alerter, parlay_alerter = t.arbs, t.evs, t.outs, t.parlays
     prop_arbs, prop_evs, prop_outs = t.prop_arbs, t.prop_evs, t.prop_outs
     tracker, markouts = t.closing, t.markouts
     results = Results(cfg, dry_run=args.dry_run)
+    health = Health(cfg, status)        # outage messages (and which sports the sharp book is missing from)
+    t.sharp_down = health.sharp_down
 
     def update_parlays() -> int:
-        # Outliers too: a leg that grew into an outlier is still the same bet (find_parlays
-        # applies the +EV price limits to every leg).
-        open_bets = [op.arb for a in (ev_alerter, prop_evs, out_alerter, prop_outs) for op in a.open.values()]
+        open_bets = parlay_bets(ev_alerter, prop_evs, out_alerter, prop_outs)
         return parlay_alerter.handle(find_parlays(open_bets, cfg,
                                                   keep=set(parlay_alerter.open) | set(parlay_alerter.restored),
                                                   now=datetime.now(timezone.utc)))
@@ -8063,7 +9351,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         board = scoreboard_text(cfg).split("\n\n", 1)[1]     # the day itself is printed above
         print("\n" + re.sub(r"__|\*\*|```\n?", "", board))
         if report := _safely("--results", markout_report, cfg):
-            print("\nMarkouts (each alert's price checked again minutes later), all time:\n" + report)
+            print(f"\nMarkouts (each alert's price checked again minutes later), {markout_span(cfg)}:\n" + report)
         return
 
     mode = "dry run (console only)" if alerter.dry_run else "sending to Discord"
@@ -8076,10 +9364,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         print(f"Active hours: {cfg.active_hours} ({cfg.timezone})")
     if REMOTE_USED:
         print(f"Using settings pushed in {REMOTE_ENV}: " + ", ".join(f"{k}={v}" for k, v in REMOTE_USED.items()))
+    print(unit_line(cfg))
     if not args.once:
-        status.send(f"🟢 Arb bot online: watching {', '.join(short(s) for s in cfg.sports)} "
-                    f"({cfg.markets})." + (f" Using {len(REMOTE_USED)} settings pushed for you ({REMOTE_ENV}); "
-                                          f"{mode_line(cfg)}" if REMOTE_USED else ""))
+        status.send(online_message(cfg))
 
     tz = ZoneInfo(cfg.timezone)
     started_local = datetime.now(tz)
@@ -8087,6 +9374,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     summary_day = (started_local.date() if started_local.hour >= max(cfg.summary_hour, 0)
                    else started_local.date() - timedelta(days=1))
     idle_logged = False
+    pruned_day = None   # the local day the logs were last cut to LOG_KEEP_DAYS
     sharp_seen = False
     sharp_checks = 0
     save_costs = False
@@ -8111,6 +9399,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             status.send_card(summary_payload(cfg, sections, api.remaining, book.take_today() if book else None))
             for a in (alerter, ev_alerter, out_alerter, parlay_alerter, prop_arbs, prop_evs, prop_outs):
                 a.reset_stats()
+
+        if cfg.log_keep_days and not (args.once or args.dry_run) and local.date() != pruned_day:
+            pruned_day = local.date()   # once a day (and at start): candidates.csv, arbs.csv, markouts.csv
+            for name, n in prune_logs(cfg, now).items():
+                print(f"Trimmed {name} to the last {cfg.log_keep_days} days ({n} older rows removed).", flush=True)
 
         wait = seconds_until_active(cfg, now)
         if wait:
@@ -8137,7 +9430,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                                 "⏸️ BUDGET_WEIGHTS gives the next 24h no budget (weight 0). Pausing.")
                 time.sleep(3600)
                 continue
-            status.budget_warned = False
+            if status.budget_warned:
+                status.budget_warned = False
+                health.say("✅ Credits available again: scanning resumed.")
             if pace_changed(old, sched):
                 print(f"Budget: {sched.allowance:,.0f} credits/day, next 24h needs "
                       f"{sched.forecast:,.0f} at full speed → live checks every "
@@ -8154,11 +9449,22 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         # Main lines and props go out together, so neither waits on the other.
         with ThreadPoolExecutor(max_workers=2) as pool:
             main_job = pool.submit(sched.fetch, due, now) if due else None
-            prop_job = pool.submit(sched.fetch_props, prop_games) if prop_games else None
+            prop_job = pool.submit(sched.fetch_props, prop_games, now) if prop_games else None
             main_events, fetched_sports = main_job.result() if main_job else ([], set())
             fetched_props, fetched_gids = prop_job.result() if prop_job else ([], set())
+        for note in sched.notices:   # (a prop type the API rejected)
+            status.send(note)
+        sched.notices.clear()
         # Only sports/games whose request worked count as checked: a timeout isn't "the bet is gone".
         checked_sports = [s for s in due if s in fetched_sports]
+        # Outages (health channel): the Odds API per sport (main lines or props answered at all), then whether
+        # the sharp book is in the answers (before the checks below: while it's missing they adjust).
+        health.odds(set(due) | {sport for sport, _ in prop_games},
+                    set(fetched_sports) | {sport for sport, gid in prop_games if gid in fetched_gids}
+                    | sched.props_answered, sched.failures)
+        sched.failures.clear()
+        sched.props_answered.clear()
+        health.sharp(main_events, checked_sports)
         close_started(now, prop_arbs, prop_evs, prop_outs)   # first, so no new card names them
         if due:
             idle_logged = False
@@ -8166,10 +9472,12 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             events = main_events
             t.set_live_interval(sched.interval(LIVE))
             res = scan_main(t, events, checked_sports, scope=sched.scope)
+            health.kalshi(any(ev.get("sport_key") in KALSHI_SERIES and _parse_time(ev["commence_time"]) > now
+                              for ev in events))
             status.check_credits(api.remaining)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
-            ev_note = (f" | {len(res.evs)} +EV, {res.ev_sent} new{confirmed_text(res.confirmed_sent, res.confirm_misses)}"
-                       if cfg.ev_enabled else "")
+            ev_note = (f" | {len(res.evs)} +EV, {res.ev_sent} new{kalshi_only_text(res.evs)}"
+                       f"{confirmed_text(res.confirmed_sent, res.confirm_misses)}" if cfg.ev_enabled else "")
             ev_note += f" | {len(res.outs)} outliers, {res.out_sent} new" if cfg.outliers_enabled else ""
             print(f"[{datetime.now():%H:%M:%S}] checked {', '.join(short(s) for s in due)} "
                   f"({len(events)} games, {time.time() - t0:.1f}s) | {len(res.arbs)} arbs, {res.sent} new"
@@ -8203,7 +9511,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             print(f"[{datetime.now():%H:%M:%S}] props: {len(prop_games)} games ({time.time() - t0:.1f}s) | "
                   f"{p.n_arb} new arbs, {p.n_ev} new +EV, {p.n_out} new outliers{held_text(p.held)}"
-                  f"{prop_guard_text(p.prices_held, p.missed, (_csv(cfg.sharp_books) or ['sharp'])[0].title())} | "
+                  f"{prop_guard_text(p.prices_held, p.missed, (_csv(cfg.sharp_books) or ['sharp'])[0].title())}"
+                  f"{alt_text(p.alt)} | "
                   f"credits left {left}", flush=True)
 
         markouts.update(main_events, prop_events, now)   # after every alert of this pass went out
@@ -8230,10 +9539,88 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 print(f"  📋 {n_res} bet result(s) posted", flush=True)
 
         if args.once:
+            if line := links_line(main_events + prop_events, cfg):
+                print(line)   # (which books' cards open the bet itself, and which only the game)
             if not due and not prop_games:
                 print("Nothing live or starting soon to check right now.")
             return
         time.sleep(max(1.0, sched.seconds_to_next(now)))
+
+
+# --------------------------------------------------------------------------- the blueprint (--blueprint)
+
+BLUEPRINT_FILE = HERE / "docs" / "BLUEPRINT.md"   # every blueprint ID, its colour, status and what the bot does
+BLUEPRINT_STATUSES = ("DONE", "PARTIAL", "SUPERSEDED", "NOT_FEASIBLE", "PROCESS", "DEVIATION")
+
+
+def blueprint_rows(text: str) -> list[list[str]]:
+    """BLUEPRINT.md's table of IDs: [ID, colour, status, what the blueprint says, what the bot does] per row."""
+    rows = []
+    for line in text.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if line.startswith("|") and len(cells) == 5 and cells[2] in BLUEPRINT_STATUSES:
+            rows.append(cells)
+    return rows
+
+
+def _plain_md(s: str) -> str:
+    """Markdown as plain console text: no bold, no code marks."""
+    return s.replace("**", "").replace("`", "")
+
+
+def setting_now(cfg: Config, key: str) -> str | None:
+    """'KEY=value' as this bot has it now (ALERT_MODE applied) for a setting named like its Config field
+    (SHARP_WEIGHTS -> sharp_weights); None for anything else, and for webhooks and keys."""
+    name = key.lower()
+    if name not in {f.name for f in fields(Config)} or "webhook" in name or "key" in name:
+        return None
+    v = getattr(cfg, name)
+    if isinstance(v, bool):
+        shown = "true" if v else "false"
+    elif isinstance(v, (int, float)):
+        shown = _plain(v)
+    elif isinstance(v, dict):
+        shown = ";".join(f"{k}={_plain(x) if isinstance(x, (int, float)) else x}" for k, x in v.items())
+    else:
+        shown = "" if v is None else str(v)
+    return f"{key}={shown}" if shown else f"{key} (empty)"
+
+
+def blueprint_text(cfg: Config | None = None, path: Path | None = None) -> str:
+    """--blueprint: every YELLOW and RED item in docs/BLUEPRINT.md with its status and what was decided, then
+    the open decisions, each with the settings it names as this bot has them now (cfg; None: not shown)."""
+    path = path or BLUEPRINT_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return f"{path} is missing: it comes with the code (git pull brings it back).\n"
+    wrap = lambda s, ind: textwrap.fill(_plain_md(s), 100, initial_indent=ind, subsequent_indent=" " * len(ind),
+                                        break_long_words=False, break_on_hyphens=False)
+    out = ["The blueprint's Yellow and Red items (all of them, with every other ID, in docs/BLUEPRINT.md):", ""]
+    for id_, colour, status, says, does in blueprint_rows(text):
+        if colour in ("YELLOW", "RED"):
+            out += [f"{id_}  {colour}  {status}", wrap(says, "  "), wrap(does, "  → "), ""]
+    lines = text.splitlines()
+    start = next((i for i, x in enumerate(lines) if x.startswith("## Open decisions")), None)
+    if start is not None:
+        out.append(_plain_md(lines[start][3:]) + ":")
+        items: list[str] = []
+        for x in lines[start + 1:]:
+            if x.startswith("## "):
+                break
+            if x.startswith("- "):
+                items.append(x[2:].strip())
+            elif x.startswith("  ") and items:
+                items[-1] += " " + x.strip()
+        for item in items:
+            out.append(wrap(item, "- "))
+            if cfg is not None:
+                keys = dict.fromkeys(k for code in re.findall(r"`([^`]+)`", item)
+                                     for k in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", code))
+                now = [x for x in (setting_now(cfg, k) for k in keys) if x]
+                if now:
+                    out.append(wrap("Yours now: " + ", ".join(now), "    "))
+    return "\n".join(out).rstrip() + "\n"
 
 
 def main() -> None:
@@ -8267,10 +9654,21 @@ def main() -> None:
                    help="print the weekly report card for the last 7 days, with suggestions (free, no credits)")
     p.add_argument("--post-weekly", action="store_true",
                    help="post the weekly report card to the results channel now (it goes out by itself on Mondays)")
+    p.add_argument("--blueprint", action="store_true",
+                   help="print the blueprint's Yellow and Red items: their status, what was decided, and your "
+                        "current settings for the open decisions (free, no credits)")
     args = p.parse_args()
 
     if args.set_webhook:
         set_webhook(args.set_webhook)
+        return
+
+    if args.blueprint:   # (before the settings check: a bad .env only hides the "Yours now" values)
+        try:
+            cfg = Config.from_env()
+        except ValueError:
+            cfg = None
+        print(blueprint_text(cfg), end="")
         return
 
     if args.set:
@@ -8281,12 +9679,13 @@ def main() -> None:
             if not sep or not key.replace("_", "").isalnum():
                 sys.exit(f"Use KEY=VALUE, like MY_BOOKS=fanduel,draftkings (got: {item!r}). Nothing was changed.")
             changes[key] = value.strip()
+        asked, changes = changes, with_unit_bankroll(changes)
         problem, others = check_settings(changes)
         if problem:
             sys.exit(f"Bad value: {problem}. Nothing was changed.")
         for key, value in changes.items():
             set_env_value(HERE / ".env", key, value)
-            print(f"Saved {key}={value}")
+            print(f"Saved {key}={value}" + ("" if key in asked else " (100 units, so every stake scales with UNIT_SIZE)"))
             if key in REMOTE_USED:
                 print(f"Note: {REMOTE_ENV} (settings pushed for you) sets {key}={REMOTE_USED[key]}, and that wins "
                       f"over .env. To use your own settings instead: --set REMOTE_SETTINGS=off")
@@ -8366,6 +9765,8 @@ def main() -> None:
     if bad:
         status.send(f"⚠️ {', '.join(bad)} in .env isn't a Discord webhook URL, so those alerts are going "
                     f"to this channel for now. Fix it with: nano /opt/arb-bot/.env")
+    for w in cfg.warnings():   # settings that load but probably aren't what was meant
+        status.send(f"⚠️ {w}")
     while True:
         try:
             run(cfg, args, status)
