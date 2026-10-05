@@ -137,6 +137,10 @@ go, as before. Prop arbs stay with the arbs, and cards already up stay where the
 
 ## 🎯 Player props
 
+*On the $119 plan, remote.env asks for many more: 76 prop types across NFL, NBA, NHL and MLB, alternate
+lines included, every 5 minutes in the last 12 hours and every 30 minutes from 2 days out. See "On the $119
+plan" below. This section describes the defaults.*
+
 Passing/rushing/receiving yards and receptions (NFL), points/rebounds/assists/threes (NBA), and
 points/shots/assists (NHL), plus, in the last 3 hours before kickoff, NHL goals and goalie saves and
 NFL alternate lines (`PROP_NEAR_MARKETS`, see below). Props are priced per game, so they're checked
@@ -730,6 +734,31 @@ come with the live check, so on a tight day they slow down with it: they're chec
 half less often than before. Live spreads and totals aren't checked at all. The credits lasted the
 month in every run, also with real costs 30% above the formula. Run `--plan` any time to see the
 actual numbers for today.
+
+## On the $119 plan
+
+The Odds API's $119 plan has 5,000,000 credits a month (50 times the $59 plan's). remote.env turns on what
+that pays for (upgraded Mon Oct 5):
+
+- **Every minute** for the moneylines, spreads and totals of every game in the next 48 hours, and live
+  games every 40 seconds (`POLL_SECONDS=40`, as often as the Odds API refreshes live odds).
+- **76 prop types** with their alternate lines (`PROP_MARKETS`): NFL passing yards, TDs, completions,
+  attempts and interceptions, rushing yards and attempts, receptions, receiving yards, rushing + receiving
+  yards and anytime TD; NBA points, rebounds, assists, threes, the four combos, blocks, steals, blocks +
+  steals and turnovers; NHL points, shots, assists, goals, goalie saves, blocked shots and anytime goal
+  scorer; MLB hits, total bases, home runs, RBIs, runs, walks, hits + runs + RBIs and pitcher strikeouts,
+  outs, earned runs, hits allowed and walks. Every 5 minutes in the last 12 hours before a game, every 30
+  minutes from 48 hours out, at most 8 games per pass (`PROP_MAX_PER_PASS`).
+- **Men's college basketball** (`basketball_ncaab` in `SPORTS`) from November, under the same rules as
+  college football (6% for +EV, New York's sportsbooks left out of games with a New York college team).
+- Credits spread almost evenly across the week (`BUDGET_WEIGHTS`), a low-credits warning at 250,000
+  (`LOW_CREDITS`), and open cards edited at most every 10 minutes for small changes
+  (`CARD_EDIT_MIN_SECONDS=600`).
+
+A simulated month at these settings used about 70,000 credits a day in October and 89,000 a day in November
+(2.1 to 2.7 million of the 5 million), with no check ever slowed down. Credits reset on the 1st at midnight
+UTC (`BILLING_DAY=1`). The bot reads the credits left from every answer and the budget autopilot still slows
+things down if they ever run short. `--plan` shows today's numbers.
 
 ## Run it 24/7 on a server (~$5/month)
 

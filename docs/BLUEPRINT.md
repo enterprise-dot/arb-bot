@@ -78,16 +78,11 @@ Claude, or change the setting yourself (`python3 arbbot.py --set NAME=value`, th
 - **Prop Unders** (SCOPE-15, OOS-13): `PROP_SIDES` empty means Overs only in locks mode, as the blueprint
   says, and Overs and Unders in balanced and all mode. Today's flood settings (`ALERT_MODE=balanced` in
   remote.env) send the Unders, about half the prop picks. `PROP_SIDES=over` stops them.
-- **Credits for NHL goals and saves and NFL alternate lines** (SCOPE-13, SCOPE-14): asked for in the last 3
-  hours before each game (`PROP_NEAR_MARKETS`), but by default only with credits the day has to spare
-  (`PROP_NEAR_SPARE_ONLY=true`): when the next 24 hours fit at full speed with them added, after the
-  near-kickoff speed-up of main-line checks. They never slow a live or main-line check; on a short day they
-  wait and the usual props carry on. In the simulated October (every credit used) that was about 1
-  near-kickoff check in 20, about 200 credits. `PROP_NEAR_SPARE_ONLY=false` asks for them every time: about
-  3,570 credits that month (NHL ~1,810, NFL ~1,760), paid for by main-line checks coming about 4-5% less often
-  and live checks 2-5 seconds further apart. To turn them off: put
-  `PROP_NEAR_MARKETS=icehockey_nhl=;americanfootball_nfl=` in `.env` (with `--set`, in quotes:
-  `python3 arbbot.py --set "PROP_NEAR_MARKETS=icehockey_nhl=;americanfootball_nfl="`).
+- **NHL goals and saves, and alternate lines** (SCOPE-13, SCOPE-14): on the $119 plan they're in
+  `PROP_MARKETS` (remote.env), so every prop check asks for them, with the alternate lines of every prop type
+  in NFL, NBA, NHL and MLB. Nothing extra is asked for near kickoff any more (`PROP_NEAR_MARKETS` is empty
+  for both sports), so `PROP_NEAR_SPARE_ONLY` has nothing left to do. Back on a 100K-credit plan, the $119-plan
+  block of remote.env comes out, and with it the old near-kickoff extras come back.
 - **Odds too old by the time an alert is ready** (FRESH-06, FRESH-07, FRESH-08, PERF-02, YELLOW): it isn't
   posted on odds older than 10 minutes (`SEND_MAX_DELAY_SECONDS=600`), live 90 seconds
   (`LIVE_SEND_MAX_DELAY_SECONDS=90`), and the bot doesn't wait out a Discord rate limit longer than 10
@@ -175,6 +170,10 @@ These are the SUPERSEDED rows, with what you said.
   yesterday", so remote.env switched to balanced mode at 3% and 6%. On Monday: "I would do 7% for props /
   I would also go 4% for normal / Instead of 3 / 3% is so common", so remote.env now uses the blueprint's
   own 4% and 7% (EV-01, EV-02 and SC-15 are DONE).
+- **Every prop type and alternate line** (SCOPE-12): after upgrading to the $119 plan (5 million credits a
+  month) on Mon Oct 5: "They want to upgrade and add all the extra perks". remote.env now asks for NFL
+  touchdown, passing attempts and completions props too, and alternate lines everywhere (SCOPE-13 and
+  SCOPE-14 are DONE).
 - **Cleaner cards and setup help** (OOS-1): "can you make the uh, notification on Discord like look a little
   cleaner, more spaced out?", "make it clear exactly what needs to be done right away?" and "can you give me
   like detailed instructions?"
@@ -208,9 +207,9 @@ York college rule.
 | SCOPE-06 | GREEN | DONE | NFL moneyline, spread and total. | `MARKETS=h2h,spreads,totals`, matched at the exact point. |
 | SCOPE-09 | GREEN | DONE | NHL moneyline, puck line and total. | The same `MARKETS` (the Odds API's NHL spread is the puck line). |
 | SCOPE-11 | GREEN | DONE | NFL props: passing, rushing and receiving yards, receptions. | `DEFAULT_PROP_MARKETS`; graded from box scores. |
-| SCOPE-12 | GREEN | DONE | No NFL touchdown or passing attempts and completions props. | None of them is asked for (`DEFAULT_PROP_MARKETS`, `PROP_NEAR_MARKETS`). |
-| SCOPE-13 | GREEN | PARTIAL | NHL props: shots on goal, points, goals, assists, goalie saves. | Shots, points and assists on every prop check; goals and goalie saves in the last 3 hours before the game (`PROP_NEAR_MARKETS`), but by default only when the day has spare credits for them (`PROP_NEAR_SPARE_ONLY`). Missing: in a month that uses every credit (the simulated October) that's about 1 near-kickoff check in 20; `PROP_NEAR_SPARE_ONLY=false` asks every time, at some live and main-line pace. An open decision. If the Odds API rejects them, just those stop for NHL until a restart. |
-| SCOPE-14 | GREEN | PARTIAL | Alternate player-prop lines are allowed. | NFL alternate passing, rushing and receiving yards and receptions near kickoff (`PROP_NEAR_MARKETS`), bet only at exactly a line that has a fair price (`base_market`, `book_offers`). Cards (and parlay and lock-in legs) say "(alternate line)". Missing: as SCOPE-13, they're asked for only when the day has spare credits (`PROP_NEAR_SPARE_ONLY`), about 1 near-kickoff check in 20 in the simulated October. An open decision. |
+| SCOPE-12 | GREEN | SUPERSEDED | No NFL touchdown or passing attempts and completions props. | You upgraded to the $119 plan on Mon Oct 5 and asked for more: "They want to upgrade and add all the extra perks". `PROP_MARKETS` in remote.env now asks for NFL passing TDs, completions, attempts and interceptions, rushing attempts, rushing + receiving yards and anytime TD too, with their alternate lines. |
+| SCOPE-13 | GREEN | DONE | NHL props: shots on goal, points, goals, assists, goalie saves. | All five (plus blocked shots and anytime goal scorer, with alternate lines) on every prop check: `PROP_MARKETS` in remote.env since the $119 plan. If the Odds API rejects one, only that one stops for NHL until a restart, and the health channel says which. |
+| SCOPE-14 | GREEN | DONE | Alternate player-prop lines are allowed. | Alternate lines for every prop type that has them, in NFL, NBA, NHL and MLB, on every prop check (`PROP_MARKETS` in remote.env since the $119 plan), bet only at exactly a line that has a fair price (`base_market`, `book_offers`). Cards (and parlay and lock-in legs) say "(alternate line)". |
 | SCOPE-15 | GREEN | PARTIAL | Player props are Overs only. | `PROP_SIDES`: empty means Overs only in locks mode (the default) and both sides in balanced and all. Missing: today's flood settings (balanced, in remote.env) still send Unders, about half the prop picks; `PROP_SIDES=over` makes it DONE. An open decision. |
 | DATA-10 | GREEN | DONE | One main odds provider. | The Odds API for all odds (`OddsAPI`). Kalshi's free API is a second opinion on game winners; ESPN, NHL and MLB stats only grade results. |
 | DATA-05 | YELLOW | SUPERSEDED | ParlayAPI is the leading candidate; check it against the others first. | You picked The Odds API's $59 plan before the blueprint arrived. ParlayAPI was checked: see "Not feasible on this feed". |
