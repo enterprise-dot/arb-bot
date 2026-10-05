@@ -73,14 +73,15 @@ python arbbot.py --post-guide
   still apply while it's missing). A failure long after the last one, with nothing asked in between
   (one at night, one in the morning), starts the clock again, and a prop request for a game that no
   longer exists (404) counts as the Odds API answering.
-- **The Odds API's limits.** The bot spaces its own calls out (up to 10 at once, then 10 a second;
-  the API allows about 30), so a big slate of props doesn't trip the API's speed limit. If the API
-  still says "slow down" (its answer says why: `EXCEEDED_FREQ_LIMIT`), that call is asked again 2 and 4
-  seconds later (a refused call costs nothing); if that doesn't do it, the health channel says "The Odds
-  API asked the bot to slow down" and the bot tries again in a minute. When the API says the plan's
-  credits are used up (`OUT_OF_USAGE_CREDITS`), the bot doesn't stop: it says so and checks again every
-  hour, until the plan resets or is upgraded. Any other "too many requests" waits 15 minutes, and a key
-  the API rejects still stops the bot, as before.
+- **The Odds API's limits.** The bot spaces its own calls out (up to 20 at once, then 10 a second, so
+  never more than the 30 a second the API allows), so a big slate of props doesn't trip the API's speed
+  limit. A check of up to 20 calls goes out all at once, as before. If the API still says "slow down"
+  (its answer says why: `EXCEEDED_FREQ_LIMIT`), that call is asked again 2 and 4 seconds later (a
+  refused call costs nothing); if that doesn't do it, the health channel says "The Odds API asked the
+  bot to slow down" and the bot tries again in a minute. When the API says the plan's credits are used
+  up (`OUT_OF_USAGE_CREDITS`), the bot doesn't stop: it says so once, checks again quietly every hour
+  until the plan resets or is upgraded, then says "Credits available again". Any other "too many
+  requests" waits 15 minutes, and a key the API rejects still stops the bot, as before.
 - **"Not enough Odds API credits for these settings."** If the budget autopilot has had to keep live
   and near-kickoff checks 3 or more times slower than set for half an hour, the health channel says so,
   once a day: how slow the checks are, when the plan resets and the credits left. Today's settings on

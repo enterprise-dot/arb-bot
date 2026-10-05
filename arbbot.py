@@ -1256,9 +1256,15 @@ def read_api_error(e: urllib.error.HTTPError) -> None:
     if hasattr(e, "odds_error_code"):
         return
     try:
-        body = (e.read() or b"").decode("utf-8", "replace")
+        raw = e.read() or b""
     except Exception:  # noqa: BLE001 - no body: nothing said
-        body = ""
+        raw = b""
+    try:   # (asked with "Accept-Encoding: gzip", an error's answer may come zipped like any other)
+        if raw and (e.headers or {}).get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
+    except Exception:  # noqa: BLE001 - not really zipped: read it as it is
+        pass
+    body = raw.decode("utf-8", "replace")
     try:
         said = json.loads(body)
     except ValueError:
@@ -1270,7 +1276,8 @@ def read_api_error(e: urllib.error.HTTPError) -> None:
 
 class OddsAPI:
     RATE = 10.0        # Odds API calls per second at most, on average (it allows 30; jitter near that gets 429s)
-    BURST = 10         # ...and this many at once
+    BURST = 20         # ...and this many at once (so never more than 30 in any one second). A check of up to 20
+    #                    calls never waits; a bigger one (a restart's first check) waits (calls - 20) / 10 seconds
     FREQ_RETRIES = 2   # "slow down" (429 EXCEEDED_FREQ_LIMIT): asked again after 2 and 4 seconds, then given up
 
     def __init__(self, cfg: Config):
@@ -1938,7 +1945,9 @@ def discord_payload(arb: Arb, mention: str = "", gone_after: float | None = None
         worst = arb.worst_ok_price(i)
         skip = f"\n     ↳ skip if the price is worse than {odds(worst)}" if worst else ""
         num = ["1️⃣", "2️⃣", "3️⃣"][i] if i < 3 else "•"
-        what = f"{arb.line[0]} {l.outcome} {arb.line[1]:g}" if is_prop(arb.line) else l.outcome
+        # (A Yes/No prop, like an anytime TD, has no line number: "Bijan Robinson Yes".)
+        what = (f"{arb.line[0]} {l.outcome}" + (f" {arb.line[1]:g}" if arb.line[1] is not None else "")
+                if is_prop(arb.line) else l.outcome)
         first = ""
         if i == 0 and arb.tagged:
             first = "\n     ↳ **Bet this one first:** it's the price that will move."
@@ -9623,7 +9632,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     if REMOTE_USED:
         print(f"Using settings pushed in {REMOTE_ENV}: " + ", ".join(f"{k}={v}" for k, v in REMOTE_USED.items()))
     print(unit_line(cfg))
-    if not args.once:
+    if not (args.once or status.budget_warned):   # (an hourly retry after running out of credits: said already)
         status.send(online_message(cfg))
 
     tz = ZoneInfo(cfg.timezone)
@@ -9688,7 +9697,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                                 "⏸️ BUDGET_WEIGHTS gives the next 24h no budget (weight 0). Pausing.")
                 time.sleep(3600)
                 continue
-            if status.budget_warned:
+            if status.budget_warned and api.remaining is not None:   # (once the Odds API has said how many)
                 status.budget_warned = False
                 health.say("✅ Credits available again: scanning resumed.")
             if note := short_credits.check(sched, now, api.remaining):
@@ -10035,8 +10044,12 @@ def main() -> None:
             read_api_error(e)   # (what the Odds API said: its error_code tells out of credits from a bad key)
             code = getattr(e, "odds_error_code", "")
             if e.code in (401, 429) and code == "OUT_OF_USAGE_CREDITS":
-                status.send("⏸️ The Odds API says the plan's credits are used up. Checking again every hour: they "
-                            "come back when the plan resets or is upgraded.")
+                # Said once per outage (not every hour, nor after run()'s own "out of credits" pause). The hourly
+                # retries don't say "online" again; the first check with credits says "Credits available again".
+                if not status.budget_warned:
+                    status.budget_warned = True
+                    status.send("⏸️ The Odds API says the plan's credits are used up. Checking again every hour: "
+                                "they come back when the plan resets or is upgraded.")
                 time.sleep(3600)
                 continue
             if e.code == 401:

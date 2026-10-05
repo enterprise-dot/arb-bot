@@ -3174,7 +3174,7 @@ class OddsApiCosts(unittest.TestCase):
 
 class OddsApiLimits(unittest.TestCase):
     """The Odds API allows about 30 calls a second, and its answer says why it refused one (error_code). The
-    bot paces its own calls (10 at once, then 10 a second, all threads together), asks a "slow down" (429)
+    bot paces its own calls (20 at once, then 10 a second, all threads together), asks a "slow down" (429)
     again after 2 and 4 seconds, and never asks again when the plan's credits are used up."""
 
     @staticmethod
@@ -3233,22 +3233,40 @@ class OddsApiLimits(unittest.TestCase):
         out, n, sleeps = self.call([self.http_error(422, {"error_code": "INVALID_MARKET"}), self.Resp()])
         self.assertEqual((out.code, n, sleeps), (422, 1, []))
 
+    def test_a_zipped_error_answer_is_read_too(self):
+        """Every call asks for gzip, so an error's answer may come zipped: out of credits must still read as out
+        of credits (an hourly check, not "key rejected, bot stopped")."""
+        import gzip, io, json
+        body = json.dumps({"message": "Usage quota has been reached", "error_code": "OUT_OF_USAGE_CREDITS"}).encode()
+        zipped = urllib.error.HTTPError("u", 401, "x", {"Content-Encoding": "gzip"}, io.BytesIO(gzip.compress(body)))
+        out, n, sleeps = self.call([zipped, self.Resp()])
+        self.assertEqual((out.odds_error_code, out.odds_message, n), ("OUT_OF_USAGE_CREDITS",
+                                                                     "Usage quota has been reached", 1))
+        zipped = urllib.error.HTTPError("u", 401, "x", {"Content-Encoding": "gzip"}, io.BytesIO(gzip.compress(body)))
+        sleeps, said = self.run_main([zipped])
+        self.assertEqual(sleeps, [3600])
+        # Said to be zipped but isn't: read as it is.
+        plain = urllib.error.HTTPError("u", 429, "x", {"Content-Encoding": "gzip"},
+                                       io.BytesIO(json.dumps({"error_code": "EXCEEDED_FREQ_LIMIT"}).encode()))
+        _arbbot.read_api_error(plain)
+        self.assertEqual(plain.odds_error_code, "EXCEEDED_FREQ_LIMIT")
+
     def test_pacing(self):
         from unittest import mock
         sleeps = []
         with mock.patch("arbbot.time.monotonic", return_value=1000.0), \
                 mock.patch("arbbot.time.sleep", sleeps.append), \
-                mock.patch("urllib.request.urlopen", side_effect=[self.Resp() for _ in range(13)]):
+                mock.patch("urllib.request.urlopen", side_effect=[self.Resp() for _ in range(23)]):
             api = _arbbot.OddsAPI(Config(api_key="k", state_dir=""))
-            for _ in range(12):   # the clock doesn't move: 10 at once, then a 0.1 s turn each
+            for _ in range(22):   # the clock doesn't move: 20 at once, then a 0.1 s turn each
                 api.events("icehockey_nhl")
             self.assertEqual([round(x, 6) for x in sleeps], [0.1, 0.2])
-        # A second later the bucket holds 10 again (never more).
+        # Later the bucket holds 20 again (never more): at most 30 calls in any one second.
         sleeps.clear()
         with mock.patch("arbbot.time.monotonic", return_value=1010.0), \
                 mock.patch("arbbot.time.sleep", sleeps.append), \
-                mock.patch("urllib.request.urlopen", side_effect=[self.Resp() for _ in range(11)]):
-            for _ in range(11):
+                mock.patch("urllib.request.urlopen", side_effect=[self.Resp() for _ in range(21)]):
+            for _ in range(21):
                 api.events("icehockey_nhl")
         self.assertEqual([round(x, 6) for x in sleeps], [0.1])
 
@@ -3276,6 +3294,46 @@ class OddsApiLimits(unittest.TestCase):
         with self.assertRaises(SystemExit) as stop:
             self.run_main([self.http_error(401, {"message": "API key is not valid", "error_code": "INVALID_KEY"})])
         self.assertEqual(stop.exception.code, 2)
+
+    def test_out_of_credits_is_said_once_until_they_are_back(self):
+        """Not "online" + "credits are used up" every hour until the plan resets (48 messages a day): one pause
+        message, quiet hourly checks (no "online" again), then "Credits available again" once there are."""
+        import os, sys, contextlib, io
+        from unittest import mock
+        out_of_credits = lambda: self.http_error(401, {"error_code": "OUT_OF_USAGE_CREDITS"})
+        refused, sleeps = [3], []
+
+        class Stop(BaseException):
+            pass
+
+        class Api:
+            remaining = used = None
+
+            def __init__(self, cfg):
+                pass
+
+            def events(self, sport, horizon_hours=26):
+                if refused[0]:          # even the free call is refused while the credits are used up
+                    refused[0] -= 1
+                    raise out_of_credits()
+                self.remaining = 4_000_000.0
+                return []
+
+        def sleep(secs):
+            sleeps.append(secs)
+            if secs != 3600:
+                raise Stop   # the first wait after the credits came back: done
+        with mock.patch.dict(os.environ, {"ODDS_API_KEY": "k", "STATE_DIR": "", "DISCORD_WEBHOOK_URL": "",
+                                          "DISCORD_STATUS_WEBHOOK_URL": "", "SPORTS": "basketball_nba",
+                                          "KALSHI_CHECK": "false", "RESULTS_MINUTES": "0", "SUMMARY_HOUR": "-1"}), \
+                mock.patch.object(sys, "argv", ["arbbot.py", "--dry-run"]), mock.patch("arbbot.load_dotenv"), \
+                mock.patch("arbbot.OddsAPI", Api), mock.patch("arbbot.time.sleep", sleep), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(Stop):
+                _arbbot.main()
+        said = [l.split(" ", 2)[1] for l in out.getvalue().splitlines() if l.startswith("[status]")]
+        self.assertEqual(sleeps[:3], [3600] * 3)
+        self.assertEqual(said, ["🟢", "⏸️", "✅"], out.getvalue())   # online, used up, available again: once each
 
     def test_main_slow_down_waits_a_minute(self):
         sleeps, said = self.run_main([self.http_error(429, {"error_code": "EXCEEDED_FREQ_LIMIT"})])
@@ -10735,6 +10793,50 @@ class PropSides(unittest.TestCase):
         self.assertEqual(find_outliers([under], cfg, NOW), [])
         [u] = find_outliers([under], replace(cfg, prop_sides="both"), NOW)
         self.assertEqual((u.book, u.outcome), ("E", "Under"))
+
+
+def yes_no_prop(fd_yes, dk_no, market="player_anytime_td", player="Bijan Robinson", sport="americanfootball_nfl"):
+    """A Yes/No prop (no line number): FanDuel has only Yes, DraftKings Yes at 1.80 and No."""
+    def book(key, title, outs):
+        return {"key": key, "title": title, "last_update": FRESH, "markets": [
+            {"key": market, "last_update": FRESH,
+             "outcomes": [{"name": n, "description": player, "price": p} for n, p in outs]}]}
+    return {"id": "p1", "sport_key": sport, "sport_title": "NFL", "commence_time": "2026-10-03T18:00:00Z",
+            "home_team": "Atlanta Falcons", "away_team": "New Orleans Saints",
+            "bookmakers": [book("fanduel", "FanDuel", [("Yes", fd_yes)]),
+                           book("draftkings", "DraftKings", [("Yes", 1.80), ("No", dk_no)])]}
+
+
+class YesNoPropArbs(MixFiles):
+    """A Yes/No prop type (anytime TD, NHL anytime goal scorer) has no line number: its line is (player, None).
+    One book's Yes and another's No can be an arb, and its card must say "Bijan Robinson Yes", not crash
+    on the missing number (that crash took the whole bot down, and it found the same arb after each restart)."""
+
+    def test_new_card_edit_and_gone(self):
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self._new_card_edit_and_gone()
+
+    def _new_card_edit_and_gone(self):
+        for market, player in (("player_anytime_td", "Bijan Robinson"),
+                               ("player_goal_scorer_anytime", "Auston Matthews")):
+            t = _arbbot.Trackers(self.cfg(Config(min_profit_pct=0, round_stakes=0, webhook_url="https://x"),
+                                          kalshi_check=False), self.args(dry_run=False))
+            cards = []
+            t.prop_arbs._discord = lambda payload, message_id=None, url="": (
+                cards.append((message_id, payload["embeds"][0])) or message_id or "m1")
+            game = lambda fd_yes, secs: stamped(yes_no_prop(fd_yes, 2.05, market=market, player=player), secs)
+            self.assertEqual(_arbbot.scan_props(t, [game(2.10, 0)], {"p1"}, at(0)).n_arb, 1, market)
+            [arb] = [op.arb for op in t.prop_arbs.open.values()]
+            self.assertEqual(arb.line, (player, None))
+            _arbbot.scan_props(t, [game(2.12, 60)], {"p1"}, at(60))                    # a new price: the card is edited
+            _arbbot.scan_props(t, [game(1.70, 120)], {"p1"}, at(120))                  # no arb any more: GONE
+            self.assertEqual([m for m, _ in cards], [None, "m1", "m1"], market)
+            for _, card in cards[:2]:
+                self.assertIn(f"**{player} Yes +11", card["description"])            # no number after Yes
+                self.assertIn(f"**{player} No +105**", card["description"])
+            self.assertTrue(cards[2][1]["title"].startswith("❌ GONE"), market)
+            self.assertEqual(t.prop_arbs.open, {})
 
 
 
