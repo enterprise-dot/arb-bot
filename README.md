@@ -73,6 +73,20 @@ python arbbot.py --post-guide
   still apply while it's missing). A failure long after the last one, with nothing asked in between
   (one at night, one in the morning), starts the clock again, and a prop request for a game that no
   longer exists (404) counts as the Odds API answering.
+- **The Odds API's limits.** The bot spaces its own calls out (up to 10 at once, then 10 a second;
+  the API allows about 30), so a big slate of props doesn't trip the API's speed limit. If the API
+  still says "slow down" (its answer says why: `EXCEEDED_FREQ_LIMIT`), that call is asked again 2 and 4
+  seconds later (a refused call costs nothing); if that doesn't do it, the health channel says "The Odds
+  API asked the bot to slow down" and the bot tries again in a minute. When the API says the plan's
+  credits are used up (`OUT_OF_USAGE_CREDITS`), the bot doesn't stop: it says so and checks again every
+  hour, until the plan resets or is upgraded. Any other "too many requests" waits 15 minutes, and a key
+  the API rejects still stops the bot, as before.
+- **"Not enough Odds API credits for these settings."** If the budget autopilot has had to keep live
+  and near-kickoff checks 3 or more times slower than set for half an hour, the health channel says so,
+  once a day: how slow the checks are, when the plan resets and the credits left. Today's settings on
+  the 100K plan never get there (2.4x at the very busiest); settings made for a bigger plan running on
+  a smaller one do, all month. Right after an upgrade it can also mean the new credits haven't reached
+  the bot yet.
 
 ## Your books
 
@@ -115,6 +129,10 @@ python arbbot.py --set MY_BOOKS=draftkings,fanduel --set EV_BOOKS=
 Arbs post to `DISCORD_WEBHOOK_URL`. Set `DISCORD_EV_WEBHOOK_URL` to send +EV alerts (and props,
 outliers and parlays) to another channel; `DISCORD_OUTLIER_WEBHOOK_URL`,
 `DISCORD_PARLAY_WEBHOOK_URL` and `DISCORD_LIVE_WEBHOOK_URL` split them further.
+`DISCORD_PROPS_WEBHOOK_URL` gives player props (their +EV and outlier cards) a channel of their own, so
+lots of prop types don't crowd out the other +EV bets: make a `#props` channel with a webhook, then run
+`python arbbot.py --set-webhook props` and restart the bot. Empty, props go where +EV bets and outliers
+go, as before. Prop arbs stay with the arbs, and cards already up stay where they were posted.
 
 ## 🎯 Player props
 
@@ -123,8 +141,12 @@ points/shots/assists (NHL), plus, in the last 3 hours before kickoff, NHL goals 
 NFL alternate lines (`PROP_NEAR_MARKETS`, see below). Props are priced per game, so they're checked
 every 30 minutes in the 3 hours before kickoff, and the budget autopilot counts them. If The Odds API
 ever rejects an extra prop type, the bot asks again without it, says so once in the health channel,
-and keeps checking that sport's other props (if it rejects the usual ones too, the health channel says
-to check `PROP_MARKETS`, and that sport's props stop until a restart). Fair odds come from Pinnacle
+and keeps checking that sport's other props. If it rejects one of the usual ones (`PROP_MARKETS`), only
+that one stops until a restart: the bot finds which (the API's answer names it, or each type is asked
+alone once; a refused call costs nothing), the health channel says "The Odds API rejected these NBA
+prop types: ... (check PROP_MARKETS). The other NBA props carry on.", and that game's props come in
+without it. Only if the API turns down every type does that sport's props stop until a restart (the
+health channel then says to check `PROP_MARKETS`). Fair odds come from Pinnacle
 when it prices the prop, otherwise from the median of at least 4 other books (the book being judged
 doesn't count, and BetOnline.ag and LowVig.ag count as one, since they share an owner), and the
 minimum
@@ -166,6 +188,16 @@ sport only; with `--set`, quote it:
 asks; in balanced and all mode both Overs and Unders are (as before). `PROP_SIDES=over` or
 `PROP_SIDES=both` picks for yourself whatever the mode. The Under's price is still used to work out the
 Over's fair odds, prop arbs still need both sides, and main-line Unders (totals) aren't affected.
+
+**A slate starting together** (`PROP_MAX_PER_PASS`, 0 = no limit): with props checked every few minutes,
+a Sunday's or a busy night's games can all be due at once. `PROP_MAX_PER_PASS=8` asks for at most 8
+games' props in one pass: the closing-line checks first, then the games most overdue (the longest past
+their next check, counted in their own pace). The rest go in the next pass, a second or so later, so the
+Odds API isn't asked for dozens at once and the next live check isn't held up. It doesn't change how
+many credits props use. With many prop types two more settings help: `DISCORD_PROPS_WEBHOOK_URL` gives
+props a channel of their own (see "Channels"), and `CARD_EDIT_MIN_SECONDS` edits open cards less often
+(see "How it keeps bets good"). How the bot handles the Odds API's speed limit, and the message when the
+settings need more credits than the plan has, are under "Bot health in Discord" above.
 
 ## 📦 Parlays
 
@@ -325,6 +357,12 @@ The console line after each check says what was held back and why, e.g.
   post went out, and `post_delay` in those files is the seconds from fetching its odds to that post
   (the bot's real speed, to set these limits from). Parlays aren't checked this way (they're built
   from alerts already up), but a bet waiting for the next check is never a parlay leg.
+- **Fewer card edits (optional).** With checks every minute, an open +EV or outlier card would be
+  edited on almost every check as other books' prices move, and every edit waits out Discord's limits.
+  `CARD_EDIT_MIN_SECONDS=600` edits such a card at most every 10 minutes when only other books' prices
+  or its notes changed; the next check after that edits it with the newest prices. A new price, book or
+  stake for the bet itself, the ❌ GONE mark, a much better price (a new alert) and live bets are still
+  edited right away, and arbs and parlays always are. 0 (the default) edits every change right away.
 - **Live arbs need both prices fresh**: priced within 60 seconds of each other, or it's usually
   just one book lagging. In locks mode every live alert also needs two checks in a row and a price
   under 60 seconds old (see "Alert mix" above).
@@ -489,12 +527,22 @@ it agreed. **Rain-shortened MLB games:** when a game ends before the 9th inning,
 on it show once on the results card as 🌧️ "game ended early (rain): check your book" (books usually
 void them), and they don't count in the record. The moneyline is still graded.
 
-**Player props are graded from ESPN box scores** (free, no credits): points, rebounds, assists,
-threes (NBA), goals, assists, points, shots on goal (NHL), passing/rushing/receiving yards and
-receptions (NFL, college), hits and pitcher strikeouts (MLB). Before trusting a box score the bot
-checks it adds up (players' points = the final score, goals = the score, runs = the score,
-receptions = completions); if it doesn't, those props are left as 🎯 for you. A player who didn't
-play is a push (books void those). Total bases isn't in the box score, so it stays manual.
+**Player props are graded from box scores** (free, no credits; NHL.com and MLB's own stats site first,
+then ESPN). These prop types grade by themselves, alternate lines included:
+- NFL (and college): passing yards, TDs, completions, attempts and interceptions; rushing yards and
+  attempts; receptions; receiving yards; rushing + receiving yards; anytime TD.
+- NBA: points, rebounds, assists, threes, blocks, steals, blocks + steals, turnovers, and points +
+  rebounds + assists, points + rebounds, points + assists, rebounds + assists.
+- NHL: goals, assists, points, shots on goal, blocked shots, goalie saves, anytime goal scorer.
+- MLB: hits, total bases (MLB's box score only: ESPN's has no doubles or triples), home runs, RBIs,
+  runs, walks, batter strikeouts, hits + runs + RBIs; pitcher strikeouts, outs, earned runs, hits and
+  walks allowed.
+
+Before trusting a box score the bot checks it adds up (players' points = the final score, goals = the
+score, runs = the score, receptions = completions); if it doesn't, those props are left as 🎯 for you.
+A player who didn't play is a push (books void those). A player the box score has no number for (a
+rushing + receiving yards bet on a quarterback who only threw) is left for you too. Any other prop
+type stays manual.
 Check it against real games any time with `python arbbot.py --check-props`. `PROP_GRADING=off`
 turns it off.
 

@@ -2466,21 +2466,16 @@ class PropGrading(unittest.TestCase):
         self.assertEqual(espn_event_id("basketball_nba", "Los Angeles Clippers", "Atlanta Hawks",
                                        "2026-10-03T23:00:00Z"), "9")
 
-    def test_other_sports_read_the_right_columns(self):
-        from arbbot import grade_prop
-        nba_l = ["MIN", "FG", "3PT", "FT", "REB", "AST", "PTS"]
+    def add_other_sports(self):
+        """An NBA (Celtics-Knicks), an NFL (Bills-Jets) and an MLB (Dodgers-Padres) box score."""
+        nba_l = ["MIN", "FG", "3PT", "FT", "REB", "AST", "STL", "BLK", "PTS"]
         nba_k = ["minutes", "fieldGoalsMade-fieldGoalsAttempted", "threePointFieldGoalsMade-threePointFieldGoalsAttempted",
-                 "freeThrowsMade-freeThrowsAttempted", "rebounds", "assists", "points"]
+                 "freeThrowsMade-freeThrowsAttempted", "rebounds", "assists", "steals", "blocks", "points"]
         self.games.append({"sport": "basketball/nba", "id": "7", "date": "2026-10-03T23:00Z", "final": True,
                            "home": ("2", "Boston Celtics", "Boston", "Celtics", 30), "away": ("18", "New York Knicks", "New York", "Knicks", 12),
-                           "groups": {"2": [("", nba_l, nba_k, [("Jayson Tatum", ["38", "10-21", "3-8", "5-6", "8", "5", "28"], False),
-                                                               ("Jaylen Brown", ["30", "1-3", "0-1", "0-0", "2", "1", "2"], False)])],
-                                      "18": [("", nba_l, nba_k, [("Jalen Brunson", ["36", "5-9", "2-4", "0-0", "1", "6", "12"], False)])]}})
-        row = self.row(player="Jayson Tatum", market="player_threes", point="2.5", sport="basketball_nba",
-                       home="Boston Celtics", away="New York Knicks")
-        self.assertEqual(grade_prop(row), (("win", 29.25), "3"))                            # 3 of 8 threes
-        pra = dict(row, market="player_points_rebounds_assists", point="40.5", outcome="Under")
-        self.assertEqual(grade_prop(pra)[1], "41")
+                           "groups": {"2": [("", nba_l, nba_k, [("Jayson Tatum", ["38", "10-21", "3-8", "5-6", "8", "5", "2", "1", "28"], False),
+                                                               ("Jaylen Brown", ["30", "1-3", "0-1", "0-0", "2", "1", "0", "0", "2"], False)])],
+                                      "18": [("", nba_l, nba_k, [("Jalen Brunson", ["36", "5-9", "2-4", "0-0", "1", "6", "1", "0", "12"], False)])]}})
         nfl = lambda g, labels, keys, rows: (g, labels, keys, rows)
         self.games.append({"sport": "football/nfl", "id": "5", "date": "2026-10-04T17:00Z", "final": True,
                            "home": ("2", "Buffalo Bills", "Buffalo", "Bills", 27), "away": ("20", "New York Jets", "New York", "Jets", 20),
@@ -2494,13 +2489,6 @@ class PropGrading(unittest.TestCase):
                                                  [("Justin Fields", ["15/25", "180", "1"], False)]),
                                              nfl("receiving", ["REC", "YDS", "TD"], ["receptions", "receivingYards", "receivingTouchdowns"],
                                                  [("Garrett Wilson", ["15", "180", "1"], False)])]}})
-        bills = dict(home="Buffalo Bills", away="New York Jets", sport="americanfootball_nfl")
-        bills_row = lambda **kw: dict(self.row(**bills), commence_time="2026-10-04T17:00:00Z", **kw)
-        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_rush_yds", point="39.5"))[1], "41")
-        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_pass_yds", point="39.5"))[1], "260")
-        self.assertEqual(grade_prop(bills_row(player="Khalil Shakir", market="player_anytime_td", outcome="Yes",
-                                              point=""))[0][0], "win")                     # no rushing line: 0 + 1
-        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_pass_completions", point="21.5"))[1], "22")
         self.games.append({"sport": "baseball/mlb", "id": "3", "date": "2026-10-03T23:00Z", "final": True,
                            "home": ("19", "Los Angeles Dodgers", "Los Angeles", "Dodgers", 4), "away": ("25", "San Diego Padres", "San Diego", "Padres", 1),
                            "groups": {"19": [("batting", ["H-AB", "AB", "R", "H", "RBI", "HR"], ["hits-atBats", "atBats", "runs", "hits", "RBIs", "homeRuns"],
@@ -2509,10 +2497,62 @@ class PropGrading(unittest.TestCase):
                                               [("Yoshinobu Yamamoto", ["6.1", "4", "1", "1", "2", "9"], False)])],
                                       "25": [("batting", ["H-AB", "AB", "R", "H", "RBI", "HR"], ["hits-atBats", "atBats", "runs", "hits", "RBIs", "homeRuns"],
                                               [("Manny Machado", ["1-4", "4", "1", "1", "1", "1"], False)])]}})
-        dodgers = lambda **kw: dict(self.row(sport="baseball_mlb", home="Los Angeles Dodgers", away="San Diego Padres"), **kw)
+
+    def bills_row(self, **kw):
+        return dict(self.row(home="Buffalo Bills", away="New York Jets", sport="americanfootball_nfl"),
+                    commence_time="2026-10-04T17:00:00Z", **kw)
+
+    def dodgers(self, **kw):
+        return dict(self.row(sport="baseball_mlb", home="Los Angeles Dodgers", away="San Diego Padres"), **kw)
+
+    def celtics(self, **kw):
+        return dict(self.row(sport="basketball_nba", home="Boston Celtics", away="New York Knicks"), **kw)
+
+    def test_other_sports_read_the_right_columns(self):
+        from arbbot import grade_prop
+        self.add_other_sports()
+        row = self.celtics(player="Jayson Tatum", market="player_threes", point="2.5")
+        self.assertEqual(grade_prop(row), (("win", 29.25), "3"))                            # 3 of 8 threes
+        pra = dict(row, market="player_points_rebounds_assists", point="40.5", outcome="Under")
+        self.assertEqual(grade_prop(pra)[1], "41")
+        bills_row = self.bills_row
+        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_rush_yds", point="39.5"))[1], "41")
+        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_pass_yds", point="39.5"))[1], "260")
+        self.assertEqual(grade_prop(bills_row(player="Khalil Shakir", market="player_anytime_td", outcome="Yes",
+                                              point=""))[0][0], "win")                     # no rushing line: 0 + 1
+        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_pass_completions", point="21.5"))[1], "22")
+        dodgers = self.dodgers
         self.assertEqual(grade_prop(dodgers(player="Shohei Ohtani", market="batter_hits", point="1.5"))[1], "2")
         self.assertEqual(grade_prop(dodgers(player="Yoshinobu Yamamoto", market="pitcher_strikeouts", point="7.5"))[1], "9")
         self.assertEqual(grade_prop(dodgers(player="Yoshinobu Yamamoto", market="pitcher_outs", point="18.5"))[1], "19")
+
+    def test_the_bigger_plans_prop_types_are_graded(self):
+        # Sums of columns the box scores already have: rushing + receiving yards, hits + runs + RBIs, blocks +
+        # steals; NHL anytime goal scorer is Yes/No (at least one goal).
+        from arbbot import grade_prop, box_supported
+        self.add_other_sports()
+        rr = lambda who: grade_prop(self.bills_row(player=who, market="player_rush_reception_yds", point="40.5"))
+        self.assertEqual(rr("James Cook")[1], "220")                     # 70 rushing + 150 receiving
+        self.assertEqual(rr("Josh Allen")[1], "41")                      # rushing only
+        self.assertEqual(rr("Khalil Shakir")[1], "110")                  # receiving only
+        self.assertEqual(rr("Justin Fields"), (None, "no Rush + Rec Yards for Justin Fields in the box score"))
+        self.assertEqual(grade_prop(self.dodgers(player="Shohei Ohtani", market="batter_hits_runs_rbis",
+                                                 point="7.5"))[1], "9")   # 2 + 4 + 3
+        self.assertEqual(grade_prop(self.celtics(player="Jayson Tatum", market="player_blocks_steals",
+                                                 point="2.5")), (("win", 29.25), "3"))   # 1 block + 2 steals
+        goal = lambda who, side: grade_prop(self.row(player=who, market="player_goal_scorer_anytime", outcome=side,
+                                                     point=""))[0][0]
+        self.assertEqual((goal("Kent Johnson", "Yes"), goal("Mitchell Marner", "Yes"), goal("Mitchell Marner", "No")),
+                         ("win", "loss", "win"))
+        for sport, market in (("americanfootball_nfl", "player_rush_reception_yds"), ("basketball_nba", "player_blocks_steals"),
+                              ("icehockey_nhl", "player_goal_scorer_anytime"), ("baseball_mlb", "batter_hits_runs_rbis")):
+            self.assertTrue(box_supported({"sport_key": sport, "market": market}), market)
+
+    def test_every_graded_market_has_a_name(self):
+        # A prop type that's graded is one that can be alerted: its cards and results name it in plain English.
+        from arbbot import BOX_STATS, MARKET_NAMES
+        self.assertEqual(sorted({m for _, m in BOX_STATS} - set(MARKET_NAMES)), [])
+        self.assertEqual(MARKET_NAMES["player_points_rebounds_assists"], "Pts + Reb + Ast")
 
     def test_props_graded_and_posted_like_everything_else(self):
         from arbbot import day_bets, result_line
@@ -3130,6 +3170,122 @@ class OddsApiCosts(unittest.TestCase):
         # No per-call header: fall back to the running total.
         self.assertIn("events endpoint used credits",
                       self.call([{"x-requests-used": "100"}, {"x-requests-used": "101"}]))
+
+
+class OddsApiLimits(unittest.TestCase):
+    """The Odds API allows about 30 calls a second, and its answer says why it refused one (error_code). The
+    bot paces its own calls (10 at once, then 10 a second, all threads together), asks a "slow down" (429)
+    again after 2 and 4 seconds, and never asks again when the plan's credits are used up."""
+
+    @staticmethod
+    def http_error(code, body):
+        import io, json
+        return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(json.dumps(body).encode()))
+
+    class Resp:
+        headers = {"x-requests-last": "0"}
+
+        def read(self):
+            return b"[]"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def call(self, replies):
+        """api.events() with urlopen answering `replies` in turn (an exception is raised): (result or the
+        error, urlopen calls, sleeps)."""
+        from unittest import mock
+        sleeps, n = [], [0]
+
+        def urlopen(req, timeout=None):
+            n[0] += 1
+            r = replies.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        api = _arbbot.OddsAPI(Config(api_key="k", state_dir=""))
+        with mock.patch("urllib.request.urlopen", urlopen), mock.patch("arbbot.time.sleep", sleeps.append):
+            try:
+                out = api.events("icehockey_nhl")
+            except urllib.error.HTTPError as e:
+                out = e
+        return out, n[0], sleeps
+
+    def test_slow_down_is_asked_again(self):
+        out, n, sleeps = self.call([self.http_error(429, {"message": "Too many", "error_code": "EXCEEDED_FREQ_LIMIT"}),
+                                    self.Resp()])
+        self.assertEqual((out, n, sleeps), ([], 2, [2.0]))
+        # Still refused after 2 and 4 seconds: given up (main() then waits a minute).
+        slow = lambda: self.http_error(429, {"error_code": "EXCEEDED_FREQ_LIMIT"})
+        out, n, sleeps = self.call([slow(), slow(), slow()])
+        self.assertEqual((out.code, out.odds_error_code, n, sleeps), (429, "EXCEEDED_FREQ_LIMIT", 3, [2.0, 4.0]))
+
+    def test_out_of_credits_is_not_asked_again(self):
+        for code in (429, 401):
+            body = {"message": "Usage quota has been reached", "error_code": "OUT_OF_USAGE_CREDITS"}
+            out, n, sleeps = self.call([self.http_error(code, body), self.Resp()])
+            self.assertEqual((out.code, out.odds_error_code, n, sleeps), (code, "OUT_OF_USAGE_CREDITS", 1, []))
+            self.assertEqual(out.odds_message, "Usage quota has been reached")
+        # Anything else (a bad request, a bad key) is raised at once, as before.
+        out, n, sleeps = self.call([self.http_error(422, {"error_code": "INVALID_MARKET"}), self.Resp()])
+        self.assertEqual((out.code, n, sleeps), (422, 1, []))
+
+    def test_pacing(self):
+        from unittest import mock
+        sleeps = []
+        with mock.patch("arbbot.time.monotonic", return_value=1000.0), \
+                mock.patch("arbbot.time.sleep", sleeps.append), \
+                mock.patch("urllib.request.urlopen", side_effect=[self.Resp() for _ in range(13)]):
+            api = _arbbot.OddsAPI(Config(api_key="k", state_dir=""))
+            for _ in range(12):   # the clock doesn't move: 10 at once, then a 0.1 s turn each
+                api.events("icehockey_nhl")
+            self.assertEqual([round(x, 6) for x in sleeps], [0.1, 0.2])
+        # A second later the bucket holds 10 again (never more).
+        sleeps.clear()
+        with mock.patch("arbbot.time.monotonic", return_value=1010.0), \
+                mock.patch("arbbot.time.sleep", sleeps.append), \
+                mock.patch("urllib.request.urlopen", side_effect=[self.Resp() for _ in range(11)]):
+            for _ in range(11):
+                api.events("icehockey_nhl")
+        self.assertEqual([round(x, 6) for x in sleeps], [0.1])
+
+    def run_main(self, errors):
+        """main() with run() raising `errors` in turn, then returning: (sleeps, status messages)."""
+        import os, sys, contextlib, io
+        from unittest import mock
+        sleeps = []
+        with mock.patch.dict(os.environ, {"ODDS_API_KEY": "k", "STATE_DIR": "", "DISCORD_WEBHOOK_URL": "",
+                                          "DISCORD_STATUS_WEBHOOK_URL": ""}), \
+                mock.patch.object(sys, "argv", ["arbbot.py"]), mock.patch("arbbot.load_dotenv"), \
+                mock.patch("arbbot.run", side_effect=[*errors, None]), \
+                mock.patch("arbbot.time.sleep", sleeps.append), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            _arbbot.main()
+        return sleeps, [l for l in out.getvalue().splitlines() if l.startswith("[status]")]
+
+    def test_main_out_of_credits_pauses_instead_of_exiting(self):
+        for code in (401, 429):
+            sleeps, said = self.run_main([self.http_error(code, {"error_code": "OUT_OF_USAGE_CREDITS"})])
+            self.assertEqual(sleeps, [3600], code)
+            self.assertEqual(said, ["[status] ⏸️ The Odds API says the plan's credits are used up. Checking again "
+                                    "every hour: they come back when the plan resets or is upgraded."])
+        # A 401 that isn't about credits is still a bad key: the bot stops.
+        with self.assertRaises(SystemExit) as stop:
+            self.run_main([self.http_error(401, {"message": "API key is not valid", "error_code": "INVALID_KEY"})])
+        self.assertEqual(stop.exception.code, 2)
+
+    def test_main_slow_down_waits_a_minute(self):
+        sleeps, said = self.run_main([self.http_error(429, {"error_code": "EXCEEDED_FREQ_LIMIT"})])
+        self.assertEqual(sleeps, [60])
+        self.assertEqual(said, ["[status] ⏸️ The Odds API asked the bot to slow down (too many requests at once). "
+                                "Retrying in 1 minute."])
+        # Any other 429: as before, 15 minutes.
+        sleeps, said = self.run_main([self.http_error(429, {"message": "Too Many Requests"})])
+        self.assertEqual(sleeps, [900])
+        self.assertIn("Retrying in 15 min", said[0])
 
 
 def kalshi_market(event, team_code, label, bid, ask, dollars=True, **extra):
@@ -9871,19 +10027,22 @@ class NearKickoffProps(MixFiles):
         import contextlib, io
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(s.fetch_props([("icehockey_nhl", "n1")], NOW), ([], set()))
-        self.assertEqual(len(calls), 2)                   # with the extras, then without: both rejected
+        # With the extras, then without: both rejected. Then each of its 3 prop types alone, to find the one
+        # turned down: all 3 are.
+        self.assertEqual(len(calls), 5)
+        self.assertEqual([m for _, m in calls[2:]], _arbbot._csv(Config().prop_markets["icehockey_nhl"]))
         # (So it's PROP_MARKETS that's wrong, not the extras: that's what the health channel hears.)
         self.assertEqual((s.bad_near_sports, s.bad_prop_sports), (set(), {"icehockey_nhl"}))
         self.assertEqual(s.notices, ["⚠️ The Odds API rejected the NHL prop request: check PROP_MARKETS. "
                                      "No NHL props until a restart."])
         self.assertEqual(s.props_due(NOW), [])
-        # A sport without extras: one request, rejected, its props stop (as before).
+        # A sport without extras: one request, rejected, then its 4 types alone, all rejected: its props stop.
         nba = sched_with({"basketball_nba": [("g1", NOW + timedelta(hours=1))]}, Config(sports=["basketball_nba"]))
         nba.api = self.api(reject="all", calls=calls)
         calls.clear()
         with contextlib.redirect_stderr(io.StringIO()):
             nba.fetch_props([("basketball_nba", "g1")], NOW)
-        self.assertEqual((len(calls), nba.bad_prop_sports, len(nba.notices)), (1, {"basketball_nba"}, 1))
+        self.assertEqual((len(calls), nba.bad_prop_sports, len(nba.notices)), (5, {"basketball_nba"}, 1))
 
     def test_only_a_422_turns_the_extras_off(self):
         # A busy or unreachable API isn't a rejection: the game isn't asked again plainly that pass, nothing is
@@ -10052,6 +10211,466 @@ class NearKickoffProps(MixFiles):
                       plan.getvalue())
         self.assertIn("NHL props per game: 5 near kickoff, 3 earlier", plan.getvalue())
 
+
+
+class PropTypeRejected(unittest.TestCase):
+    """The bigger plan asks for 13-23 prop types per sport: one the API turns down (422) stops alone, not the
+    sport's props. The types its answer names (when that's some of them, not all), else each type asked alone
+    once for the first refused game (a rejected call costs nothing; the accepted answers are that game's). The
+    rest of the sport's refused games are asked again without them. Every type turned down: as before."""
+
+    NBA = Config(sports=["basketball_nba"], prop_sports=["basketball_nba"],
+                 prop_markets={"basketball_nba": "player_points,player_bad,player_rebounds"})
+
+    def api(self, reject=("player_bad",), message="", calls=None, fail_on=None):
+        """An event_odds fake: a 422 naming `message` for a request asking for any of `reject`; the call
+        numbered fail_on (0-based) gets a 503 instead."""
+        calls = [] if calls is None else calls
+
+        class Api:
+            remaining = None
+
+            def event_odds(self, sport, gid, markets):
+                calls.append((gid, markets))
+                if fail_on is not None and len(calls) - 1 == fail_on:
+                    raise urllib.error.HTTPError("u", 503, "busy", {}, None)
+                asked = markets.split(",")
+                if set(asked) & set(reject):
+                    e = urllib.error.HTTPError("u", 422, "Unprocessable Entity", {}, None)
+                    e.odds_error_code, e.odds_message = "INVALID_MARKET", message
+                    raise e
+                return {"id": gid, "sport_key": sport, "commence_time": "2026-10-03T13:00:00Z",
+                        "home_team": "H", "away_team": "A",
+                        "bookmakers": [{"key": "draftkings", "title": "DraftKings",
+                                        "markets": [{"key": m, "outcomes": []} for m in asked]}]}
+        return Api()
+
+    def sched(self):
+        return sched_with({"basketball_nba": [("g1", NOW + timedelta(hours=1)), ("g2", NOW + timedelta(hours=1))]},
+                          self.NBA)
+
+    def fetch(self, s, games=("g1", "g2")):
+        import contextlib, io
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            events, ok = s.fetch_props([("basketball_nba", g) for g in games], NOW)
+        return events, ok, err.getvalue()
+
+    def test_one_rejected_type_is_dropped_not_the_sport(self):
+        s, calls = self.sched(), []
+        s.api = self.api(calls=calls)
+        events, ok, err = self.fetch(s)
+        full = "player_points,player_bad,player_rebounds"
+        self.assertEqual(sorted(calls[:2]), [("g1", full), ("g2", full)])   # (the pool: either order)
+        self.assertEqual(calls[2:], [("g1", "player_points"), ("g1", "player_bad"), ("g1", "player_rebounds"),
+                                     ("g2", "player_points,player_rebounds")])
+        self.assertEqual((s.bad_prop_sports, s.bad_prop_markets, ok),
+                         (set(), {"basketball_nba": {"player_bad"}}, {"g1", "g2"}))
+        self.assertEqual(sorted(e["id"] for e in events), ["g1", "g2"])
+        g1 = next(e for e in events if e["id"] == "g1")
+        self.assertEqual([m["key"] for bm in g1["bookmakers"] for m in bm["markets"]],
+                         ["player_points", "player_rebounds"])   # the two answers asked alone, merged
+        self.assertEqual(s.notices, ["⚠️ The Odds API rejected these NBA prop types: player_bad (check "
+                                     "PROP_MARKETS). The other NBA props carry on."])
+        self.assertIn("basketball_nba prop types rejected (422): player_bad. Asking without them until restart.", err)
+        # Until restart: asked without it, and costed without it.
+        calls.clear()
+        self.fetch(s, ("g1",))
+        self.assertEqual(calls, [("g1", "player_points,player_rebounds")])
+        self.assertEqual(s.prop_cost("basketball_nba", 1), 2)
+        self.assertEqual(len(s.notices), 1)
+        self.assertIn("NBA props per game: 2 ", "\n".join(_arbbot.cost_lines(s.cfg, s)))
+
+    def test_a_422_naming_the_type_needs_no_probing(self):
+        s, calls = self.sched(), []
+        s.api = self.api(message="Invalid markets: player_bad", calls=calls)
+        events, ok, _ = self.fetch(s, ("g1",))
+        self.assertEqual(calls, [("g1", "player_points,player_bad,player_rebounds"),
+                                 ("g1", "player_points,player_rebounds")])
+        self.assertEqual((s.bad_prop_markets, ok, len(events)), ({"basketball_nba": {"player_bad"}}, {"g1"}, 1))
+        # A name inside a longer one isn't that one: player_points_alternate doesn't name player_points.
+        s, calls = self.sched(), []
+        s.api = self.api(message="Invalid markets: player_bad, player_points_alternate", calls=calls)
+        self.fetch(s, ("g1",))
+        self.assertEqual((len(calls), s.bad_prop_markets), (2, {"basketball_nba": {"player_bad"}}))
+
+    def test_a_422_naming_every_type_is_probed(self):
+        s, calls = self.sched(), []
+        s.api = self.api(message="Invalid markets: player_points, player_bad, player_rebounds", calls=calls)
+        events, ok, _ = self.fetch(s, ("g1",))
+        self.assertEqual(len(calls), 4)          # the full request, then each type alone
+        self.assertEqual((s.bad_prop_sports, s.bad_prop_markets, ok), (set(), {"basketball_nba": {"player_bad"}},
+                                                                       {"g1"}))
+
+    def test_probing_stopped_by_another_error_decides_nothing(self):
+        s, calls = self.sched(), []
+        s.api = self.api(calls=calls, fail_on=2)   # the full request, the first type alone, then a 503
+        events, ok, _ = self.fetch(s, ("g1",))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual((s.bad_prop_sports, s.bad_prop_markets, ok, events, s.notices), (set(), {}, set(), [], []))
+        self.assertIn("g1", s.last_props)        # tried again when next due
+
+    def test_every_type_rejected_stops_the_sport_as_before(self):
+        s, calls = self.sched(), []
+        s.api = self.api(reject=("player_points", "player_bad", "player_rebounds"), calls=calls)
+        events, ok, _ = self.fetch(s)
+        self.assertEqual(len(calls), 5)          # both games, then the first one's 3 types alone
+        self.assertEqual((s.bad_prop_sports, s.bad_prop_markets, ok), ({"basketball_nba"}, {}, set()))
+        self.assertEqual(s.notices, ["⚠️ The Odds API rejected the NBA prop request: check PROP_MARKETS. "
+                                     "No NBA props until a restart."])
+
+    def test_out_of_credits_while_probing_is_raised(self):
+        s = self.sched()
+        api = self.api()
+        real = api.event_odds
+
+        def event_odds(sport, gid, markets):
+            if "," not in markets:
+                raise urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+            return real(sport, gid, markets)
+        api.event_odds = event_odds
+        s.api = api
+        with self.assertRaises(urllib.error.HTTPError):
+            self.fetch(s, ("g1",))
+
+    def test_read_api_error(self):
+        import io
+        from arbbot import read_api_error
+
+        def err(body):
+            return urllib.error.HTTPError("u", 422, "x", {}, io.BytesIO(body) if body is not None else None)
+        e = err(b'{"message": "Invalid markets: player_bad", "error_code": "INVALID_MARKET"}')
+        read_api_error(e)
+        self.assertEqual((e.odds_error_code, e.odds_message), ("INVALID_MARKET", "Invalid markets: player_bad"))
+        read_api_error(e)                         # (read once: a second call keeps what was read)
+        self.assertEqual(e.odds_message, "Invalid markets: player_bad")
+        e = err(b"Bad Gateway" + b"!" * 600)
+        read_api_error(e)
+        self.assertEqual((e.odds_error_code, e.odds_message), ("", ("Bad Gateway" + "!" * 600)[:500]))
+        for e in (err(None), err(b"")):
+            read_api_error(e)
+            self.assertEqual((e.odds_error_code, e.odds_message), ("", ""))
+
+
+class PropCapPerPass(unittest.TestCase):
+    """PROP_MAX_PER_PASS: at most that many games' props in one pass, the closing-line checks first, then the
+    most overdue (time since the last check over the game's pace); the rest stay due for the next pass. 0 (the
+    default): every game due, in the same order as before."""
+
+    def sched(self, cap, games, last):
+        cfg = Config(sports=["basketball_nba"], prop_sports=["basketball_nba"], prop_max_per_pass=cap)
+        s = sched_with({"basketball_nba": [(g, NOW + timedelta(hours=h)) for g, h in games]}, cfg)
+        ts = time.time()
+        s.last_props.update({g: ts - ago for g, ago in last.items()})
+        return s
+
+    # Near kickoff (3h) every 30 min, 3-24h out every 4h. g4 was never checked.
+    GAMES = [("g1", 1), ("g2", 1), ("g3", 10), ("g4", 10), ("g5", 2)]
+    LAST = {"g1": 1900, "g2": 3600, "g3": 15000, "g5": 2000}
+
+    def test_prop_cap_takes_the_most_overdue_first(self):
+        s = self.sched(2, self.GAMES, self.LAST)
+        due = s.props_due(NOW)
+        self.assertEqual(due, [("basketball_nba", "g4"), ("basketball_nba", "g2")])   # never, then 2x its pace
+        s.last_props.update({g: time.time() for _, g in due})
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", "g5"), ("basketball_nba", "g1")])   # 1.11x, 1.06x
+        s.last_props.update({"g5": time.time(), "g1": time.time()})
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", "g3")])
+        # Within the cap: the list as it is.
+        self.assertEqual(self.sched(5, self.GAMES, self.LAST).props_due(NOW),
+                         [("basketball_nba", g) for g in ("g1", "g2", "g3", "g4", "g5")])
+
+    def test_prop_cap_puts_closing_checks_first(self):
+        # g6 starts in 3 minutes with a logged prop bet (closing-line check); g7 too, and it's due anyway.
+        games = self.GAMES + [("g6", 0.05), ("g7", 0.07)]
+        s = self.sched(2, games, {**self.LAST, "g6": 120, "g7": 1900})
+        s.need_close_props = {"g6", "g7"}
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", "g7"), ("basketball_nba", "g6")])
+        s.cfg.prop_max_per_pass = 3
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", g) for g in ("g7", "g6", "g4")])
+
+    def test_no_prop_cap_keeps_the_list(self):
+        games = self.GAMES + [("g6", 0.05), ("g7", 0.07), ("g8", 30)]
+        s = self.sched(0, games, {**self.LAST, "g6": 120, "g7": 1900})
+        s.need_close_props = {"g6", "g7"}
+        # The regular ones in schedule order, then the closing-line check (as before the setting existed).
+        self.assertEqual(s.props_due(NOW), [("basketball_nba", g) for g in ("g1", "g2", "g3", "g4", "g5", "g7", "g6")])
+
+    def test_setting(self):
+        import os
+        from unittest import mock
+        self.assertEqual(Config().prop_max_per_pass, 0)
+        with mock.patch.dict(os.environ, {"PROP_MAX_PER_PASS": "8"}):
+            self.assertEqual(Config.from_env().prop_max_per_pass, 8)
+        with self.assertRaises(ValueError) as bad:
+            Config(prop_max_per_pass=-1).check()
+        self.assertEqual(str(bad.exception), "PROP_MAX_PER_PASS=-1 should be 0 (no limit) or a number of games, like 8")
+
+
+class CardEditThrottle(unittest.TestCase):
+    """CARD_EDIT_MIN_SECONDS: an open +EV or outlier card whose bet didn't change (only other books' prices or
+    its notes) is edited at most that often; the next check after that edits it with what's newest. Its own
+    book, price or stake changing, a GONE mark, a live bet, arbs and parlays: right away. 0: every change at once."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        d = Path(self.tmp.name)
+        self.cfg = Config(webhook_url="https://main", state_dir="", log_file="", min_ev_pct=3, round_stakes=0,
+                          ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
+                          pregame_max_age_seconds=10**9, card_edit_min_seconds=600)
+        self.sent = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def alerter(self, cls=EVAlerter, cfg=None):
+        import contextlib, io
+        a = cls(cfg or self.cfg, dry_run=False)
+        handle = a.handle
+
+        def quiet(*args, **kw):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return handle(*args, **kw)
+        a.handle = quiet
+
+        def fake(payload, message_id=None, url=""):
+            self.sent.append(("PATCH" if message_id else "POST", payload["embeds"][0]))
+            a.send_retryable = False
+            return message_id or f"m{len(self.sent)}"
+        a._discord = fake
+        return a
+
+    def scan(self, a, at, a_price=2.15, b_price=2.10, live=False):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"A": [("Home", a_price, None)], "B": [("Home", b_price, None)]})
+        [bet] = find_evs([ev], a.cfg, NOW)
+        bet.is_live = live
+        a.handle([bet], ["Test"], now=self.t0 + at)
+        return bet
+
+    t0 = 1_000_000.0
+
+    def methods(self):
+        return [m for m, _ in self.sent]
+
+    def test_other_books_prices_wait(self):
+        a = self.alerter()
+        self.scan(a, 0)
+        self.scan(a, 60, b_price=1.80)                     # only the "every book" list changed
+        self.assertEqual(self.methods(), ["POST"])
+        self.scan(a, 300, b_price=1.85)
+        self.assertEqual(self.methods(), ["POST"])
+        self.scan(a, 601, b_price=1.85)                    # 10 minutes on: edited, with the newest prices
+        self.assertEqual(self.methods(), ["POST", "PATCH"])
+        self.assertIn("B — **-118**", self.sent[-1][1]["description"])   # (1.85: the newest price)
+        self.scan(a, 700, b_price=1.90)                    # the clock starts again from that edit
+        self.assertEqual(self.methods(), ["POST", "PATCH"])
+        # 0 (the default): every change at once.
+        self.sent.clear()
+        a = self.alerter(cfg=replace(self.cfg, card_edit_min_seconds=0))
+        self.scan(a, 0)
+        self.scan(a, 60, b_price=1.80)
+        self.assertEqual(self.methods(), ["POST", "PATCH"])
+
+    def test_the_bets_own_price_and_gone_dont_wait(self):
+        a = self.alerter()
+        self.scan(a, 0)
+        self.scan(a, 60, a_price=2.12)                     # the price to bet (and its stake) changed: at once
+        self.assertEqual(self.methods(), ["POST", "PATCH"])
+        bet = self.scan(a, 90, a_price=2.12, b_price=1.80)   # then only another book: waits
+        self.assertEqual(self.methods(), ["POST", "PATCH"])
+        a.handle([], [bet.sport_key], now=self.t0 + 120)   # gone: marked at once
+        self.assertEqual(self.methods(), ["POST", "PATCH", "PATCH"])
+        self.assertTrue(self.sent[-1][1]["title"].startswith("❌ GONE"))
+
+    def test_live_bets_outliers_arbs(self):
+        a = self.alerter()
+        self.scan(a, 0, live=True)
+        self.scan(a, 60, b_price=1.80, live=True)          # live: at once
+        self.assertEqual(self.methods(), ["POST", "PATCH"])
+        self.assertTrue(OutlierAlerter.throttle_edits and EVAlerter.throttle_edits)
+        self.assertFalse(Alerter.throttle_edits or _arbbot.ParlayAlerter.throttle_edits)
+        # The arbs' alerter: every change at once.
+        self.sent.clear()
+        arbs = self.alerter(Alerter)
+        arbs.handle(find_arbs(demo_events(), Config()), ["basketball_nba"], now=self.t0)
+        moved = find_arbs(demo_events(), Config())
+        moved[0].legs[0].price += 0.05
+        arbs.handle(moved, ["basketball_nba"], now=self.t0 + 60)
+        self.assertIn("PATCH", self.methods())
+
+    def test_setting(self):
+        import os
+        from unittest import mock
+        self.assertEqual(Config().card_edit_min_seconds, 0)
+        with mock.patch.dict(os.environ, {"CARD_EDIT_MIN_SECONDS": "600"}):
+            self.assertEqual(Config.from_env().card_edit_min_seconds, 600)
+        with self.assertRaises(ValueError):
+            Config(card_edit_min_seconds=-1).check()
+
+
+class PlanText(unittest.TestCase):
+    """--plan and the budget log line say prop rates in minutes or hours as fits (30m, 4h, 16h), and the
+    call costs have a "more than 24h out" line when early props start further out than that."""
+
+    def plan(self, **kw):
+        import contextlib, io
+        cfg = Config(sports=["basketball_nba"], prop_sports=["basketball_nba"], **kw)
+        sched = Scheduler(cfg, FakeAPI(50000))
+        sched.games["basketball_nba"] = [("g1", datetime.now(timezone.utc) + timedelta(hours=30))]
+        sched.refresh_events = lambda force=False: None
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            _arbbot.print_plan(cfg, sched)
+        return out.getvalue()
+
+    def test_props_line(self):
+        self.assertIn("every 30m from 48h out, every 30m in the last 3h.",
+                      self.plan(prop_early_minutes=30, prop_early_min_minutes=30, prop_early_hours=48))
+        self.assertIn("every 4h from 24h out, every 30m in the last 3h.", self.plan())
+
+    def test_every_long(self):
+        from arbbot import every_long
+        self.assertEqual([every_long(x) for x in (90, 1800, 7199, 7200, 14400, 57600)],
+                         ["90s", "30m", "120m", "2h", "4h", "16h"])
+
+    def test_slowed_early_props_in_minutes(self):
+        s = sched_with({"basketball_nba": []}, Config(sports=["basketball_nba"], prop_early_minutes=10,
+                                                      prop_early_min_minutes=10))
+        s.extra_scale, s.side_scale = 4.0, 2.0
+        s.demand = {_arbbot.PROP_EARLY: 100.0, FAR: 100.0}
+        lines = "\n".join(_arbbot.pace_lines(s.cfg, s))
+        self.assertIn("→ Then early props every 80m and games 1-2 days out every 24h (8× slower in all)", lines)
+        s.cfg = replace(s.cfg, prop_early_minutes=240)          # today's settings: as before
+        self.assertIn("→ Then early props every 32h and games 1-2 days out every 24h", "\n".join(_arbbot.pace_lines(s.cfg, s)))
+
+    def test_cost_line_more_than_24h_out(self):
+        for hours, shown in ((48, True), (24, False)):
+            cfg = Config(sports=["basketball_nba"], prop_sports=["basketball_nba"], prop_early_hours=hours)
+            s = sched_with({"basketball_nba": []}, cfg)
+            s.api.costs = _arbbot.CostBook()
+            s.api.costs.add("props:basketball_nba:12h", 2, 4)
+            [line] = [l for l in _arbbot.cost_lines(cfg, s) if l.startswith("NBA props")]
+            self.assertEqual("4.0 (formula) more than 24h out" in line, shown, line)
+            self.assertIn("up to 24h out", line)
+
+
+class PropsChannel(unittest.TestCase):
+    """DISCORD_PROPS_WEBHOOK_URL: player props' +EV and outlier cards get their own channel, so many more prop
+    types don't crowd the +EV channel. Empty: where they go today. Prop arbs, parlays and results don't move."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def trackers(self, **kw):
+        from arbbot import Trackers
+        d = Path(self.tmp.name)
+        urls = {"webhook_url": "https://main", "ev_webhook_url": "https://ev", "outlier_webhook_url": "https://out",
+                "parlay_webhook_url": "https://par"}
+        cfg = Config(state_dir="", log_file="", ev_log_file=str(d / "ev.csv"), outlier_log_file=str(d / "out.csv"),
+                     parlay_log_file=str(d / "par.csv"), markout_file="", candidate_log_file="",
+                     closing_file=str(d / "close.csv"), **{**urls, **kw})
+        return Trackers(cfg, SimpleNamespace(once=False, demo=False, dry_run=True))
+
+    def test_props_get_their_own_channel(self):
+        t = self.trackers(props_webhook_url="https://props")
+        [arb] = find_arbs(demo_events(), Config())
+        self.assertEqual((t.prop_evs.webhook_for(None), t.prop_outs.webhook_for(None)), ("https://props",) * 2)
+        self.assertEqual((t.evs.webhook_for(None), t.outs.webhook_for(None), t.prop_arbs.webhook_for(arb),
+                          t.parlays.webhook_for(None)), ("https://ev", "https://out", "https://main", "https://par"))
+        # A prop +EV card is posted there; a main-line one isn't.
+        from unittest import mock
+        import contextlib, io
+        posted = []
+        cfg = replace(t.cfg, min_ev_pct=3, round_stakes=0)
+        prop = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)})
+        prop["bookmakers"][0]["key"] = "pinnacle"
+        [prop_bet] = find_evs([prop], cfg.for_props(), NOW)
+        main = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"A": [("Home", 2.15, None)]})
+        [main_bet] = find_evs([main], cfg, NOW)
+        with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: posted.append(url) or {"id": "1"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            EVAlerter(cfg, dry_run=False, noun="+EV props", props=True).handle([prop_bet], now=1000)
+            EVAlerter(cfg, dry_run=False).handle([main_bet], now=1000)
+        self.assertEqual(posted, ["https://props", "https://ev"])
+
+    def test_empty_keeps_todays_channels(self):
+        t = self.trackers()
+        self.assertEqual((t.prop_evs.webhook_for(None), t.prop_outs.webhook_for(None)), ("https://ev", "https://out"))
+        t = self.trackers(outlier_webhook_url="")
+        self.assertEqual(t.prop_outs.webhook_for(None), "https://ev")
+
+    def test_setting_and_set_webhook(self):
+        import os
+        from unittest import mock
+        from arbbot import WEBHOOK_SETTINGS
+        with mock.patch.dict(os.environ, {"DISCORD_PROPS_WEBHOOK_URL": "https://discord.com/api/webhooks/9/p"}):
+            self.assertEqual(Config.from_env().props_webhook_url, "https://discord.com/api/webhooks/9/p")
+        self.assertEqual(WEBHOOK_SETTINGS["props"], ("DISCORD_PROPS_WEBHOOK_URL", "player props (+EV and outliers)"))
+        import sys
+        with mock.patch.object(sys, "argv", ["arbbot.py", "--set-webhook", "props"]), \
+                mock.patch.dict(os.environ, {}), mock.patch("arbbot.load_dotenv"), \
+                mock.patch("arbbot.set_webhook") as asked:
+            _arbbot.main()
+        asked.assert_called_once_with("props")
+        cfg = Config(webhook_url="https://main", props_webhook_url="PASTE_URL_HERE")
+        self.assertEqual(cfg.bad_webhooks(), ["DISCORD_PROPS_WEBHOOK_URL"])          # not a URL: cleared
+        self.assertEqual(EVAlerter(cfg, True, props=True).webhook_for(None), "https://main")
+
+
+class CreditsShortMessage(MixFiles):
+    """The health channel hears it once a local day when the budget keeps live and near-kickoff checks 3x or
+    more slower than set for half an hour: the settings need more credits than the plan has (the safety net
+    if the bigger plan's settings ever run on the 100K plan; today's settings peak at about 2.4x there)."""
+
+    def short(self, slow, minutes, start=datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc)):
+        from arbbot import CreditsShort
+        s = sched_with({"basketball_nba": []}, Config(sports=["basketball_nba"], billing_day=1))
+        c = CreditsShort(s.cfg)
+        said = []
+        for m in range(0, minutes + 1, 5 if minutes < 120 else 30):
+            s.scale = slow(m) if callable(slow) else slow
+            if note := c.check(s, start + timedelta(minutes=m), 1234.0):
+                said.append((m, note))
+        return said
+
+    def test_said_after_half_an_hour(self):
+        said = self.short(3.2, 31)
+        self.assertEqual([m for m, _ in said], [30])
+        self.assertEqual(said[0][1], "⚠️ Not enough Odds API credits for these settings: live checks every 192s "
+                                     "instead of 60s and near-kickoff checks 3x slower, so the credits last until "
+                                     "the plan resets (Nov 01). Credits left: 1,234. If the plan was just upgraded, "
+                                     "the new credits haven't reached the bot yet.")
+        self.assertEqual(self.short(3.2, 25), [])                       # not half an hour yet
+        self.assertEqual(self.short(2.9, 600), [])                      # today's settings never get there
+        # Back under 3x in between: the half hour starts again.
+        self.assertEqual(self.short(lambda m: 2.0 if m == 20 else 3.5, 45), [])
+
+    def test_once_a_day(self):
+        said = self.short(3.2, 26 * 60)                                 # 4pm UTC = noon in New York, for 26 hours
+        self.assertEqual([m for m, _ in said], [30, 12 * 60])           # then again at midnight in New York
+
+    def test_run_sends_it(self):
+        import argparse, contextlib, io
+        from unittest import mock
+
+        class Api:
+            remaining, used = 50000.0, None
+
+            def __init__(self, cfg):
+                pass
+
+            def events(self, sport, horizon_hours=26):
+                return []
+        cfg = self.cfg(sports=["basketball_nba"], kalshi_check=False)
+        args = argparse.Namespace(once=True, demo=False, dry_run=True, plan=False, check_kalshi=False,
+                                  results=None, post_results=None)
+        with mock.patch("arbbot.OddsAPI", Api), mock.patch.object(_arbbot.CreditsShort, "check",
+                                                                  return_value="⚠️ short"), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            _arbbot.run(cfg, args, _arbbot.Status(cfg, dry_run=True))
+        self.assertIn("[status] ⚠️ short", out.getvalue())
 
 
 class PropSides(unittest.TestCase):
@@ -11917,6 +12536,31 @@ class BlueprintSettingsDocumented(unittest.TestCase):
         for key in self.ADDED:
             self.assertEqual(getattr(from_example, key.lower()), getattr(default, key.lower()), key)
 
+
+class UpgradeSettingsDocumented(unittest.TestCase):
+    """The settings added for the bigger plan are explained in README.md and listed in .env.example, at the value
+    the code uses when it's left out (so copying .env.example changes nothing, and they're off until set)."""
+    ADDED = ("PROP_MAX_PER_PASS", "CARD_EDIT_MIN_SECONDS")
+
+    def test_in_readme_and_env_example_at_the_default(self):
+        import os, re
+        from unittest import mock
+        here = Path(_arbbot.HERE)
+        readme, example = ((here / n).read_text(encoding="utf-8") for n in ("README.md", ".env.example"))
+        values = dict(re.findall(r"^([A-Z][A-Z0-9_]+)=(.*)$", example, re.M))
+        for key in self.ADDED:
+            self.assertRegex(readme, rf"\b{key}\b", f"README.md doesn't explain {key}")
+            self.assertIn(key, values, f".env.example doesn't list {key}")
+        with mock.patch.dict(os.environ, {k: values[k] for k in self.ADDED}):
+            from_example = Config.from_env()
+        default = Config().with_mode()
+        for key in self.ADDED:
+            self.assertEqual(getattr(from_example, key.lower()), getattr(default, key.lower()), key)
+            self.assertEqual(getattr(default, key.lower()), 0, key)              # off unless set
+        # The props channel: explained, listed empty, and one of --set-webhook's channels.
+        self.assertIn("DISCORD_PROPS_WEBHOOK_URL", readme)
+        self.assertEqual(values.get("DISCORD_PROPS_WEBHOOK_URL"), "")
+        self.assertIn("--set-webhook props", readme)
 
 if __name__ == "__main__":
     unittest.main()

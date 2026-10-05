@@ -168,9 +168,10 @@ DEFAULT_PROP_NEAR_MARKETS = {
 
 WEBHOOK_SETTINGS = {
     "main": ("DISCORD_WEBHOOK_URL", "arbs (and anything without its own channel)"),
-    "ev": ("DISCORD_EV_WEBHOOK_URL", "+EV bets, props, outliers and parlays"),
+    "ev": ("DISCORD_EV_WEBHOOK_URL", "+EV bets, outliers and parlays (props too, unless they have their own channel)"),
     "outlier": ("DISCORD_OUTLIER_WEBHOOK_URL", "outliers"),
     "parlay": ("DISCORD_PARLAY_WEBHOOK_URL", "parlays"),
+    "props": ("DISCORD_PROPS_WEBHOOK_URL", "player props (+EV and outliers)"),
     "live": ("DISCORD_LIVE_WEBHOOK_URL", "live arbs"),
     "status": ("DISCORD_STATUS_WEBHOOK_URL", "bot health messages"),
     "results": ("DISCORD_RESULTS_WEBHOOK_URL", "bet results (what hit and what missed)"),
@@ -395,6 +396,7 @@ class Config:
     live_webhook_url: str = ""    # send live arbs to a separate Discord channel
     ev_webhook_url: str = ""      # +EV (incl. props) channel; outliers and parlays fall back to it
     parlay_webhook_url: str = ""
+    props_webhook_url: str = ""   # player props' +EV and outlier cards ("" = where other +EV and outliers go)
     include_links: bool = True    # ask for bet-slip deep links where books support them
     include_sids: bool = True     # ...and each book's own ids, to build a bet-slip link where it sent none (no credits)
     discord_mention: str = ""     # e.g. @everyone or <@USER_ID> to force a phone ping
@@ -405,6 +407,10 @@ class Config:
     live_send_max_delay_seconds: int = 90
     discord_max_wait_seconds: float = 10   # a new alert's post told to wait longer (429): don't, try at the next check
                                            # (0 = wait); edits and status messages always wait
+    # A +EV or outlier card already posted is edited at most this often when only other books' prices or its notes
+    # changed (each edit waits out Discord's limits). Its own book, price or stake changing, a GONE mark, a much
+    # better price (a new alert), a live bet, arbs and parlays: right away (0 = every change right away).
+    card_edit_min_seconds: int = 0
     status_webhook_url: str = ""  # health messages; defaults to the alerts webhook
     results_webhook_url: str = ""  # graded bets (what hit); defaults to the health channel
     results_minutes: int = 30     # look for finished games to grade this often (0 = daily only)
@@ -507,6 +513,10 @@ class Config:
     prop_hours: float = 3.0         # check every PROP_MINUTES this close to kickoff
     prop_early_hours: float = 24.0  # and every PROP_EARLY_MINUTES from this far out
     prop_early_minutes: int = 240
+    # At most this many games' props per pass, the most overdue first (closing-line checks before any); the rest
+    # stay due and go in the next pass, a second later. Spreads a slate starting together over a few passes, so
+    # the Odds API isn't asked for dozens at once and the next live check isn't held up (0 = no limit).
+    prop_max_per_pass: int = 0
     prop_min_ev_pct: float = 7.0    # prop prices are noisier, so ask for more edge
     # "over": prop Unders aren't alerted (+EV, outliers, so parlays too; prop arbs still need both sides),
     # "both": Overs and Unders. "" = the mode's choice: locks over (the blueprint), otherwise both.
@@ -637,12 +647,14 @@ class Config:
             live_webhook_url=e("DISCORD_LIVE_WEBHOOK_URL", ""),
             ev_webhook_url=e("DISCORD_EV_WEBHOOK_URL", ""),
             parlay_webhook_url=e("DISCORD_PARLAY_WEBHOOK_URL", ""),
+            props_webhook_url=e("DISCORD_PROPS_WEBHOOK_URL", ""),
             include_links=e("INCLUDE_LINKS", "true").lower() in ("1", "true", "yes"),
             include_sids=(e("INCLUDE_SIDS") or "true").strip().lower() in ("1", "true", "yes"),
             discord_mention=e("DISCORD_MENTION", ""),
             send_max_delay_seconds=num("SEND_MAX_DELAY_SECONDS", d.send_max_delay_seconds, int),
             live_send_max_delay_seconds=num("LIVE_SEND_MAX_DELAY_SECONDS", d.live_send_max_delay_seconds, int),
             discord_max_wait_seconds=num("DISCORD_MAX_WAIT_SECONDS", d.discord_max_wait_seconds, float),
+            card_edit_min_seconds=num("CARD_EDIT_MIN_SECONDS", d.card_edit_min_seconds, int),
             status_webhook_url=e("DISCORD_STATUS_WEBHOOK_URL", ""),
             results_webhook_url=e("DISCORD_RESULTS_WEBHOOK_URL", ""),
             results_minutes=num("RESULTS_MINUTES", d.results_minutes, int),
@@ -716,6 +728,7 @@ class Config:
             prop_hours=num("PROP_HOURS", d.prop_hours, float),
             prop_early_hours=num("PROP_EARLY_HOURS", d.prop_early_hours, float),
             prop_early_minutes=num("PROP_EARLY_MINUTES", d.prop_early_minutes, int),
+            prop_max_per_pass=num("PROP_MAX_PER_PASS", d.prop_max_per_pass, int),
             prop_min_ev_pct=num("PROP_MIN_EV_PCT", d.prop_min_ev_pct, float),
             prop_sides=(e("PROP_SIDES") or "").strip().lower(),
             prop_min_books=num("PROP_MIN_BOOKS", d.prop_min_books, int),
@@ -810,6 +823,9 @@ class Config:
         if self.log_keep_days < 0:
             raise ValueError(f"LOG_KEEP_DAYS={self.log_keep_days} should be 0 (keep everything) or a number of days, "
                              f"like 60")
+        if self.prop_max_per_pass < 0:
+            raise ValueError(f"PROP_MAX_PER_PASS={self.prop_max_per_pass} should be 0 (no limit) or a number of games, "
+                             f"like 8")
         for key, v in (("ODDS_DOWN_MINUTES", self.odds_down_minutes), ("SHARP_DOWN_MINUTES", self.sharp_down_minutes),
                        ("KALSHI_DOWN_MINUTES", self.kalshi_down_minutes)):
             if v < 0:
@@ -819,6 +835,9 @@ class Config:
                        ("DISCORD_MAX_WAIT_SECONDS", self.discord_max_wait_seconds)):
             if v < 0:
                 raise ValueError(f"{key}={v:g} should be 0 (no limit) or a number of seconds, like 60")
+        if self.card_edit_min_seconds < 0:
+            raise ValueError(f"CARD_EDIT_MIN_SECONDS={self.card_edit_min_seconds} should be 0 (every change right "
+                             f"away) or a number of seconds, like 600")
         for key, v in (("ONE_SOURCE_STAKE", self.one_source_stake), ("KALSHI_ONLY_STAKE", self.kalshi_only_stake)):
             if v < 0:
                 raise ValueError(f"{key}={v:g} should be a fraction of the normal stake, like 0.5 (1 = the full stake)")
@@ -904,6 +923,7 @@ class Config:
         for attr, env in (("ev_webhook_url", "DISCORD_EV_WEBHOOK_URL"),
                           ("outlier_webhook_url", "DISCORD_OUTLIER_WEBHOOK_URL"),
                           ("parlay_webhook_url", "DISCORD_PARLAY_WEBHOOK_URL"),
+                          ("props_webhook_url", "DISCORD_PROPS_WEBHOOK_URL"),
                           ("live_webhook_url", "DISCORD_LIVE_WEBHOOK_URL"),
                           ("status_webhook_url", "DISCORD_STATUS_WEBHOOK_URL"),
                           ("results_webhook_url", "DISCORD_RESULTS_WEBHOOK_URL")):
@@ -1230,16 +1250,64 @@ class CostBook:
             print(f"  ! Couldn't save call costs: {e}", file=sys.stderr)
 
 
+def read_api_error(e: urllib.error.HTTPError) -> None:
+    """Note on an Odds API error what it said: e.odds_error_code (e.g. EXCEEDED_FREQ_LIMIT, OUT_OF_USAGE_CREDITS,
+    INVALID_MARKET; "" if it didn't say) and e.odds_message. Its body can only be read once."""
+    if hasattr(e, "odds_error_code"):
+        return
+    try:
+        body = (e.read() or b"").decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - no body: nothing said
+        body = ""
+    try:
+        said = json.loads(body)
+    except ValueError:
+        said = None
+    said = said if isinstance(said, dict) else {}
+    e.odds_error_code = str(said.get("error_code") or "")
+    e.odds_message = str(said.get("message") or body)[:500]
+
+
 class OddsAPI:
+    RATE = 10.0        # Odds API calls per second at most, on average (it allows 30; jitter near that gets 429s)
+    BURST = 10         # ...and this many at once
+    FREQ_RETRIES = 2   # "slow down" (429 EXCEEDED_FREQ_LIMIT): asked again after 2 and 4 seconds, then given up
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.remaining: float | None = None
         self.used: float | None = None
         self._warned_events_cost = False
         self.costs = CostBook(data_path(cfg.state_dir) / "call_costs.json" if cfg.state_dir else None)
+        self._pace_lock = threading.Lock()
+        self._tokens, self._token_at = float(self.BURST), time.monotonic()
+
+    def _pace(self) -> None:
+        """Wait for a turn: at most BURST calls at once, RATE per second on average (all threads together)."""
+        with self._pace_lock:
+            now = time.monotonic()
+            self._tokens = min(float(self.BURST), self._tokens + (now - self._token_at) * self.RATE)
+            self._token_at = now
+            self._tokens -= 1
+            wait = -self._tokens / self.RATE if self._tokens < 0 else 0.0
+        if wait > 0:
+            time.sleep(wait)
 
     def _request(self, path: str, params: dict) -> tuple[list | dict, float | None]:
-        """(the JSON, what this one call cost in credits if the API said)."""
+        """(the JSON, what this one call cost in credits if the API said). A "slow down" (429 that isn't out of
+        credits) is asked again FREQ_RETRIES times, 2 and 4 seconds later (a refused call costs nothing)."""
+        for attempt in range(self.FREQ_RETRIES + 1):
+            try:
+                return self._request_once(path, params)
+            except urllib.error.HTTPError as e:
+                read_api_error(e)
+                if e.code != 429 or e.odds_error_code == "OUT_OF_USAGE_CREDITS" or attempt == self.FREQ_RETRIES:
+                    raise
+                time.sleep(2.0 * (attempt + 1))
+        raise AssertionError("unreachable")
+
+    def _request_once(self, path: str, params: dict) -> tuple[list | dict, float | None]:
+        self._pace()
         params = {"apiKey": self.cfg.api_key, **params}
         url = f"{API_BASE}{path}?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={"User-Agent": "arbbot/2.0", "Accept-Encoding": "gzip"})
@@ -1677,6 +1745,21 @@ MARKET_NAMES = {
     "player_threes": "Threes", "player_shots_on_goal": "Shots on Goal", "player_goals": "Goals",
     "player_total_saves": "Saves", "batter_hits": "Hits", "batter_total_bases": "Total Bases",
     "pitcher_strikeouts": "Strikeouts",
+    # NFL
+    "player_pass_completions": "Pass Completions", "player_pass_attempts": "Pass Attempts",
+    "player_pass_interceptions": "Interceptions Thrown", "player_rush_attempts": "Rush Attempts",
+    "player_rush_reception_yds": "Rush + Rec Yards", "player_anytime_td": "Anytime TD",
+    # NBA
+    "player_blocks": "Blocks", "player_steals": "Steals", "player_blocks_steals": "Blocks + Steals",
+    "player_turnovers": "Turnovers", "player_points_rebounds_assists": "Pts + Reb + Ast",
+    "player_points_rebounds": "Pts + Reb", "player_points_assists": "Pts + Ast", "player_rebounds_assists": "Reb + Ast",
+    # NHL
+    "player_blocked_shots": "Blocked Shots", "player_goal_scorer_anytime": "Anytime Goal Scorer",
+    # MLB
+    "batter_home_runs": "Home Runs", "batter_rbis": "RBIs", "batter_runs_scored": "Runs", "batter_walks": "Walks",
+    "batter_strikeouts": "Batter Strikeouts", "batter_hits_runs_rbis": "Hits + Runs + RBIs",
+    "pitcher_outs": "Pitching Outs", "pitcher_earned_runs": "Earned Runs", "pitcher_hits_allowed": "Hits Allowed",
+    "pitcher_walks": "Walks Allowed",
 }
 
 
@@ -1951,6 +2034,8 @@ class OpenArb:
                               # it never goes out
     prev: tuple = ()          # (message id, webhook) of the card it was handed over from (now a pointer to this
                               # one): if it closes before its own post lands, that card says GONE
+    edited: float = 0.0       # when its card was last posted or edited (CARD_EDIT_MIN_SECONDS)
+    shown: tuple = ()         # (book, price, stake) of the bet as its card shows it (an arb: ())
 
 
 def data_path(name: str) -> Path:
@@ -2169,9 +2254,13 @@ class Alerter:
 
     RESTORE_GRACE = 900  # seconds a restored alert gets to show up again before it's marked gone
     scoped = True        # handle() is told which sports/games were checked (parlays: no)
+    # An open card whose own bet didn't change (only other books' prices, its notes) is edited at most every
+    # CARD_EDIT_MIN_SECONDS: +EV and outlier cards. Arbs, prop arbs and parlays: every change right away.
+    throttle_edits = False
 
-    def __init__(self, cfg: Config, dry_run: bool, noun: str | None = None):
+    def __init__(self, cfg: Config, dry_run: bool, noun: str | None = None, props: bool = False):
         self.cfg = cfg
+        self.props = props   # player props' +EV and outlier cards: DISCORD_PROPS_WEBHOOK_URL when it's set
         if noun:
             self.noun = noun  # before loading state: it names the state file
         self.dry_run = dry_run or not cfg.webhook_url
@@ -2247,6 +2336,7 @@ class Alerter:
         self.open[arb.key] = op
         if saved.get("card") != op.card and op.message_id:
             self._discord(self.payload(arb, first_seen=op.first_seen), op.message_id, op.url)
+            op.edited, op.shown = now, self.shown(arb)
         return op
 
     def _drop_restored(self, key: str, why: str) -> None:
@@ -2276,6 +2366,21 @@ class Alerter:
         confidence, related alerts...) edits it."""
         emb = {k: v for k, v in self.payload(item, first_seen=first_seen)["embeds"][0].items() if k != "timestamp"}
         return hashlib.sha1(json.dumps(emb, sort_keys=True).encode()).hexdigest()[:16]
+
+    @staticmethod
+    def shown(item) -> tuple:
+        """The bet as its card shows it, (book, price, stake): what an edit can't wait for (an arb: ())."""
+        return tuple(getattr(item, k) for k in ("book", "price", "stake")) if hasattr(item, "book") else ()
+
+    def edit_waits(self, item, cur: OpenArb, now: float) -> bool:
+        """Can this change to an open card wait (CARD_EDIT_MIN_SECONDS)? Only on a +EV or outlier card already
+        posted, before the game, when the bet itself (book, price, stake) is as the card shows it and the card
+        was posted or edited less than that long ago. The card isn't marked as edited, so a later check edits
+        it with whatever is newest then."""
+        limit = self.cfg.card_edit_min_seconds
+        return (self.throttle_edits and limit > 0 and bool(cur.message_id) and not cur.retry
+                and not getattr(item, "is_live", False) and self.shown(item) == cur.shown
+                and now - cur.edited < limit)
 
     # ---- hooks (overridden for +EV)
     def text(self, item) -> str:
@@ -2528,6 +2633,7 @@ class Alerter:
                               flush=True)
                     op.message_id = self._discord(self.payload(arb, "" if quiet else self.mention(),
                                                                first_seen=first), url=op.url)
+                    op.edited, op.shown = now, self.shown(arb)
                     op.retry = op.message_id is None and self.send_retryable
                     if op.retry:
                         self.not_taken(op)
@@ -2568,6 +2674,7 @@ class Alerter:
                     cur.deferred = False
                     cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=cur.first_seen),
                                                    url=cur.url)
+                    cur.edited, cur.shown = now, self.shown(arb)
                     cur.card, cur.retry = card, cur.message_id is None and self.send_retryable
                     if cur.retry:
                         self.not_taken(cur)
@@ -2577,6 +2684,8 @@ class Alerter:
                     if not cur.sent and not cur.retry:   # (an alert held back until now goes out as this one)
                         self._went_out(cur, now, fetched)
                     new += 1
+                elif changed and self.edit_waits(arb, cur, now):
+                    pass   # (only other books' prices or notes changed: edited by a later check, CARD_EDIT_MIN_SECONDS)
                 elif changed or cur.retry:
                     # (A live bet's better price that the live rules hold back: edited, no new ping yet.)
                     if changed:
@@ -2585,6 +2694,7 @@ class Alerter:
                               flush=True)
                     if cur.message_id:
                         self._discord(self.payload(arb, first_seen=cur.first_seen), cur.message_id, cur.url)
+                        cur.edited, cur.shown = now, self.shown(arb)
                     elif cur.retry and self.too_old(arb, age):
                         self.defer(cur, age, now)   # this check's odds are too old by now as well: the next one
                     elif cur.retry:
@@ -2602,6 +2712,7 @@ class Alerter:
                             cur.deferred = False   # (from here, a post Discord doesn't take is "not sent")
                             cur.message_id = self._discord(self.payload(arb, "" if cur.quiet else self.mention(),
                                                                         first_seen=cur.first_seen), url=cur.url)
+                            cur.edited, cur.shown = now, self.shown(arb)
                             cur.retry = cur.message_id is None and self.send_retryable
                             if cur.retry:
                                 self.not_taken(cur)
@@ -4029,6 +4140,7 @@ EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
 class EVAlerter(Alerter):
     noun = "+EV bets"
     log_fields = EV_LOG_FIELDS
+    throttle_edits = True   # (CARD_EDIT_MIN_SECONDS; outliers too)
     log_on_open = True  # logged at first sight, so a restart never loses a bet from the results
     log_held = False    # the bet log is what was alerted (results are graded from it)
 
@@ -4066,7 +4178,7 @@ class EVAlerter(Alerter):
         return self.cfg.ev_log_file
 
     def webhook_for(self, item) -> str:
-        return self.cfg.ev_webhook_url or self.cfg.webhook_url
+        return (self.props and self.cfg.props_webhook_url) or self.cfg.ev_webhook_url or self.cfg.webhook_url
 
     def row(self, op: OpenArb) -> dict:
         b = op.arb
@@ -4803,9 +4915,10 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                     # right one, and the rest are behind: betting it is no edge at all.
                     # That test reads the book's main line at this point when it has one, whichever price
                     # is the bet: its alternate line paying more isn't the book moving (alternate lines
-                    # are only asked for near kickoff, so the first one seen isn't a move from the main
-                    # line's price). With only an alternate line here (its main line moved to another
-                    # point), that price is what the book's price here moved to.
+                    # may not be asked for on every check, e.g. only near kickoff with PROP_NEAR_MARKETS, so
+                    # the first one seen isn't a move from the main line's price). With only an alternate line
+                    # here (its main line moved to another point), that price is what the book's price here
+                    # moved to.
                     main_p = full.get(bk, {}).get(name)
                     gp = price if main_p is None else main_p
                     hkey = (ev["id"], k, bk, name)
@@ -5088,7 +5201,8 @@ class OutlierAlerter(EVAlerter):
         return self.cfg.outlier_log_file
 
     def webhook_for(self, item) -> str:
-        return self.cfg.outlier_webhook_url or self.cfg.ev_webhook_url or self.cfg.webhook_url
+        return ((self.props and self.cfg.props_webhook_url) or self.cfg.outlier_webhook_url or self.cfg.ev_webhook_url
+                or self.cfg.webhook_url)
 
 
 # --------------------------------------------------------------------------- parlays
@@ -5639,7 +5753,16 @@ BOX_STATS = {   # (sport family, prop market) -> columns added together
     ("baseball", "pitcher_walks"): [_t(("BB",), ("walks",), ("pitching",))],
     ("baseball", "pitcher_earned_runs"): [_t(("ER",), ("earnedRuns",), ("pitching",))],
     ("baseball", "pitcher_outs"): [_t(("IP",), ("fullInnings.partInnings", "inningsPitched"), ("pitching",), "outs")],
+    # Added with the bigger plan's prop types: sums of columns already read.
+    ("americanfootball", "player_rush_reception_yds"): [_t(("YDS",), ("rushingYards",), ("rushing",), optional=True),
+                                                        _t(("YDS",), ("receivingYards",), ("receiving",), optional=True)],
+    ("basketball", "player_blocks_steals"): [_t(("BLK",), ("blocks",)), _t(("STL",), ("steals",))],
+    ("icehockey", "player_goal_scorer_anytime"): [_G],   # Yes/No: at least one goal
+    ("baseball", "batter_hits_runs_rbis"): [_t(("H",), ("hits",), ("batting",)), _t(("R",), ("runs",), ("batting",)),
+                                            _t(("RBI",), ("RBIs", "rbis"), ("batting",))],
 }
+# Optional columns of which at least one must be in the box score: a player in neither group is left to check by hand.
+NEED_ONE = {"player_rush_reception_yds"}
 # Total bases isn't in the ESPN box score (no doubles/triples column); MLB's own box score has it.
 
 
@@ -5975,7 +6098,10 @@ _DEFENSE_TD = [_t(("TD",), ("interceptionTouchdowns",), ("interceptions",), opti
 def _read_stat(player: dict, market: str, sport_key: str) -> float | None:
     """A player's number for a prop market. For anytime TD, a pick-six shows up both as an
     interception TD and a defensive TD, so the larger of the two counts, not both."""
-    value = _read(player, BOX_STATS[(_family(sport_key), market)])
+    terms = BOX_STATS[(_family(sport_key), market)]
+    if market in NEED_ONE and all(_read(player, [t[:4] + (False,)]) is None for t in terms):
+        return None
+    value = _read(player, terms)
     if market == "player_anytime_td" and value is not None:
         value += max((_read(player, [t]) or 0) for t in _DEFENSE_TD)
     return value
@@ -8024,6 +8150,7 @@ class Scheduler:
         self.odds_ok: dict[str, float] = {s: 0.0 for s in cfg.sports}  # sport -> last good odds check
         self.bad_prop_sports: set[str] = set()  # sports whose prop request the API rejected
         self.bad_near_sports: set[str] = set()  # ...and whose near-kickoff extras (PROP_NEAR_MARKETS) it rejected
+        self.bad_prop_markets: dict[str, set[str]] = {}   # sport -> PROP_MARKETS types the API rejected (until restart)
         self.notices: list[str] = []            # messages for the health channel (run() sends them)
         self.failures: dict[str, str] = {}      # sport -> why its last failed request failed (run() reads, clears)
         self.props_answered: set[str] = set()   # sports a prop request got a "no such game" (404) from: the API is up
@@ -8129,7 +8256,7 @@ class Scheduler:
         Near kickoff the request carries PROP_NEAR_MARKETS too (until the API rejects them): see near_costs."""
         if hours <= self.cfg.prop_hours:
             return sum(self.near_costs(sport))
-        formula = self.cfg.prop_credits_per_call(sport)
+        formula = self.prop_credits(sport)
         book = getattr(self.api, "costs", None)
         if not book:
             return formula
@@ -8137,12 +8264,17 @@ class Scheduler:
         # (That floor is for the same prop types: an earlier check doesn't ask for PROP_NEAR_MARKETS.)
         return max(est, self.near_costs(sport)[0]) if today else est
 
+    def prop_credits(self, sport: str, near: bool = False) -> int:
+        """The formula's credits for one game's prop request now (prop types x regions): what prop_ask asks
+        for, so a prop type the API rejected (bad_prop_markets) isn't counted."""
+        return len(_csv(self.prop_ask(sport, near))) * self.cfg.regions_billed()
+
     def near_costs(self, sport: str) -> tuple[float, float]:
         """One near-kickoff prop check of a game: (the plain request's credits, what PROP_NEAR_MARKETS add on
         top; 0 once the API rejected them). Measured when it can be (each prop-type count has its own
         average), the one from the other when only one of the two requests has been made yet."""
-        formula = self.cfg.prop_credits_per_call(sport)
-        with_f = self.cfg.prop_credits_per_call(sport, near=sport not in self.bad_near_sports)
+        formula = self.prop_credits(sport)
+        with_f = self.prop_credits(sport, near=sport not in self.bad_near_sports)
         book = getattr(self.api, "costs", None)
         if not book or not formula:
             return formula, with_f - formula
@@ -8400,21 +8532,45 @@ class Scheduler:
         return near, near_x, early
 
     def props_due(self, now: datetime) -> list[tuple[str, str]]:
+        """The games whose props are due now, as (sport, event id). PROP_MAX_PER_PASS: at most that many, the
+        closing-line checks first, then the most overdue (time since the last check over the game's pace); the
+        rest stay due for the next pass."""
         ts = time.time()
-        out = [(sport, gid) for sport, gid, near in self._prop_tiers(now)
+        tiers = self._prop_tiers(now)
+        out = [(sport, gid) for sport, gid, near in tiers
                if ts - self.last_props.get(gid, 0) >= self._prop_every(near)]
         cfg = self.cfg
+        window = timedelta(minutes=cfg.closing_minutes)
+
+        def closing_look(gid: str, start: datetime) -> bool:   # (a logged prop bet's game, no good look yet)
+            return (gid in self.need_close_props and now < start <= now + window
+                    and self.props_ok.get(gid, 0) < (start - window).timestamp())
         if cfg.closing_minutes and self.need_close_props and cfg.props_enabled and not cfg.live_only:
             # One last prop check just before kickoff for games with a logged prop bet (CLV).
-            window = timedelta(minutes=cfg.closing_minutes)
             have = {gid for _, gid in out}
             out += [(sport, gid) for sport in cfg.prop_sports
                     if sport in self.games and cfg.prop_markets.get(sport) and sport not in self.bad_prop_sports
                     for gid, start in self.games[sport]
-                    if gid in self.need_close_props and gid not in have and now < start <= now + window
-                    and self.props_ok.get(gid, 0) < (start - window).timestamp()   # no good look yet
+                    if gid not in have and closing_look(gid, start)
                     and ts - self.last_props.get(gid, 0) >= 60]                     # retry a failure each minute
+        cap = cfg.prop_max_per_pass
+        if cap > 0 and len(out) > cap:
+            # The closing-line checks first (also a game due anyway), then the most overdue.
+            near = {(sport, gid): n for sport, gid, n in tiers}
+            starts = {(sport, gid): start for sport in {s for s, _ in out} for gid, start in self.games.get(sport, [])}
+            first = {item for item in out if cfg.closing_minutes and item in starts
+                     and closing_look(item[1], starts[item])}
+
+            def overdue(item) -> float:
+                return (ts - self.last_props.get(item[1], 0)) / max(self._prop_every(near.get(item, True)), 1e-9)
+            out = sorted(out, key=lambda item: (item not in first, -overdue(item)))[:cap]   # (stable: ties keep order)
         return out
+
+    def prop_ask(self, sport: str, near: bool = False) -> str:
+        """The prop types one game's request asks for now: PROP_MARKETS (plus PROP_NEAR_MARKETS near kickoff),
+        without the ones the API rejected (bad_prop_markets)."""
+        bad = self.bad_prop_markets.get(sport, set())
+        return ",".join(m for m in _csv(self.cfg.prop_request(sport, near)) if m not in bad)
 
     def fetch_props(self, games: list[tuple[str, str]], now: datetime | None = None) -> tuple[list[dict], set[str]]:
         """Prop odds per game, plus the ids of games whose request worked (a failed request
@@ -8422,18 +8578,19 @@ class Scheduler:
         asks for PROP_NEAR_MARKETS while the day's credits cover them (near_extras, see update_budget);
         if the API rejects that request (422), the game is asked again
         without them and the sport stops asking for them until a restart (said once, here and in
-        the health channel). Only a rejected plain request stops the sport's props (then it's PROP_MARKETS
-        that's wrong, not the extras, and that's what's said)."""
+        the health channel). A rejected plain request: the prop types the API turned down are found
+        (named in its answer, else each asked alone once) and only those stop until a restart; the sport's
+        props stop only when it turns down every one (then it's PROP_MARKETS that's wrong, and that's what's said)."""
         cfg = self.cfg
         now = now or datetime.now(timezone.utc)
         starts = {gid: start for sport in {s for s, _ in games} for gid, start in self.games.get(sport, [])}
 
         def one(item):
             sport, gid = item
-            plain = cfg.prop_request(sport)
+            plain = self.prop_ask(sport)
             near = (sport not in self.bad_near_sports and self.near_extras and gid in starts
                     and starts[gid] - now <= timedelta(hours=cfg.prop_hours))
-            ask = cfg.prop_request(sport, near)
+            ask = self.prop_ask(sport, near)
             rejected = False   # the near-kickoff extras were rejected (the answer is the plain request's)
             try:
                 if ask != plain:
@@ -8449,6 +8606,15 @@ class Scheduler:
 
         events: list[dict] = []
         ok: set[str] = set()
+        refused: dict[str, list[tuple[str, Exception]]] = {}   # sport -> its games whose plain request got a 422
+
+        def take(sport, gid, result):
+            if isinstance(result, dict):
+                ok.add(gid)   # an answer with no books is still a real "nothing there"
+                self.props_ok[gid] = time.time()
+                if result.get("bookmakers"):
+                    events.append(apply_fees([result], self.cfg)[0])
+
         with ThreadPoolExecutor(max_workers=min(8, len(games))) as pool:
             for (sport, gid), result, rejected in pool.map(one, games):
                 self.last_props[gid] = time.time()
@@ -8468,24 +8634,76 @@ class Scheduler:
                 if isinstance(result, urllib.error.HTTPError):
                     if result.code in (401, 429):
                         raise result
-                    if result.code == 422 and sport not in self.bad_prop_sports:
-                        # The API rejected the request itself (e.g. a prop type it doesn't offer
-                        # for this sport). Retrying would fail the same way, so stop asking.
-                        self.bad_prop_sports.add(sport)
-                        print(f"! Props for {sport} rejected (422): check PROP_MARKETS for it. "
-                              f"Skipping {sport} props until restart.", file=sys.stderr)
-                        self.notices.append(f"⚠️ The Odds API rejected the {short(sport)} prop request: check "
-                                            f"PROP_MARKETS. No {short(sport)} props until a restart.")
+                    if plain_rejected:
+                        if sport not in self.bad_prop_sports:
+                            refused.setdefault(sport, []).append((gid, result))
                     else:
                         print(f"! Props error for {sport} {gid}: {result.code}", file=sys.stderr)
                 elif isinstance(result, Exception) or not isinstance(result, dict):
                     print(f"! Props error for {sport} {gid}: {result!r:.200}", file=sys.stderr)
-                elif isinstance(result, dict):
-                    ok.add(gid)   # an answer with no books is still a real "nothing there"
-                    self.props_ok[gid] = time.time()
-                    if result.get("bookmakers"):
-                        events.append(apply_fees([result], self.cfg)[0])
+                else:
+                    take(sport, gid, result)
+        for sport, refused_games in refused.items():
+            for gid, result in self._after_422(sport, refused_games):
+                take(sport, gid, result)
         return events, ok
+
+    def _after_422(self, sport: str, refused: list[tuple[str, Exception]]) -> list[tuple[str, dict]]:
+        """The API rejected a sport's plain prop request (422): find which prop types it turned down, stop asking
+        for just those (until restart, said once), and ask those games again without them. Answers to use
+        [(game id, answer)]. The types are the ones its answer names, else each is asked alone for the first game
+        (a rejected request costs nothing, an accepted one what it would have cost in the full request, and those
+        answers are that game's). Every type rejected: the sport's props stop, as before."""
+        plain = _csv(self.prop_ask(sport))
+        text = " ".join(str(getattr(e, "odds_message", "") or "") for _, e in refused)
+        named = [m for m in plain if re.search(rf"(?<![A-Za-z0-9_]){re.escape(m)}(?![A-Za-z0-9_])", text)]
+        bad: set[str] = set(named) if 0 < len(named) < len(plain) else set()
+        first: dict | None = None
+        if not bad:
+            gid0, parts = refused[0][0], []
+            for m in plain:
+                try:
+                    parts.append(stamp_fetched(self.api.event_odds(sport, gid0, m)))
+                except urllib.error.HTTPError as e:
+                    if e.code == 422:
+                        bad.add(m)
+                        continue
+                    if e.code in (401, 429):
+                        raise
+                    return []   # (anything else isn't a verdict: those games are tried again when next due)
+                except Exception:  # noqa: BLE001 - the same
+                    return []
+            if parts:
+                first = merge_events([json.loads(json.dumps(x)) for x in parts])[0]
+        if not bad or set(plain) <= bad:
+            if bad:   # every one turned down: it's PROP_MARKETS that's wrong
+                self.bad_prop_sports.add(sport)
+                print(f"! Props for {sport} rejected (422): check PROP_MARKETS for it. "
+                      f"Skipping {sport} props until restart.", file=sys.stderr)
+                self.notices.append(f"⚠️ The Odds API rejected the {short(sport)} prop request: check "
+                                    f"PROP_MARKETS. No {short(sport)} props until a restart.")
+            else:
+                print(f"! Props for {sport} rejected (422), but every prop type alone was accepted.", file=sys.stderr)
+            return []
+        self.bad_prop_markets.setdefault(sport, set()).update(bad)
+        names = ", ".join(m for m in plain if m in bad)
+        print(f"! {sport} prop types rejected (422): {names}. Asking without them until restart.", file=sys.stderr)
+        self.notices.append(f"⚠️ The Odds API rejected these {short(sport)} prop types: {names} (check PROP_MARKETS). "
+                            f"The other {short(sport)} props carry on.")
+        out: list[tuple[str, dict]] = []
+        ask = self.prop_ask(sport)
+        for gid, _ in refused:
+            if gid == refused[0][0] and first is not None:
+                out.append((gid, first))
+                continue
+            try:
+                out.append((gid, stamp_fetched(self.api.event_odds(sport, gid, ask))))
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 429):
+                    raise
+            except Exception:  # noqa: BLE001 - tried again when next due
+                pass
+        return out
 
     def day_weight(self, t: datetime) -> float:
         day = WEEKDAYS[t.astimezone(ZoneInfo(self.cfg.timezone)).weekday()]
@@ -8823,7 +9041,7 @@ def print_plan(cfg: Config, sched: Scheduler) -> None:
     if cfg.props_enabled:
         prop_games = {gid for h in range(0, 24 * 60, 10) for _, gid in sched._prop_games(now + timedelta(minutes=h))}
         print(f"\nProps: {len(prop_games)} games in the next 24h ({', '.join(short(s) for s in cfg.prop_sports)}): "
-              f"every {cfg.prop_early_minutes // 60}h from {cfg.prop_early_hours:g}h out, "
+              f"every {every_long(cfg.prop_early_minutes * 60)} from {cfg.prop_early_hours:g}h out, "
               f"every {cfg.prop_minutes}m in the last {cfg.prop_hours:g}h.")
         near = [f"{short(s)} {', '.join(cfg.prop_near_extra(s))}" for s in cfg.prop_sports
                 if cfg.prop_markets.get(s) and cfg.prop_near_extra(s)]
@@ -8846,6 +9064,11 @@ SPEED_NAMES = {PRE_LIVE: "of later games in sports with a live game", PREGAME: "
 def every(seconds: float) -> str:
     """A check rate in words: 90s, 2m, 15m."""
     return f"{seconds:.0f}s" if seconds < 120 else f"{seconds / 60:.0f}m"
+
+
+def every_long(seconds: float) -> str:
+    """A slower check rate in words: hours from 2 hours (4h, 16h), else as every() (30m, 90m)."""
+    return f"{seconds / 3600:.0f}h" if seconds >= 7200 else every(seconds)
 
 
 def bet_types(markets: str) -> str:
@@ -8875,8 +9098,8 @@ def pace_lines(cfg: Config, sched: Scheduler) -> list[str]:
         lines.append(f"→ Upcoming-game checks slowed {sched.extra_scale:.1f}× "
                      f"(every {sched.interval(EARLY) / 60:.0f}m instead of {cfg.early_minutes}m).")
     if sched.side_scale > 1.01:
-        parts = ([f"early props every {sched._prop_every(False) / 3600:.0f}h"] if sched.demand.get(PROP_EARLY) else []) \
-            + ([f"games 1-2 days out every {sched.interval(FAR) / 3600:.0f}h"] if sched.demand.get(FAR) else [])
+        parts = ([f"early props every {every_long(sched._prop_every(False))}"] if sched.demand.get(PROP_EARLY) else []) \
+            + ([f"games 1-2 days out every {every_long(sched.interval(FAR))}"] if sched.demand.get(FAR) else [])
         lines.append(f"→ Then {' and '.join(parts)} ({sched.extra_scale * sched.side_scale:.0f}× slower in all), "
                      f"before near-kickoff checks{f' and {pre_live}' if pre_live else ''} slow down.")
     if sched.scale > 1.01:
@@ -8919,6 +9142,38 @@ def pace_changed(old: tuple, sched: Scheduler) -> bool:
     return any(abs(speed.get(k, 1.0) / cur_speed.get(k, 1.0) - 1) >= 0.1 for k in set(speed) | set(cur_speed))
 
 
+class CreditsShort:
+    """The health channel hears it (once a local day) when the budget has kept live and near-kickoff checks 3x
+    or more slower than set for 30 minutes in a row: these settings need more credits than the plan has. The
+    safety net if settings made for a bigger plan ever run on a smaller one (today's settings on the 100K plan
+    reach about 2.4x at the busiest)."""
+    SLOW = 3.0     # live x near-kickoff slow-down (Scheduler.scale x live_scale)
+    MINUTES = 30   # ...this long in a row
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.since: datetime | None = None   # when it got (and stayed) this slow
+        self.said: date | None = None        # the local day it was last said
+
+    def check(self, sched: Scheduler, now: datetime, remaining: float | None) -> str:
+        """After update_budget: the message to send now, or ""."""
+        slow = sched.scale * sched.live_scale
+        if not math.isfinite(slow) or slow < self.SLOW:   # (out of credits altogether is said elsewhere)
+            self.since = None
+            return ""
+        self.since = self.since or now
+        day = now.astimezone(ZoneInfo(self.cfg.timezone)).date()
+        if now - self.since < timedelta(minutes=self.MINUTES) or self.said == day:
+            return ""
+        self.said = day
+        near = f" and near-kickoff checks {sched.scale:.0f}x slower" if sched.scale >= 1.5 else ""
+        left = f"{remaining:,.0f}" if remaining is not None else "unknown"
+        return (f"⚠️ Not enough Odds API credits for these settings: live checks every {sched.interval(LIVE):.0f}s "
+                f"instead of {self.cfg.poll_seconds}s{near}, so the credits last until the plan resets "
+                f"({next_reset(self.cfg, now):%b %d}). Credits left: {left}. If the plan was just upgraded, the new "
+                f"credits haven't reached the bot yet.")
+
+
 def cost_lines(cfg: Config, sched: Scheduler) -> list[str]:
     """What each kind of check costs: measured (x-requests-last) once there are calls to go on."""
     book = getattr(sched.api, "costs", None)
@@ -8939,13 +9194,15 @@ def cost_lines(cfg: Config, sched: Scheduler) -> list[str]:
         lines = [f"Each check: {one('odds', cfg.credits_per_call())} ({cfg.markets})"]
     if cfg.props_enabled:
         for sport in cfg.prop_sports:
-            f = cfg.prop_credits_per_call(sport)
+            f = sched.prop_credits(sport)
             if not f:
                 continue
             # (Near kickoff the request carries PROP_NEAR_MARKETS too, unless the API rejected them.)
-            near_f = cfg.prop_credits_per_call(sport, near=sport not in sched.bad_near_sports)
+            near_f = sched.prop_credits(sport, near=sport not in sched.bad_near_sports)
             buckets = [("near kickoff", "near", near_f)] + [(f"up to {h}h out", f"{h}h", f) for h in PROP_COST_HOURS
                                                              if h > cfg.prop_hours]
+            if cfg.prop_early_minutes > 0 and cfg.prop_early_hours > PROP_COST_HOURS[-1]:
+                buckets.append((f"more than {PROP_COST_HOURS[-1]}h out", "later", f))
             if book and any(book.calls(f"props:{sport}:{b}", bf) for _, b, bf in buckets):
                 lines.append(f"{short(sport)} props per game: "
                              + ", ".join(f"{one(f'props:{sport}:{b}', bf)} {label}" for label, b, bf in buckets))
@@ -9043,8 +9300,8 @@ class Trackers:
         # Props are fetched per game on their own schedule, so they get their own alert trackers
         # (a main-line check must never "close" a prop alert it didn't look at).
         self.prop_arbs = Alerter(cfg, dry_run=dry, noun="prop arbs")
-        self.prop_evs = EVAlerter(cfg, dry_run=dry, noun="+EV props")
-        self.prop_outs = OutlierAlerter(cfg, dry_run=dry, noun="prop outliers")
+        self.prop_evs = EVAlerter(cfg, dry_run=dry, noun="+EV props", props=True)
+        self.prop_outs = OutlierAlerter(cfg, dry_run=dry, noun="prop outliers", props=True)
         self.parlays = ParlayAlerter(cfg, dry_run=dry)
         self.closing = ClosingTracker(cfg)
         for a in (self.evs, self.prop_evs):
@@ -9279,6 +9536,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     results = Results(cfg, dry_run=args.dry_run)
     health = Health(cfg, status)        # outage messages (and which sports the sharp book is missing from)
     t.sharp_down = health.sharp_down
+    short_credits = CreditsShort(cfg)   # checks held 3x slower or more for half an hour: said once a day
 
     def update_parlays() -> int:
         open_bets = parlay_bets(ev_alerter, prop_evs, out_alerter, prop_outs)
@@ -9433,6 +9691,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             if status.budget_warned:
                 status.budget_warned = False
                 health.say("✅ Credits available again: scanning resumed.")
+            if note := short_credits.check(sched, now, api.remaining):
+                status.send(note)
             if pace_changed(old, sched):
                 print(f"Budget: {sched.allowance:,.0f} credits/day, next 24h needs "
                       f"{sched.forecast:,.0f} at full speed → live checks every "
@@ -9772,10 +10032,22 @@ def main() -> None:
             run(cfg, args, status)
             return
         except urllib.error.HTTPError as e:
+            read_api_error(e)   # (what the Odds API said: its error_code tells out of credits from a bad key)
+            code = getattr(e, "odds_error_code", "")
+            if e.code in (401, 429) and code == "OUT_OF_USAGE_CREDITS":
+                status.send("⏸️ The Odds API says the plan's credits are used up. Checking again every hour: they "
+                            "come back when the plan resets or is upgraded.")
+                time.sleep(3600)
+                continue
             if e.code == 401:
                 status.send("🔴 Odds API rejected the key (401). Check ODDS_API_KEY. Bot stopped.")
                 print("Odds API rejected the key (401). Check ODDS_API_KEY.", file=sys.stderr)
                 sys.exit(2)  # config problem: the service won't keep restarting
+            if e.code == 429 and code == "EXCEEDED_FREQ_LIMIT":
+                status.send("⏸️ The Odds API asked the bot to slow down (too many requests at once). "
+                            "Retrying in 1 minute.")
+                time.sleep(60)
+                continue
             if e.code == 429:
                 status.send("⏸️ Odds API says rate-limited or out of credits (429). Retrying in 15 min.")
                 time.sleep(900)
