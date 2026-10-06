@@ -538,6 +538,10 @@ class Config:
     outlier_min_pct: float = 10.0   # edge vs the other books' median fair price
     outlier_live_min_pct: float = 0  # live outliers need this edge (0 = OUTLIER_MIN_PCT)
     outlier_min_books: int = 3      # need at least this many other books to compare against
+    outlier_prop_max_pct: float = 40.0  # a prop price further off the other books than this is bad data, left out
+                                        # of every prop check (0 = no cap)
+    outlier_prop_cluster: int = 4   # one book off on this many players of one prop type in a game (and on at least
+                                    # half the players it lists there): its whole market there is left out (0 = off)
     outlier_live: bool = True       # live is where stale books show up most
     outlier_mention: str = ""
     outlier_webhook_url: str = ""
@@ -745,6 +749,8 @@ class Config:
             outlier_min_pct=num("OUTLIER_MIN_PCT", d.outlier_min_pct, float),
             outlier_live_min_pct=num("OUTLIER_LIVE_MIN_PCT", d.outlier_live_min_pct, float),
             outlier_min_books=num("OUTLIER_MIN_BOOKS", d.outlier_min_books, int),
+            outlier_prop_max_pct=num("OUTLIER_PROP_MAX_PCT", d.outlier_prop_max_pct, float),
+            outlier_prop_cluster=num("OUTLIER_PROP_CLUSTER", d.outlier_prop_cluster, int),
             outlier_live=e("OUTLIER_LIVE", "true").lower() in ("1", "true", "yes"),
             outlier_mention=e("OUTLIER_MENTION", ""),
             outlier_webhook_url=e("DISCORD_OUTLIER_WEBHOOK_URL", ""),
@@ -826,6 +832,13 @@ class Config:
         if self.prop_max_per_pass < 0:
             raise ValueError(f"PROP_MAX_PER_PASS={self.prop_max_per_pass} should be 0 (no limit) or a number of games, "
                              f"like 8")
+        bar = max(self.outlier_min_pct, LOCKS["outlier_pct"] if self.alert_mode == "locks" else 0)
+        if self.outlier_prop_max_pct < 0 or 0 < self.outlier_prop_max_pct <= bar:
+            raise ValueError(f"OUTLIER_PROP_MAX_PCT={self.outlier_prop_max_pct:g} should be 0 (no cap) or an edge in % "
+                             f"above the outlier bar ({bar:g}), like 40")
+        if self.outlier_prop_cluster < 0 or self.outlier_prop_cluster == 1:
+            raise ValueError(f"OUTLIER_PROP_CLUSTER={self.outlier_prop_cluster} should be 0 (off) or a number of "
+                             f"players, 2 or more, like 4")
         for key, v in (("ODDS_DOWN_MINUTES", self.odds_down_minutes), ("SHARP_DOWN_MINUTES", self.sharp_down_minutes),
                        ("KALSHI_DOWN_MINUTES", self.kalshi_down_minutes)):
             if v < 0:
@@ -2088,7 +2101,8 @@ class CandidateLog:
     to each: "alerted" (with post_delay, seconds from fetching its odds to the post), held back ("capped",
     "live cap", "old price", "unconfirmed", "deferred": its odds too old by sending time), or the check that
     stopped it ("sharp hold", "market gap", "kalshi gap", "kalshi no", "sharp no", "sharp other line",
-    "sharp last price", "confirm fail: <why>", "low confidence", "moved first", "first look", "under bar").
+    "sharp last price", "confirm fail: <why>", "low confidence", "moved first", "first look", "under bar"), or
+    a prop price left out as bad data ("too big", "book market off": see prop_glitches).
     The same bet and decision again within HELD_LOG_GAP seconds isn't written again. Off ("" or a run that
     mustn't write the service's files) writes nothing."""
 
@@ -4831,6 +4845,147 @@ def check_upcoming(cfg: Config, api: "OddsAPI", now: datetime | None = None) -> 
 
 
 # --------------------------------------------------------------------------- outliers
+
+PROP_GLITCH_SHARE = 0.6   # a book's prop market is bad data when it's off on at least this share of the players it
+                          # can be compared on there (and on OUTLIER_PROP_CLUSTER of them). News moves one team (about
+                          # half a game's players), or a few teammates.
+PROP_GLITCH_CLEAR = 2     # a market left out stays out until it's been back in line on this many checks in a row
+
+
+def prop_glitches(events: list[dict], cfg: Config, now: datetime,
+                  hold: dict | None = None) -> tuple[dict, list, list]:
+    """Player-prop prices that look like bad data rather than a price that hasn't caught up, found the way
+    find_outliers looks: each book's price to bet (main line, or its alternate line at the same point) against the
+    median of the OTHER books' no-vig prices on that main line (at least OUTLIER_MIN_BOOKS of them).
+    - A line more than OUTLIER_PROP_MAX_PCT off: that line at that book ("too big").
+    - A book off by the outlier bar on OUTLIER_PROP_CLUSTER players or more of one prop type in a game, and on at
+      least PROP_GLITCH_SHARE of the players it can be compared on there: that book's whole prop type in that game,
+      alternate lines too ("book market off"). One morning BetMGM's NHL points came through priced like goals (Roope
+      Hintz 1+ point at +190, -125 everywhere else), off on nearly every player; a book slow after news (a star
+      ruled out) is off on a few teammates, and those still go out.
+    The sharp books (SHARP_BOOKS) are never judged: when Pinnacle moves first on news it's the others that are off.
+    And a line the sharp book prices and says is no edge (under MIN_EV_PCT, as outliers' "sharp no") isn't off.
+    hold (kept between checks, see Trackers): a market left out stays out until it's been back in line on
+    PROP_GLITCH_CLEAR checks of its game in a row, so one price near the bar can't make a whole book's cards go GONE
+    and come back with new pings on every other check. The console says when one is left out and when it's back.
+    Returns ({event id: {(book key, market key, line or None for the whole market)}} to leave out of every prop
+    check (drop_glitches), [(candidate, why)] for the candidate log, [console lines])."""
+    bad: dict[str, set] = {}
+    notes: list = []
+    said: list = []
+    if not (cfg.outlier_prop_max_pct or cfg.outlier_prop_cluster):
+        return bad, notes, said
+    if hold is not None:
+        for key in [key for key, (_, start) in hold.items() if start <= now]:
+            del hold[key]   # its game has started: no more prop checks
+    reference = set(_csv(cfg.sharp_books))
+    for ev in events:
+        is_live = _parse_time(ev["commence_time"]) <= now
+        bar = max(cfg.outlier_min_pct, cfg.outlier_live_min_pct) if is_live else cfg.outlier_min_pct
+        lines: dict[tuple, dict[str, dict[str, float]]] = {}   # (market, line) -> book -> {outcome: price}, main lines
+        offers: dict[tuple, dict[str, float]] = {}             # ((market, line), outcome) -> book -> price to bet
+        titles: dict[str, str] = {}
+        for bm in ev.get("bookmakers", []):
+            titles[bm["key"]] = bm.get("title", bm["key"])
+            for mkt, oc, k, alt, _ in book_offers(bm, ev, now, is_live, cfg):
+                if is_prop(k[1]):
+                    offers.setdefault((k, oc["name"]), {})[bm["key"]] = float(oc["price"])
+            for mkt in bm.get("markets", []):
+                if is_alt(mkt["key"]) or not is_fresh(mkt, bm, now, is_live, cfg, _parse_time(ev["commence_time"])):
+                    continue
+                for oc in mkt.get("outcomes", []):
+                    price = float(oc.get("price") or 0)
+                    k = (mkt["key"], _line_for(mkt["key"], oc, ev["home_team"]))
+                    if price > 1.0 and is_prop(k[1]):
+                        lines.setdefault(k, {}).setdefault(bm["key"], {})[oc["name"]] = price
+        sharp = sharp_fair(ev, cfg, now, is_live)[0] if lines else {}
+        compared: dict[tuple, set] = {}    # (market, book) -> players it could be compared on
+        off: dict[tuple, list] = {}        # (market, book) -> its lines off by the bar: (k, name, price, fair, n)
+        big: list = []                     # lines over OUTLIER_PROP_MAX_PCT: (book, k, name, price, fair, n)
+        for k, books in lines.items():
+            n_out = max(len(o) for o in books.values())
+            full = {bk: o for bk, o in books.items() if len(o) == n_out and n_out >= 2}
+            names = set().union(*full.values()) if full else set()
+            full = {bk: o for bk, o in full.items() if set(o) == names}
+            probs = {bk: dict(zip(o, devig(list(o.values()), cfg.devig_method))) for bk, o in full.items()}
+            for name in names:
+                sp = sharp.get(k, {}).get(name)
+                for bk, price in offers.get((k, name), {}).items():
+                    others = [probs[ob][name] for ob in probs if ob != bk]
+                    if bk in reference or len(others) < cfg.outlier_min_books:
+                        continue
+                    fair_p = statistics.median(others)
+                    edge = (fair_p * price - 1) * 100
+                    compared.setdefault((k[0], bk), set()).add(k[1][0])
+                    if sp is not None and (sp * price - 1) * 100 < cfg.min_ev_pct:
+                        continue   # the sharp book prices it and says it's no edge: the others are behind, not it
+                    if edge >= bar:
+                        off.setdefault((k[0], bk), []).append((k, name, price, fair_p, len(others)))
+                    if cfg.outlier_prop_max_pct and edge > cfg.outlier_prop_max_pct:
+                        big.append((bk, k, name, price, fair_p, len(others)))
+        whole = set()
+        for (mkt, bk), rows in off.items():
+            players = {r[0][1][0] for r in rows}
+            if (cfg.outlier_prop_cluster and len(players) >= cfg.outlier_prop_cluster
+                    and len(players) >= PROP_GLITCH_SHARE * len(compared[(mkt, bk)])):
+                whole.add((mkt, bk))
+                notes += [(candidate(ev, k, name, k[1][1], titles[bk], price, fair_p, f"median of {n} other books"),
+                           "book market off") for k, name, price, fair_p, n in rows]
+                if hold is None or (ev["id"], bk, mkt) not in hold:
+                    said.append(f"  ! {titles[bk]}'s {MARKET_NAMES.get(mkt, mkt)} for {ev['away_team']} @ "
+                                f"{ev['home_team']} look wrong (off on {len(players)} of {len(compared[(mkt, bk)])} "
+                                f"players): left out" + ("" if hold is None else
+                                                         f" until back in line for {PROP_GLITCH_CLEAR} checks"))
+                if hold is not None:
+                    hold[(ev["id"], bk, mkt)] = (0, _parse_time(ev["commence_time"]))
+        if hold is not None:
+            for (gid, bk, mkt), (clean, start) in list(hold.items()):
+                if gid != ev["id"] or (mkt, bk) in whole:
+                    continue
+                if clean + 1 >= PROP_GLITCH_CLEAR:
+                    del hold[(gid, bk, mkt)]
+                    said.append(f"  ✓ {titles.get(bk, bk)}'s {MARKET_NAMES.get(mkt, mkt)} for {ev['away_team']} @ "
+                                f"{ev['home_team']} are back in line: included again")
+                else:
+                    hold[(gid, bk, mkt)] = (clean + 1, start)
+                    whole.add((mkt, bk))
+        for mkt, bk in whole:
+            bad.setdefault(ev["id"], set()).add((bk, mkt, None))
+        for bk, k, name, price, fair_p, n in big:
+            if (k[0], bk) not in whole:
+                bad.setdefault(ev["id"], set()).add((bk, k[0], k[1]))
+                notes.append((candidate(ev, k, name, k[1][1], titles[bk], price, fair_p, f"median of {n} other books"),
+                              "too big"))
+    return bad, notes, said
+
+
+def drop_glitches(events: list[dict], bad: dict) -> list[dict]:
+    """events without the prices prop_glitches found: a book's whole prop type in a game (alternate lines too),
+    or one line of it (both sides). Events and books that change are copies; the rest are the same objects."""
+    if not bad:
+        return events
+    out = []
+    for ev in events:
+        drop = bad.get(ev["id"])
+        if not drop:
+            out.append(ev)
+            continue
+        books = []
+        for bm in ev.get("bookmakers", []):
+            markets = []
+            for mkt in bm.get("markets", []):
+                base = base_market(mkt["key"])
+                if (bm["key"], base, None) in drop:
+                    continue
+                lines = {ln for b, m, ln in drop if b == bm["key"] and m == base and ln is not None}
+                if lines:
+                    mkt = {**mkt, "outcomes": [oc for oc in mkt.get("outcomes", [])
+                                               if _line_for(mkt["key"], oc, ev["home_team"]) not in lines]}
+                markets.append(mkt)
+            books.append({**bm, "markets": markets})
+        out.append({**ev, "bookmakers": books})
+    return out
+
 
 def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                   history: PriceHistory | None = None, kalshi: dict | None = None,
@@ -9337,6 +9492,8 @@ class Trackers:
         # +EV props no sharp prices: spots a book that moved first on news. Its own memory: outliers
         # store the same keys against a different bar and fair price.
         self.prop_prices = PriceHistory()
+        # Prop markets left out as bad data, kept out until back in line (prop_glitches).
+        self.prop_glitch_hold: dict = {}
         self.evs.max_per_hour = cfg.max_ev_per_hour
         self.prop_evs.max_per_hour = cfg.max_prop_per_hour
         self.parlays.max_per_hour = cfg.max_parlay_per_hour
@@ -9463,6 +9620,13 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
     carded = {k for a in (t.prop_evs, t.prop_outs) for k in (*a.open, *a.restored)}
     alt_seen: set = set()   # alternate-line prices with a fair price at exactly their line
     rejects: list = []      # (for the candidate log)
+    # Prices that look like bad data (a book's market that isn't the same bet) are left out of everything below:
+    # outliers, +EV, arbs, boards, parlays, closing lines (see prop_glitches).
+    bad, glitches, said = prop_glitches(prop_events, cfg, at, t.prop_glitch_hold)
+    prop_events = drop_glitches(prop_events, bad)
+    rejects += glitches
+    for line in said:
+        print(line, file=sys.stderr)
     p_outs = find_outliers(prop_events, cfg, at, history=t.price_history, alt_seen=alt_seen, rejects=rejects)
     p_evs = without_outliers(find_evs(prop_events, t.prop_cfg, at, history=t.sharp_history, prices=t.prop_prices,
                                       keep=carded, alt_seen=alt_seen, sharp_down=t.sharp_down, rejects=rejects), p_outs)
@@ -9485,7 +9649,8 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
         alt = (len(alt_seen), sum(1 for a in (t.prop_evs, t.prop_outs) for k, op in a.open.items()
                                   if k not in carded and op.arb.alt))
     return SimpleNamespace(n_arb=n_arb, n_out=n_out, n_ev=n_ev, held=take_held(t.prop_arbs, t.prop_outs, t.prop_evs),
-                           prices_held=dict(t.prop_prices.held), missed=list(t.prop_prices.missed), alt=alt)
+                           prices_held=dict(t.prop_prices.held), missed=list(t.prop_prices.missed), alt=alt,
+                           events=prop_events)
 
 
 def confirmed_text(sent: int, misses: dict[str, int]) -> str:
@@ -9777,6 +9942,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             t0 = time.time()
             prop_events = [ev for ev in fetched_props if _parse_time(ev["commence_time"]) > now]
             p = scan_props(t, prop_events, fetched_gids)
+            prop_events = p.events   # without prices that looked like bad data (markouts read these too)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             print(f"[{datetime.now():%H:%M:%S}] props: {len(prop_games)} games ({time.time() - t0:.1f}s) | "
                   f"{p.n_arb} new arbs, {p.n_ev} new +EV, {p.n_out} new outliers{held_text(p.held)}"

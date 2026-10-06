@@ -227,6 +227,24 @@ the other side elsewhere locks in a profit, the alert shows that hedge with stak
 Books can cancel bets on obvious pricing errors ("palpable errors"), and the bigger the gap,
 the more likely that is. Bet fast, and expect the occasional void.
 
+**Bad prop data is left out.** One morning BetMGM's NHL "points" came through priced like goals (Roope
+Hintz 1+ point at +190, -125 everywhere else), and 27 prop outliers with 47-80% edges went out at once.
+Before every prop check the bot now leaves out, for outliers, +EV, arbs and parlays alike:
+
+- a prop price more than 40% off the median of the other books (`OUTLIER_PROP_MAX_PCT`, 0 = no cap):
+  usually a book whose market isn't the same bet. Real long shots that far off are held back too, and so
+  are arbs built on such a price (they're the ones books void);
+- a book's whole prop type in a game when it's off by the outlier bar on 4 or more players there
+  (`OUTLIER_PROP_CLUSTER`, 0 = off) and on at least 60% of the players it can be compared on. News moves
+  one team (about half a game's players) or a few teammates, and those still go out. Once left out, that
+  market stays out until it's been back in line for 2 checks, so one price near the bar can't make its
+  cards go GONE and come back with new pings every other check.
+
+The sharp book is never judged this way: when Pinnacle moves first on news, it's the others that are
+behind. A line Pinnacle prices and calls no edge isn't counted as off either. Both show in
+candidates.csv ("too big", "book market off"), and the log says when a market is left out and when it's
+back. Main-line outliers keep no upper limit.
+
 ## Locks mode (default)
 
 The bot only sends alerts worth acting on: arbs that lock in **2%+** ($2 per $100, **5%+ when

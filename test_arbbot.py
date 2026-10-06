@@ -12664,5 +12664,269 @@ class UpgradeSettingsDocumented(unittest.TestCase):
         self.assertEqual(values.get("DISCORD_PROPS_WEBHOOK_URL"), "")
         self.assertIn("--set-webhook props", readme)
 
+
+FOUR = (("draftkings", "DraftKings"), ("fanduel", "FanDuel"), ("williamhill_us", "Caesars"), ("espnbet", "ESPN BET"))
+SIX = FOUR + (("betrivers", "BetRivers"), ("fanatics", "Fanatics"))
+
+
+def nhl_points_event(players, gid="g1", start="2026-10-03T18:00:00Z", mgm=None, others=FOUR, alt=False, pin=None):
+    """One NHL game's player_points (0.5): the other books agree at 50% (1.9 / 1.9) on every player.
+    mgm: {player: (over, under)}, BetMGM's prices (its market lists only these players; alt: as an alternate line).
+    pin: {player: (over, under)}, Pinnacle's."""
+    def book(key, title, rows, market="player_points"):
+        return {"key": key, "title": title, "last_update": FRESH, "markets": [
+            {"key": market, "last_update": FRESH, "outcomes": [o for pl, ov, un in rows for o in (
+                {"name": "Over", "description": pl, "price": ov, "point": 0.5},
+                {"name": "Under", "description": pl, "price": un, "point": 0.5})]}]}
+    books = [book(k, t, [(pl, 1.9, 1.9) for pl in players]) for k, t in others]
+    if mgm:
+        books.append(book("betmgm", "BetMGM", [(pl, ov, un) for pl, (ov, un) in mgm.items()],
+                          "player_points_alternate" if alt else "player_points"))
+    if pin:
+        books.append(book("pinnacle", "Pinnacle", [(pl, ov, un) for pl, (ov, un) in pin.items()]))
+    return {"id": gid, "sport_key": "icehockey_nhl", "sport_title": "NHL", "commence_time": start,
+            "home_team": "Dallas Stars", "away_team": "San Jose Sharks", "bookmakers": books}
+
+
+class PropOutlierBadData(MixFiles):
+    """Mon Oct 5, 9:49 AM: BetMGM's NHL "player points" came through priced like goals (Hintz 1+ point at +190,
+    -125 everywhere else) and 27 prop outliers with 47-80% edges went out at once. prop_glitches finds prices like
+    that and drop_glitches leaves them out of every prop check: outliers, +EV, arbs, boards and parlays."""
+    PLAYERS = [f"Player {i}" for i in range(8)]
+
+    def find(self, events, cfg=None):
+        cfg = cfg or Config()
+        bad, notes, said = _arbbot.prop_glitches(events, cfg, NOW)
+        return find_outliers(_arbbot.drop_glitches(events, bad), cfg, NOW), notes, said
+
+    def test_the_betmgm_burst_never_goes_out(self):
+        # Every BetMGM Over priced like a goal: 2.9-4.65 where the other books say 50% (edges 45-133%).
+        mgm = {pl: (2.9 + 0.25 * i, 1.35) for i, pl in enumerate(self.PLAYERS)}
+        outs, notes, said = self.find([nhl_points_event(self.PLAYERS, mgm=mgm)])
+        self.assertEqual(outs, [])
+        self.assertEqual([why for _, why in notes], ["book market off"] * 8)
+        self.assertTrue(all(c.book == "BetMGM" and c.market == "player_points" for c, _ in notes))
+        self.assertEqual(said, ["  ! BetMGM's Points for San Jose Sharks @ Dallas Stars look wrong (off on 8 of 8 "
+                                "players): left out"])
+        # Pinnacle pricing every player at 50% doesn't change that: it says BetMGM's prices are an edge.
+        pin = {pl: (1.9, 1.9) for pl in self.PLAYERS}
+        outs, notes, _ = self.find([nhl_points_event(self.PLAYERS, mgm=mgm, pin=pin)])
+        self.assertEqual((outs, len(notes)), ([], 8))
+        # The old behaviour, both checks off: all 8 go out.
+        outs, notes, _ = self.find([nhl_points_event(self.PLAYERS, mgm=mgm)],
+                                   Config(outlier_prop_max_pct=0, outlier_prop_cluster=0))
+        self.assertEqual((len(outs), notes), (8, []))
+
+    def test_a_burst_under_the_cap_is_still_bad_data(self):
+        # Off at about 20% on every player it lists: not too big alone, but the whole market is off.
+        mgm = {pl: (2.4, 1.55) for pl in self.PLAYERS[:4]}
+        outs, notes, _ = self.find([nhl_points_event(self.PLAYERS, mgm=mgm)])
+        self.assertEqual(outs, [])
+        self.assertEqual([why for _, why in notes], ["book market off"] * 4)
+        # Three players is still a few stale prices: they go out.
+        outs, notes, _ = self.find([nhl_points_event(self.PLAYERS, mgm=dict(list(mgm.items())[:3]))])
+        self.assertEqual((sorted(o.line[0] for o in outs), notes), (self.PLAYERS[:3], []))
+        self.assertTrue(all(round(o.ev_pct) == 20 for o in outs))
+        # OUTLIER_PROP_CLUSTER=0 turns the check off. An alternate line at the same point counts the same.
+        self.assertEqual(len(self.find([nhl_points_event(self.PLAYERS, mgm=mgm)], Config(outlier_prop_cluster=0))[0]), 4)
+        outs, notes, _ = self.find([nhl_points_event(self.PLAYERS, mgm=mgm, alt=True)])
+        self.assertEqual((outs, [why for _, why in notes]), ([], ["book market off"] * 4))
+
+    def test_news_still_goes_out(self):
+        # A book slow after news is off on a few teammates, or on one team (half the game): those still go out.
+        ten = [f"Player {i}" for i in range(10)]
+        for n in (4, 5):
+            mgm = {pl: ((2.4, 1.55) if i < n else (1.9, 1.9)) for i, pl in enumerate(ten)}
+            outs, notes, _ = self.find([nhl_points_event(ten, mgm=mgm)])
+            self.assertEqual((sorted(o.line[0] for o in outs), notes), (ten[:n], []), n)
+        # Off on 60% or more is the market itself.
+        mgm = {pl: ((2.4, 1.55) if i < 6 else (1.9, 1.9)) for i, pl in enumerate(ten)}
+        outs, notes, _ = self.find([nhl_points_event(ten, mgm=mgm)])
+        self.assertEqual((outs, len(notes)), ([], 6))
+
+    def test_team_news_with_the_fast_books_moving_first(self):
+        # An opposing starter is scratched: DraftKings and FanDuel move one team's 9 hitters first and the other books
+        # are behind. 9 of 18 isn't the market being wrong: nothing is left out.
+        hitters = [f"Hitter {i}" for i in range(18)]
+        books = [("draftkings", "DraftKings"), ("fanduel", "FanDuel"), ("williamhill_us", "Caesars"),
+                 ("espnbet", "ESPN BET"), ("betrivers", "BetRivers"), ("fanatics", "Fanatics"), ("betmgm", "BetMGM")]
+        ev = {"id": "m1", "sport_key": "baseball_mlb", "sport_title": "MLB", "commence_time": "2026-10-03T18:00:00Z",
+              "home_team": "Home", "away_team": "Away", "bookmakers": [
+                  {"key": k, "title": t, "last_update": FRESH, "markets": [{"key": "batter_hits", "last_update": FRESH,
+                   "outcomes": [o for i, h in enumerate(hitters) for ov, un in [((1.55, 2.5) if i < 9 and k in (
+                       "draftkings", "fanduel") else (1.8, 2.0))] for o in (
+                       {"name": "Over", "description": h, "price": ov, "point": 0.5},
+                       {"name": "Under", "description": h, "price": un, "point": 0.5})]}]} for k, t in books]}
+        bad, notes, said = _arbbot.prop_glitches([ev], Config(), NOW)
+        self.assertEqual((bad, notes, said), ({}, [], []))
+
+    def test_the_sharp_book_is_never_left_out(self):
+        # Pinnacle moves first on news (3.0 where the others still say 1.9) and DraftKings follows (2.75). Pinnacle isn't
+        # judged, and DraftKings' price is no edge by Pinnacle: no outlier, nothing left out (as before the change).
+        pin = {pl: (1.9, 1.9) for pl in self.PLAYERS}
+        pin[self.PLAYERS[0]] = (3.0, 1.38)
+        ev = nhl_points_event(self.PLAYERS, pin=pin)
+        for bm in ev["bookmakers"]:
+            if bm["key"] == "draftkings":
+                bm["markets"][0]["outcomes"][0]["price"] = 2.75
+        outs, notes, said = self.find([ev])
+        self.assertEqual((outs, notes, said), ([], [], []))
+        # Pinnacle off on every player (a whole market moved first): still never left out, even quoting one side only.
+        bad, _, _ = _arbbot.prop_glitches([nhl_points_event(self.PLAYERS, pin={pl: (3.0, 1.38) for pl in self.PLAYERS})],
+                                          Config(), NOW)
+        self.assertEqual(bad, {})
+        ev = nhl_points_event(self.PLAYERS, pin={pl: (3.0, 1.38) for pl in self.PLAYERS})
+        pinny = next(bm for bm in ev["bookmakers"] if bm["key"] == "pinnacle")
+        pinny["markets"][0]["outcomes"] = [o for o in pinny["markets"][0]["outcomes"] if o["name"] == "Over"]
+        self.assertEqual(_arbbot.prop_glitches([ev], Config(), NOW)[0], {})
+        # The whole game moves (weather, a lineup): Pinnacle and DraftKings first, on every player. DraftKings' prices
+        # are no edge by Pinnacle, so it isn't left out as bad data even though it's off the others on all 8.
+        ev = nhl_points_event(self.PLAYERS, pin={pl: (2.4, 1.6) for pl in self.PLAYERS})
+        for bm in ev["bookmakers"]:
+            if bm["key"] == "draftkings":
+                for o in bm["markets"][0]["outcomes"]:
+                    o["price"] = 2.4 if o["name"] == "Over" else 1.6
+        self.assertEqual(_arbbot.prop_glitches([ev], Config(), NOW)[0], {})
+
+    def test_a_market_left_out_stays_out_until_back_in_line(self):
+        # BetMGM steadily off on 3 of 8 players, and a 4th flickers around the bar: once left out, its market stays
+        # out (no GONE and new pings every other check) until it's been back in line for 2 checks.
+        hold = {}
+        steady = {pl: (2.3, 1.6) for pl in self.PLAYERS[:3]}
+        tripped = dict(steady, **{self.PLAYERS[3]: (2.3, 1.6)})
+        near = dict(steady, **{self.PLAYERS[3]: (2.1, 1.7)})        # 5%: under the bar
+        fine = {pl: (1.9, 1.9) for pl in self.PLAYERS[:4]}
+        expect = [(tripped, True, 1), (near, True, 0), (tripped, True, 0), (near, True, 0), (fine, False, 1),
+                  (steady, False, 0)]
+        lines_said = []
+        for i, (mgm, left_out, lines) in enumerate(expect):
+            bad, _, said = _arbbot.prop_glitches([nhl_points_event(self.PLAYERS, mgm=mgm)], Config(), at(300 * i), hold)
+            self.assertEqual(("g1" in bad, len(said)), (left_out, lines), i)
+            lines_said += said
+        self.assertEqual(hold, {})
+        self.assertEqual(lines_said, [
+            "  ! BetMGM's Points for San Jose Sharks @ Dallas Stars look wrong (off on 4 of 4 players): left out until "
+            "back in line for 2 checks",
+            "  \u2713 BetMGM's Points for San Jose Sharks @ Dallas Stars are back in line: included again"])
+        # A game that has started is forgotten.
+        _arbbot.prop_glitches([nhl_points_event(self.PLAYERS, mgm=tripped)], Config(), NOW, hold)
+        _arbbot.prop_glitches([], Config(), NOW + timedelta(hours=7), hold)
+        self.assertEqual(hold, {})
+
+    def test_one_line_too_big_is_left_out_alone(self):
+        mgm = {pl: (1.9, 1.9) for pl in self.PLAYERS}
+        mgm[self.PLAYERS[5]] = (3.2, 1.35)   # 60%: too big
+        mgm[self.PLAYERS[6]] = (2.6, 1.5)    # 30%: a stale price, goes out
+        outs, notes, _ = self.find([nhl_points_event(self.PLAYERS, mgm=mgm)])
+        self.assertEqual([(o.book, o.line, o.outcome, round(o.ev_pct)) for o in outs],
+                         [("BetMGM", ("Player 6", 0.5), "Over", 30)])
+        self.assertEqual([(c.line, why) for c, why in notes], [(("Player 5", 0.5), "too big")])
+        # OUTLIER_PROP_MAX_PCT=0: no cap.
+        outs, notes, _ = self.find([nhl_points_event(self.PLAYERS, mgm=mgm)], Config(outlier_prop_max_pct=0))
+        self.assertEqual(sorted(round(o.ev_pct) for o in outs), [30, 60])
+
+    def test_bad_prices_reach_no_other_card_or_parlay(self):
+        # BetMGM's market in g1 is bad; DraftKings is genuinely off on Player 0 there. Its card mustn't list
+        # BetMGM's bad price on the board, nor offer BetMGM for a parlay.
+        g1 = nhl_points_event(self.PLAYERS, gid="g1", mgm={pl: (2.4, 1.55) for pl in self.PLAYERS[:4]})
+        for bm in g1["bookmakers"]:
+            if bm["key"] == "draftkings":
+                bm["markets"][0]["outcomes"][0]["price"] = 2.3   # Player 0 Over
+        g2 = nhl_points_event(self.PLAYERS, gid="g2", mgm={self.PLAYERS[0]: (2.4, 1.55)})   # another game: fine
+        outs, notes, _ = self.find([g1, g2])
+        self.assertEqual(sorted((o.event_id, o.book, o.line[0]) for o in outs),
+                         [("g1", "DraftKings", "Player 0"), ("g2", "BetMGM", "Player 0")])
+        dk = next(o for o in outs if o.event_id == "g1")
+        self.assertNotIn("BetMGM", [r[0] for r in dk.board])
+        self.assertNotIn("BetMGM", dk.parlay_books)
+        self.assertEqual(len(notes), 4)
+
+    def test_no_leak_through_a_whole_prop_check(self):
+        # The reviewers' case, with today's settings: BetMGM in line for two checks, then off at 14-22% on the 5
+        # players it lists, and it stays that way. Outliers, +EV props and prop arbs all stay quiet.
+        sent = []
+        cfg = self.cfg(replace(Config(webhook_url="https://x", ev_mention="@here", outlier_mention="@here"),
+                               alert_mode="balanced", min_confidence="medium", outlier_live=False, round_stakes=0,
+                               **AGES)).with_mode()
+        t = _arbbot.Trackers(cfg, self.args(dry_run=False))
+        for a in (t.prop_evs, t.prop_outs, t.prop_arbs):
+            def fake(payload, message_id=None, url=""):
+                sent.append(("PATCH" if message_id else "POST", payload["embeds"][0]["title"]))
+                return message_id or f"m{len(sent)}"
+            a._discord = fake
+        five = self.PLAYERS[:5]
+        good = {pl: (1.9, 1.9) for pl in five}
+        bad = {pl: (2.28 + 0.04 * i, 1.6) for i, pl in enumerate(five)}
+        for i, mgm in enumerate([good, good] + [bad] * 10):
+            p = _arbbot.scan_props(t, [nhl_points_event(self.PLAYERS, mgm=mgm, others=SIX)], {"g1"}, at(300 * i))
+            self.assertEqual((p.n_out, p.n_ev, p.n_arb), (0, 0, 0), i)
+        self.assertEqual(sent, [])
+        import csv
+        with open(self.files["candidate_log_file"], newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual({r["decision"] for r in rows}, {"book market off"})
+        self.assertEqual({r["book"] for r in rows}, {"BetMGM"})
+        # The prices the rest of the pass sees (markouts too) are without them.
+        self.assertFalse(any(bm["key"] == "betmgm" and bm["markets"] for bm in p.events[0]["bookmakers"]))
+
+    def test_a_flickering_market_stays_quiet_in_a_whole_prop_check(self):
+        # Through scan_props (Trackers keeps the hold): a 4th BetMGM player flickering around the bar never gets
+        # BetMGM's 3 steady ones, nor arbs on them, posted and then marked GONE every other check.
+        sent = []
+        cfg = self.cfg(replace(Config(webhook_url="https://x"), alert_mode="balanced", min_confidence="medium",
+                               round_stakes=0, **AGES)).with_mode()
+        t = _arbbot.Trackers(cfg, self.args(dry_run=False))
+        for a in (t.prop_evs, t.prop_outs, t.prop_arbs):
+            def fake(payload, message_id=None, url=""):
+                sent.append(("PATCH" if message_id else "POST", payload["embeds"][0]["title"]))
+                return message_id or f"m{len(sent)}"
+            a._discord = fake
+        steady = {pl: (2.3, 1.6) for pl in self.PLAYERS[:3]}
+        tripped = dict(steady, **{self.PLAYERS[3]: (2.3, 1.6)})
+        near = dict(steady, **{self.PLAYERS[3]: (2.1, 1.7)})
+        for i, mgm in enumerate([tripped, near, tripped, near]):
+            _arbbot.scan_props(t, [nhl_points_event(self.PLAYERS, mgm=mgm)], {"g1"}, at(300 * i))
+        self.assertEqual(sent, [])
+        self.assertEqual(list(t.prop_glitch_hold), [("g1", "betmgm", "player_points")])
+
+    def test_drop_glitches(self):
+        ev = nhl_points_event(self.PLAYERS[:2], mgm={pl: (1.9, 1.9) for pl in self.PLAYERS[:2]})
+        mgm = next(bm for bm in ev["bookmakers"] if bm["key"] == "betmgm")
+        mgm["markets"].append({**mgm["markets"][0], "key": "player_points_alternate"})
+        mgm["markets"].append({"key": "player_shots_on_goal", "last_update": FRESH, "outcomes": []})
+        other = nhl_points_event(self.PLAYERS[:2], gid="g2")
+        whole = _arbbot.drop_glitches([ev, other], {"g1": {("betmgm", "player_points", None)}})
+        self.assertIs(whole[1], other)
+        self.assertEqual([m["key"] for m in next(b for b in whole[0]["bookmakers"] if b["key"] == "betmgm")["markets"]],
+                         ["player_shots_on_goal"])
+        one = _arbbot.drop_glitches([ev], {"g1": {("betmgm", "player_points", ("Player 0", 0.5))}})[0]
+        left = next(b for b in one["bookmakers"] if b["key"] == "betmgm")
+        self.assertEqual([[(o["description"], o["name"]) for o in m["outcomes"]] for m in left["markets"]],
+                         [[("Player 1", "Over"), ("Player 1", "Under")]] * 2 + [[]])
+        self.assertEqual(len(mgm["markets"][0]["outcomes"]), 4)   # the fetched event itself is untouched
+        evs = [ev]
+        self.assertIs(_arbbot.drop_glitches(evs, {}), evs)   # nothing to leave out: the same list
+
+    def test_settings(self):
+        import os, re
+        from unittest import mock
+        self.assertEqual((Config().outlier_prop_max_pct, Config().outlier_prop_cluster), (40.0, 4))
+        with mock.patch.dict(os.environ, {"OUTLIER_PROP_MAX_PCT": "0", "OUTLIER_PROP_CLUSTER": "6"}):
+            cfg = Config.from_env()
+        self.assertEqual((cfg.outlier_prop_max_pct, cfg.outlier_prop_cluster), (0.0, 6))
+        for env in ({"OUTLIER_PROP_MAX_PCT": "-1"}, {"OUTLIER_PROP_CLUSTER": "-1"}, {"OUTLIER_PROP_CLUSTER": "1"},
+                    {"OUTLIER_PROP_MAX_PCT": "10"},                          # at the outlier bar: every one too big
+                    {"OUTLIER_PROP_MAX_PCT": "12", "ALERT_MODE": "locks"}):  # under the locks bar (15)
+            key = next(k for k in env if k.startswith("OUTLIER_"))
+            with mock.patch.dict(os.environ, env), self.assertRaisesRegex(ValueError, f"^{key}="):
+                Config.from_env()
+        here = Path(_arbbot.HERE)
+        readme, example = ((here / n).read_text(encoding="utf-8") for n in ("README.md", ".env.example"))
+        values = dict(re.findall(r"^([A-Z][A-Z0-9_]+)=(.*)$", example, re.M))
+        self.assertEqual((values.get("OUTLIER_PROP_MAX_PCT"), values.get("OUTLIER_PROP_CLUSTER")), ("40", "4"))
+        for key in ("OUTLIER_PROP_MAX_PCT", "OUTLIER_PROP_CLUSTER"):
+            self.assertIn(key, readme)
+
+
 if __name__ == "__main__":
     unittest.main()
