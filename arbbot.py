@@ -52,6 +52,7 @@ from zoneinfo import ZoneInfo
 
 API_BASE = os.environ.get("ODDS_API_BASE", "https://api.the-odds-api.com/v4")
 HERE = Path(__file__).resolve().parent
+BOT_NAME = "EV BOT"   # the sender name on every Discord message (and what phones read out for it)
 
 # How long a game typically runs, by sport-key prefix (first match wins).
 # Used to know when a game is "live"; finished games are also detected from the feed.
@@ -247,7 +248,7 @@ def set_webhook(channel: str) -> None:
         sys.exit("That doesn't look like a Discord webhook URL (it should start with "
                  "https://discord.com/api/webhooks/). Nothing was changed.")
     try:
-        _webhook(url, {"username": "Arb Bot", "content": f"✅ Connected. This channel now gets {what}."})
+        _webhook(url, {"username": BOT_NAME, "content": f"✅ Connected. This channel now gets {what}."})
     except Exception as e:  # noqa: BLE001
         sys.exit(f"Discord rejected that URL ({e}). Copy it again from the channel's webhook settings. "
                  "Nothing was changed.")
@@ -400,6 +401,14 @@ class Config:
     include_links: bool = True    # ask for bet-slip deep links where books support them
     include_sids: bool = True     # ...and each book's own ids, to build a bet-slip link where it sent none (no credits)
     discord_mention: str = ""     # e.g. @everyone or <@USER_ID> to force a phone ping
+    arbs_enabled: bool = True     # look for arbs (main lines and props) at all; false = no arb alerts
+    # Discord role ids by book (BOOK_ROLES=draftkings=123,fanduel=456): a new +EV, prop, outlier or parlay
+    # card pings its book's role instead of EV_MENTION / OUTLIER_MENTION / PARLAY_MENTION. Empty = those.
+    book_roles: dict = field(default_factory=dict)
+    # One alert per bet: a bet that went out is never alerted again (not at a better price, not at another
+    # book, not after a restart), and its card isn't edited except to mark it GONE.
+    one_alert_per_bet: bool = False
+    results_daily_only: bool = False   # results: one card per finished day (~12:30am), none as bets settle
     # A new alert (or a much better price's re-alert) isn't posted on odds fetched longer ago than this by the
     # time it's ready (a slow pass, Discord making the bot wait): the next check looks again and sends it on its
     # fresh odds, only if it still qualifies. Seconds, before the game / live; 0 = no limit.
@@ -643,6 +652,10 @@ class Config:
             tax_rate=num("TAX_RATE", d.tax_rate, float),
             min_after_tax_pct=num("MIN_AFTER_TAX_PCT", d.min_after_tax_pct, float),
             arb_live=e("ARB_LIVE", "true").lower() in ("1", "true", "yes"),
+            arbs_enabled=e("ARBS_ENABLED", "true").lower() in ("1", "true", "yes"),
+            book_roles=parse_book_roles(e("BOOK_ROLES", "")),
+            one_alert_per_bet=e("ONE_ALERT_PER_BET", "false").lower() in ("1", "true", "yes"),
+            results_daily_only=e("RESULTS_DAILY_ONLY", "false").lower() in ("1", "true", "yes"),
             min_live_profit_pct=num("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct, float),
             live_arb_max_skew=num("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew, int),
             live_confirm_checks=num("LIVE_CONFIRM_CHECKS", d.live_confirm_checks, int),
@@ -1935,11 +1948,49 @@ def _card(title: str, description: str, color: int, url: str = "", footer: str =
         embed["url"] = url  # makes the title tappable
     if footer:
         embed["footer"] = {"text": footer}
-    payload = {"username": "Arb Bot", "embeds": [embed],
-               "allowed_mentions": {"parse": ["everyone", "roles", "users"]}}
+    payload = {"username": BOT_NAME, "embeds": [embed], "allowed_mentions": allowed_mentions(mention)}
     if mention:
         payload["content"] = mention
     return payload
+
+
+def allowed_mentions(mention: str) -> dict:
+    """Discord may ping only what the message names: these roles and users, and @everyone/@here only
+    when it says so. A book's role mention can't ping anyone else."""
+    out: dict = {"parse": ["everyone"] if "@everyone" in mention or "@here" in mention else []}
+    roles = re.findall(r"<@&(\d+)>", mention)
+    users = re.findall(r"<@!?(\d+)>", mention)
+    if roles:
+        out["roles"] = list(dict.fromkeys(roles))
+    if users:
+        out["users"] = list(dict.fromkeys(users))
+    return out
+
+
+def book_role_mention(cfg: "Config", book: str) -> str:
+    """The Discord role to ping for a bet at this book (BOOK_ROLES), or "" when the book has none."""
+    role = cfg.book_roles.get(book_slug(book))
+    return f"<@&{role}>" if role else ""
+
+
+def book_slug(book: str) -> str:
+    """A book's name or Odds API key, reduced to lowercase letters and digits: "BetMGM", "betmgm" -> "betmgm"."""
+    return "".join(c for c in book.lower() if c.isalnum())
+
+
+def parse_book_roles(text: str) -> dict[str, str]:
+    """BOOK_ROLES=DraftKings=123,FanDuel=456 (commas or semicolons; a book's name as its cards show it):
+    {book slug: role id}. A role id is the number Discord copies with Developer Mode on."""
+    out = {}
+    for x in text.replace(";", ",").split(","):
+        if not x.strip():
+            continue
+        book, sep, role = (s.strip() for s in x.partition("="))
+        if not sep or not book_slug(book) or not role.isdigit():
+            raise ValueError(f"BOOK_ROLES: '{x.strip()}' should look like DraftKings=123456789012345678 "
+                             "(the book, then its Discord role id)")
+        out[book_slug(book)] = role
+    return out
 
 
 def _gone_card(title: str, line: str) -> dict:
@@ -2258,6 +2309,41 @@ def looked_at(checked, sport_key: str, event_id: str, market: str = "", commence
     return sport_key in checked or event_id in checked
 
 
+class AlertedBets:
+    """Every bet alerted so far (ONE_ALERT_PER_BET), so none goes out twice: not at a better price, not at
+    another book, not as the other alert type, not after a restart. Saved in STATE_DIR (alerted_bets.json);
+    each one is forgotten a day after its game starts. path None: remembered only while the bot runs."""
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self.until: dict[str, float] = {}   # bet -> when it can be forgotten (time.time())
+        if path and path.exists():
+            try:
+                self.until = {k: float(v) for k, v in json.loads(path.read_text()).items()}
+            except (OSError, ValueError, AttributeError):
+                print(f"  ! Couldn't read {path.name}; starting it again", file=sys.stderr)
+
+    def __contains__(self, bet: str) -> bool:
+        return bet in self.until
+
+    def add(self, bet: str, until: float, now: float | None = None) -> None:
+        """Remember a bet until `until`; the ones whose time is up by `now` (the check's clock) go."""
+        if self.until.get(bet) == until:
+            return
+        now = time.time() if now is None else now
+        self.until = {k: t for k, t in self.until.items() if t > now}
+        self.until[bet] = until
+        if not self.path:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.until))
+            tmp.replace(self.path)
+        except OSError as e:
+            print(f"  ! Couldn't save the alerted bets: {e}", file=sys.stderr)
+
+
 class Alerter:
     """Tracks arbs from first sighting until they close.
 
@@ -2280,6 +2366,9 @@ class Alerter:
     # An open card whose own bet didn't change (only other books' prices, its notes) is edited at most every
     # CARD_EDIT_MIN_SECONDS: +EV and outlier cards. Arbs, prop arbs and parlays: every change right away.
     throttle_edits = False
+    book_pings = False   # a new card pings its book's Discord role when BOOK_ROLES is set (bets, not arbs)
+    one_alert = False    # ONE_ALERT_PER_BET applies (bets, not arbs)
+    alerted: "AlertedBets | None" = None   # the bets already alerted, shared by every bet alerter (Trackers)
 
     def __init__(self, cfg: Config, dry_run: bool, noun: str | None = None, props: bool = False):
         self.cfg = cfg
@@ -2357,7 +2446,9 @@ class Alerter:
                      card=self.card_hash(arb, saved["first_seen"]), checks=saved.get("checks", 1),
                      spotted=saved.get("spotted") or 0.0, sent=True)
         self.open[arb.key] = op
-        if saved.get("card") != op.card and op.message_id:
+        if self.once and self.alerted is not None:   # (state saved before ONE_ALERT_PER_BET was on)
+            self.alerted.add(self.bet_identity(arb), self.bet_expires(arb), now)
+        if saved.get("card") != op.card and op.message_id and not self.once:
             self._discord(self.payload(arb, first_seen=op.first_seen), op.message_id, op.url)
             op.edited, op.shown = now, self.shown(arb)
         return op
@@ -2421,6 +2512,27 @@ class Alerter:
 
     def mention(self) -> str:
         return self.cfg.discord_mention
+
+    def mention_for(self, item) -> str:
+        """Who a new card for this item pings: its book's role (BOOK_ROLES; nobody when its book has none),
+        or else this alert type's mention."""
+        if self.book_pings and self.cfg.book_roles:
+            return book_role_mention(self.cfg, getattr(item, "book", ""))
+        return self.mention()
+
+    @property
+    def once(self) -> bool:
+        """One alert per bet (ONE_ALERT_PER_BET): no re-alerts, no edits but GONE, never the same bet twice."""
+        return self.one_alert and self.cfg.one_alert_per_bet
+
+    def bet_identity(self, item) -> str:
+        """The bet itself, whatever book has it (the +EV / outlier key has no book in it)."""
+        return item.key
+
+    def bet_expires(self, item) -> float:
+        """When the bet can't come back any more, so the memory of it can go: a day after its game starts."""
+        start = getattr(item, "commence_time", "")
+        return (_parse_time(start).timestamp() if start else time.time()) + 86400
 
     def ranked(self, items: list) -> list:
         """The order new alerts go out in, so an hourly cap keeps the best: games that haven't
@@ -2595,6 +2707,8 @@ class Alerter:
         op.post_delay, op.deferred = self.data_age(op.arb, fetched), False
         if self.on_candidate:
             self.on_candidate(op.arb, "alerted", now, op.post_delay)
+        if self.once and self.alerted is not None:
+            self.alerted.add(self.bet_identity(op.arb), self.bet_expires(op.arb), now)
         if not op.sent:
             op.sent = True
             if self.log_on_open:
@@ -2624,6 +2738,11 @@ class Alerter:
             cur = self.open.get(arb.key) or self._restore(arb, now)
             handed = self.handed.pop(arb.key, None)
             last_pct = self.handed_pct.pop(arb.key, None)
+            if (cur is None and handed is None and self.once and self.alerted is not None
+                    and self.bet_identity(arb) in self.alerted):
+                # Alerted once already (its card closed, or another book has it now): bet once, never again.
+                self.held_counts["alerted before"] = self.held_counts.get("alerted before", 0) + 1
+                continue
             if cur is None and handed is None and (why := self.capped(arb, now)):
                 self.note_held(arb, why, now)
                 continue  # an hourly cap is full; the best go first, so the best already went out
@@ -2654,7 +2773,7 @@ class Alerter:
                         print(f"  ↔ {self.label(arb)}: same bet as its other card, no new ping (not "
                               f"{self.cfg.realert_jump_pct:g}+ points better than the {last_pct:.2f}% alerted)",
                               flush=True)
-                    op.message_id = self._discord(self.payload(arb, "" if quiet else self.mention(),
+                    op.message_id = self._discord(self.payload(arb, "" if quiet else self.mention_for(arb),
                                                                first_seen=first), url=op.url)
                     op.edited, op.shown = now, self.shown(arb)
                     op.retry = op.message_id is None and self.send_retryable
@@ -2674,8 +2793,9 @@ class Alerter:
                 cur.checks += 1
                 cur.best_pct = max(cur.best_pct, self.value(arb))
                 # (Not for a bet kept up under MIN_CONFIDENCE: it wouldn't be alerted new, so no new ping.)
+                # (Nor with ONE_ALERT_PER_BET: a bet goes out once, whatever its price does later.)
                 better = (self.value(arb) >= cur.alerted_pct + self.cfg.realert_jump_pct
-                          and not getattr(arb, "kept", False))
+                          and not getattr(arb, "kept", False) and not self.once)
                 if not better:
                     cur.better = 0
                 age = self.data_age(arb, fetched)
@@ -2695,7 +2815,7 @@ class Alerter:
                         self._discord({"embeds": [{"title": "⬆️ Better price: see the newer alert below",
                                                    "color": 0x95A5A6}]}, cur.message_id, cur.url)
                     cur.deferred = False
-                    cur.message_id = self._discord(self.payload(arb, self.mention(), first_seen=cur.first_seen),
+                    cur.message_id = self._discord(self.payload(arb, self.mention_for(arb), first_seen=cur.first_seen),
                                                    url=cur.url)
                     cur.edited, cur.shown = now, self.shown(arb)
                     cur.card, cur.retry = card, cur.message_id is None and self.send_retryable
@@ -2709,6 +2829,8 @@ class Alerter:
                     new += 1
                 elif changed and self.edit_waits(arb, cur, now):
                     pass   # (only other books' prices or notes changed: edited by a later check, CARD_EDIT_MIN_SECONDS)
+                elif changed and self.once and cur.sent:
+                    pass   # (ONE_ALERT_PER_BET: the card stays as it went out until it's GONE)
                 elif changed or cur.retry:
                     # (A live bet's better price that the live rules hold back: edited, no new ping yet.)
                     if changed:
@@ -2733,7 +2855,7 @@ class Alerter:
                             if cur.deferred:   # (never shown: it was held before its first post)
                                 print(self.text(arb), flush=True)
                             cur.deferred = False   # (from here, a post Discord doesn't take is "not sent")
-                            cur.message_id = self._discord(self.payload(arb, "" if cur.quiet else self.mention(),
+                            cur.message_id = self._discord(self.payload(arb, "" if cur.quiet else self.mention_for(arb),
                                                                         first_seen=cur.first_seen), url=cur.url)
                             cur.edited, cur.shown = now, self.shown(arb)
                             cur.retry = cur.message_id is None and self.send_retryable
@@ -2840,7 +2962,7 @@ class Status:
         if self.dry_run:
             return
         try:
-            _webhook(self.url, {"username": "Arb Bot", "content": text[:1900]})
+            _webhook(self.url, {"username": BOT_NAME, "content": text[:1900]})
         except Exception as e:
             print(f"  ! Status message failed: {e}", file=sys.stderr)
 
@@ -4106,44 +4228,51 @@ def _board_lines(b: EVBet, rows: int = 12) -> str:
     return "\n".join(lines)
 
 
+EV_DIVIDER = "\n\n\n───────────────\n\n\n"   # (two blank lines each side: Discord keeps them)
+
+
+def confidence_line(confidence: str) -> str:
+    """"🟡 Confidence: Medium" ("" for a bet with no rating)."""
+    if not confidence:
+        return ""
+    icon, word = CONFIDENCE_BADGE[confidence].split(" ", 1)
+    return f"{icon} Confidence: {word}"
+
+
 def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
                 first_seen: float | None = None) -> dict:
-    """+EV card: the instruction first, then why (fair value, sharp prices), then every book."""
+    """+EV card: the game and when first, then the bet itself (stake, odds, pick), then why (fair value,
+    sharp prices), then every book. The title (the bet at its book) opens the bet slip."""
     icon = sport_icon(b.sport_key)
     if gone_after is not None:
         return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~+{b.ev_pct:.1f}%~~ {b.pick} {odds(b.price)}",
                           f"Ignore this one. {b.book} moved and the value is gone. ({icon} {b.matchup})")
-    parts = [
-        f"👉 **DO THIS: bet this ONE side.** Good value, but it won't win every time.\n\n"
-        f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**"
-        f"{ALT_NOTE if b.alt else ''}\n"
-        f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**"
-        + kalshi_room_line(b.kalshi_room) + kalshi_tie_note(b.sport_key, b.market, b.book)
-        + (f"\nConfidence: **{CONFIDENCE_BADGE[b.confidence]}**"
-           + (f" · {', '.join(b.confidence_notes)}" if b.confidence_notes else "") if b.confidence else ""),
-    ]
+    game = f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}{_age_note(b.age)}"
+    bet = (f"**BET SIZE: {b.stake_label}**\n**ODDS: {odds(b.price)}**\n\n"
+           f"**{b.pick}**{ALT_NOTE if b.alt else ''}")
+    parts = []
+    notes = (confidence_line(b.confidence) + kalshi_room_line(b.kalshi_room)
+             + kalshi_tie_note(b.sport_key, b.market, b.book)).strip("\n")
+    if notes:
+        parts.append(notes)
     agree, why = confirm_lines(b)
     if agree:
         parts.append(f"**{agree}**\n{why}")
-    if len([r for r in b.board if r[2] > 0 and r[4]]) > 1:
-        parts.append("Can't use that book? Any 🟢 book below works too, at its price.")
     if b.related:
         parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}. These move together, "
                      f"so treat them as one bet, not separate ones.")
-    details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}"
-               f"{_age_note(b.age)}\n\n**Fair value** {_fair_line(b)} · {b.fair_prob:.1%} to win"
-               + (f"\n{sources_line(b, bold=True)}" if b.refs else "")
-               + (f"\n**{b.sharp_quotes[0][0]}** {' / '.join(odds(x) for x in b.sharp_quotes[0][1])}"
-                  if b.sharp_quotes else "")
-               + (f" *(was {' / '.join(odds(x) for x in b.first_sharp_quotes[0][1])})*"
-                  if b.first_sharp_quotes and b.first_sharp_quotes != b.sharp_quotes else "")
-               + _kalshi_line(b))
-    desc = "\n\n".join(parts) + DIVIDER + details
+    parts.append(f"**Fair value** {_fair_line(b)} · {b.fair_prob:.1%} to win"
+                 + (f"\n{sources_line(b, bold=True)}" if b.refs else "")
+                 + (f"\n**{b.sharp_quotes[0][0]}** {' / '.join(odds(x) for x in b.sharp_quotes[0][1])}"
+                    if b.sharp_quotes else "")
+                 + (f" *(was {' / '.join(odds(x) for x in b.first_sharp_quotes[0][1])})*"
+                    if b.first_sharp_quotes and b.first_sharp_quotes != b.sharp_quotes else "")
+                 + _kalshi_line(b))
     if b.board:
-        desc += "\n\n**Every book**\n" + _board_lines(b)
-    footer = f"+EV = better price than the true odds ({b.sharp_book}). Wins over many bets, not every bet."
+        parts.append("**Every book**\n" + _board_lines(b))
+    desc = game + EV_DIVIDER + bet + "\n\n\n" + "\n\n".join(parts)
     return _card(f"📈 +EV {b.ev_pct:.1f}%{' ✅✅' if agree else ''} · {b.pick} {odds(b.price)} at {b.book}", desc,
-                 0x3498DB, url=b.link, footer=footer, mention=mention)
+                 0x3498DB, url=b.link, mention=mention)
 
 
 EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
@@ -4162,6 +4291,8 @@ EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
 
 class EVAlerter(Alerter):
     noun = "+EV bets"
+    book_pings = True   # (outliers too)
+    one_alert = True
     log_fields = EV_LOG_FIELDS
     throttle_edits = True   # (CARD_EDIT_MIN_SECONDS; outliers too)
     log_on_open = True  # logged at first sight, so a restart never loses a bet from the results
@@ -5276,6 +5407,9 @@ def hand_over(evs: list[EVBet], outs: list[EVBet], ev_alr: "EVAlerter", out_alr:
             if k in live and before_kickoff(src.open[k].first_seen, src.open[k].arb.commence_time):
                 src._close(k, now)
                 continue
+            if src.once:   # ONE_ALERT_PER_BET: the card it went out on stays, now followed by the other alerter
+                dst.open[k] = src.open.pop(k)
+                continue
             op = src.open.pop(k)
             dst.handed[k] = op.first_seen
             if op.pinged_pct is not None:   # (no post of this bet pinged yet: the new card is the alert)
@@ -5292,6 +5426,9 @@ def hand_over(evs: list[EVBet], outs: list[EVBet], ev_alr: "EVAlerter", out_alr:
             if k in live and before_kickoff(src.restored[k].get("first_seen", now),
                                             src.restored[k].get("commence_time", "")):
                 src._drop_restored(k, "Ignore this one. The game has started.")
+                continue
+            if src.once:
+                dst.restored[k] = src.restored.pop(k)
                 continue
             saved = src.restored.pop(k)
             dst.handed[k] = saved.get("first_seen", time.time())
@@ -5530,6 +5667,8 @@ LEG_FIELDS = ["event_id", "sport_key", "matchup", "home_team", "away_team", "com
 class ParlayAlerter(Alerter):
     noun = "parlays"
     scoped = False
+    book_pings = True
+    one_alert = True
     log_fields = PARLAY_FIELDS
     log_on_open = True
     log_held = False
@@ -5548,6 +5687,13 @@ class ParlayAlerter(Alerter):
 
     def mention(self) -> str:
         return self.cfg.parlay_mention
+
+    def bet_identity(self, item) -> str:
+        """The same legs are the same parlay at any book."""
+        return "parlay|" + "|".join(b.key for b, _, _ in item.legs)
+
+    def bet_expires(self, item) -> float:
+        return max(Alerter.bet_expires(self, b) for b, _, _ in item.legs)
 
     def log_path(self) -> str:
         return self.cfg.parlay_log_file
@@ -6689,6 +6835,16 @@ def arbs_on(cfg: Config, day) -> str:
             f"once at {money(cfg.bankroll)}{gone}")
 
 
+def day_clv_line(rows: list[dict]) -> str:
+    """The day's bet quality: "📐 CLV: avg +2.1% · beat the close on 64% (11 bets)" ("" before any closing line)."""
+    clvs = [float(r["clv_pct"]) for r in rows if r.get("clv_pct") not in ("", None)]
+    if not clvs:
+        return ""
+    beat = sum(c > 0 for c in clvs) / len(clvs) * 100
+    return (f"📐 **CLV:** avg {sum(clvs) / len(clvs):+.1f}% · beat the close on {beat:.0f}% "
+            f"({len(clvs)} bet{'s' if len(clvs) != 1 else ''})")
+
+
 def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: list[dict],
                     day, now: datetime | None = None) -> dict:
     """A results card: the given bets one by one, then the day's record."""
@@ -6702,8 +6858,9 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
     title = f"{title_prefix}" + (f" · {w}-{l}" + (f"-{pu}" if pu else "") + f" · {signed_money(profit)}"
                                  if graded else "")
     arbs = arbs_on(cfg, day)
+    clv = day_clv_line(day_rows)
     desc = (body + DIVIDER + f"**{day:%a %b %-d}** (every alert at the stake it showed)\n"
-            + day_summary(day_rows, cfg, now) + (f"\n{arbs}" if arbs else ""))
+            + day_summary(day_rows, cfg, now) + (f"\n{clv}" if clv else "") + (f"\n{arbs}" if arbs else ""))
     color = 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else GREY)
     return _card(title, desc, color,
                  footer="Results assume every alert was bet at the stake shown. Props are graded from the box "
@@ -6774,6 +6931,12 @@ def scoreboard_payload(cfg: Config, now: datetime | None = None) -> dict:
     return _card("📊 Scoreboard", text,
                  0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else 0x5865F2),
                  footer="Every alert at the stake it showed. Updates by itself as games finish. Pin this message.")
+
+
+# RESULTS_DAILY_ONLY: a day's results card (12:00am-11:59pm New York, by game start) goes out at the first check
+# from RECAP_AT the next night, once every bet that day the bot can grade is graded, and by RECAP_LATEST anyway.
+RECAP_AT = dtime(0, 30)
+RECAP_LATEST = dtime(1, 0)
 
 
 class Results:
@@ -6850,6 +7013,8 @@ class Results:
             settle_pending(self.cfg, api, now, recent_hours)
         except Exception as e:  # noqa: BLE001 - grading must never stop the bot
             print(f"! Grading bets failed: {e}", file=sys.stderr)
+        if self.cfg.results_daily_only:
+            return 0   # (RESULTS_DAILY_ONLY: graded now, posted in the day's one card after midnight)
         self._load()
         cutoff = now - timedelta(days=3)
         new = [r for r in _read_csv(self.cfg.ev_results_file)
@@ -6926,14 +7091,26 @@ class Results:
         card for `day`, and count that day's bets as posted so they don't also come one by one.
         A failed post is tried again at most every RESULTS_MINUTES (10 at the least)."""
         self.recap_tried = time.time()
-        if self.graded_day != day.isoformat():
+        if self.graded_day != day.isoformat() or self.cfg.results_daily_only:
             self.graded_day = day.isoformat()
             try:
                 settle_pending(self.cfg, api, now)
             except Exception as e:  # noqa: BLE001
                 print(f"! Grading bets failed: {e}", file=sys.stderr)
+        if self.cfg.results_daily_only and self.still_playing(day, now):
+            return   # (a late game still going: the card waits for it, until RECAP_LATEST)
         self.recap(day, now)
         self.update_board(now)
+
+    def still_playing(self, day, now: datetime | None = None) -> bool:
+        """RESULTS_DAILY_ONLY: should `day`'s card wait? Yes while one of its bets the bot can grade isn't
+        graded yet and it's not RECAP_LATEST yet (then it goes out anyway, showing what's left)."""
+        now = now or datetime.now(timezone.utc)
+        local = now.astimezone(ZoneInfo(self.cfg.timezone))
+        if local.date() > day + timedelta(days=1) or local.time() >= RECAP_LATEST:
+            return False
+        return any(not r.get("result") and r.get("actual") != RAIN_HELD and gradable(r)
+                   and not stuck(r, self.cfg, now) for r in day_bets(self.cfg, day))
 
     def recap_due(self, day) -> bool:
         if time.time() - self.recap_tried < max(600, self.cfg.results_minutes * 60):
@@ -9167,8 +9344,9 @@ def unit_line(cfg: Config) -> str:
 
 def online_message(cfg: Config) -> str:
     """The health channel's message when the bot starts."""
-    return (f"🟢 Arb bot online: watching {', '.join(short(s) for s in cfg.sports)} ({cfg.markets}). "
+    return (f"🟢 {BOT_NAME} online: watching {', '.join(short(s) for s in cfg.sports)} ({cfg.markets}). "
             f"Bet cards show stakes in units too: 1u = {money(cfg.unit())}."
+            + ("" if cfg.arbs_enabled else " Arbs are off (ARBS_ENABLED=false).")
             + (f" Using {len(REMOTE_USED)} settings pushed for you ({REMOTE_ENV}); {mode_line(cfg)}"
                if REMOTE_USED else ""))
 
@@ -9482,6 +9660,12 @@ class Trackers:
         self.held = HeldTally(cfg, None if off else held_path(cfg))
         for a in (self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs, self.prop_outs, self.parlays):
             a.on_held = self.held.add
+        # Bets alerted once already (ONE_ALERT_PER_BET), one memory for every bet alerter: +EV and outliers share
+        # keys. Saved only by the service (not --once, --demo or --dry-run), so a restart remembers them.
+        self.alerted = AlertedBets(None if off or not cfg.state_dir or not cfg.webhook_url
+                                   else data_path(cfg.state_dir) / "alerted_bets.json")
+        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays):
+            a.alerted = self.alerted
         # Bets that came close and what happened to them (CANDIDATE_LOG_FILE; not for --once, --demo or --dry-run).
         self.candidates = CandidateLog(replace(cfg, candidate_log_file="") if off else cfg)
         for a in (self.evs, self.outs, self.prop_evs, self.prop_outs):
@@ -9535,7 +9719,8 @@ class Trackers:
 HELD_LABELS = {"waiting": "live, waiting for another check", "unconfirmed": "live, gone before it was confirmed",
                "old price": "live, price too old", "capped": "over the hourly cap",
                "live cap": "over the live-alert cap", "old data": "odds too old by sending time (checked again)",
-               "not sent": "Discord didn't take it (tried again next check)"}
+               "not sent": "Discord didn't take it (tried again next check)",
+               "alerted before": "alerted once already (ONE_ALERT_PER_BET)"}
 
 
 def take_held(*alerters: Alerter) -> dict[str, int]:
@@ -9575,7 +9760,7 @@ def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: d
     take_held(t.arbs, t.outs, t.evs)
     close["fetched"] = fetched_at(events)   # (no post on odds too old by the time it's ready)
     at = clock()
-    arbs = find_arbs(events, cfg, at)
+    arbs = find_arbs(events, cfg, at) if cfg.arbs_enabled else []   # (ARBS_ENABLED=false: none, cards close)
     # An arb with a Kalshi bet waits for Kalshi's quotes (asked below anyway), so its card can say when
     # Kalshi's order book can't take that bet's whole stake at its price.
     kq = kalshi_fair(events, cfg, clock()) if kalshi and kalshi_arb_bets(arbs, cfg) else None
@@ -9636,7 +9821,8 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
     note_related([(p_outs, t.prop_outs, checked), (p_evs, t.prop_evs, checked),
                   ([], t.outs, set()), ([], t.evs, set())], ts)
     fetched = fetched_at(prop_events)
-    n_arb = t.prop_arbs.handle(find_arbs(prop_events, cfg, at), checked_events=checked, now=ts, fetched=fetched)
+    p_arbs = find_arbs(prop_events, cfg, at) if cfg.arbs_enabled else []
+    n_arb = t.prop_arbs.handle(p_arbs, checked_events=checked, now=ts, fetched=fetched)
     n_out = t.prop_outs.handle(p_outs, checked_events=checked, now=ts, fetched=fetched)
     n_ev = t.prop_evs.handle(p_evs, checked_events=checked, now=ts, fetched=fetched)
     t.closing.observe(prop_events, at)
@@ -9816,7 +10002,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         if (cfg.summary_hour >= 0 and not args.once and local.hour >= cfg.summary_hour
                 and local.date() != summary_day):
             summary_day = local.date()
-            sections = [("💰 **Arbs**", f"{alerter.summary()}; props: {prop_arbs.summary()}")]
+            sections = ([("💰 **Arbs**", f"{alerter.summary()}; props: {prop_arbs.summary()}")]
+                        if cfg.arbs_enabled else [])
             if cfg.ev_enabled:
                 sections.append(("📈 **+EV**", f"{ev_alerter.summary()}\nIf you bet every alert: "
                                  f"last 7 days {ev_record(cfg, 7)}; all time {ev_record(cfg)}"))
@@ -9962,8 +10149,10 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 print(f"  📦 {n_par} new parlay(s)", flush=True)
 
         yesterday = local.date() - timedelta(days=1)
-        if (not args.once and cfg.summary_hour >= 0 and local.hour >= cfg.summary_hour
-                and results.recap_due(yesterday)):
+        # (RESULTS_DAILY_ONLY: just after midnight, as the day's only results post; else with the morning summary.)
+        recap_time = (local.time() >= RECAP_AT if cfg.results_daily_only
+                      else cfg.summary_hour >= 0 and local.hour >= cfg.summary_hour)
+        if not args.once and recap_time and results.recap_due(yesterday):
             results.daily(api, yesterday, now)   # yesterday's full card, once (survives restarts)
         if (not args.once and cfg.summary_hour >= 0 and local.hour >= cfg.summary_hour and local.weekday() == 0
                 and results.weekly_due(local.date())):
@@ -10141,7 +10330,7 @@ def main() -> None:
                        args.weekly, args.post_weekly)
         if url.startswith("https://") and not any(interactive):   # the service: say why it stopped
             try:
-                _webhook(url, {"username": "Arb Bot", "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
+                _webhook(url, {"username": BOT_NAME, "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
                                "Fix it (nano /opt/arb-bot/.env), then: systemctl restart arbbot"})
             except Exception:  # noqa: BLE001 - already exiting with the reason printed
                 pass

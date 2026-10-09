@@ -554,7 +554,7 @@ class PlusEV(unittest.TestCase):
                                [(1.95, 1.95), (1.96, 1.94), (1.94, 1.96)])
         [b] = find_evs([ev], Config(min_ev_pct=3, round_stakes=0), NOW)
         self.assertEqual(b.confidence, "high")
-        self.assertIn("Confidence: **🟢 High**", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("🟢 Confidence: High", ev_payload(b)["embeds"][0]["description"])
         lowcfg = Config(min_ev_pct=3, round_stakes=0, min_confidence="high")
         wide = self.market_event([("Home", 1.88, None), ("Away", 1.88, None)], [])     # ~6.4% margin
         self.assertEqual(find_evs([wide], lowcfg, NOW), [])
@@ -624,9 +624,15 @@ class PlusEV(unittest.TestCase):
         [b] = find_evs([ev], EVCFG, NOW)
         self.assertEqual("📈 +EV 5.0% · Home ML +110 at B", ev_payload(b)["embeds"][0]["title"])
         desc = ev_payload(b)["embeds"][0]["description"]
-        self.assertTrue(desc.startswith("👉 **DO THIS: bet this ONE side.**"))
-        self.assertIn("Open **B** → bet **$11 (1.1u)** on **Home ML +110**", desc)   # 1u = 1% of $1,000
-        self.assertIn("skip if the price is worse than **+103**", desc)   # 1.5% edge vs fair +100
+        # The game and when first, the divider, then the bet: stake (1u = 1% of $1,000), odds, the pick alone.
+        self.assertEqual(desc.split("**Fair value**")[0],
+                         "🏟️ **Test** · Away @ Home\n⏰ Starts <t:1791050400:t> (<t:1791050400:R>)\n"
+                         "⏱ price was 0s old when sent\n\n\n───────────────\n\n\n"
+                         "**BET SIZE: $11 (1.1u)**\n**ODDS: +110**\n\n**Home ML**\n\n\n🟡 Confidence: Medium\n\n")
+        for gone in ("DO THIS", "won't win every time", "+EV = better price", "Can't use that book",
+                     "skip if the price", "other books mostly agree"):
+            self.assertNotIn(gone, desc)
+        self.assertNotIn("footer", ev_payload(b)["embeds"][0])
         self.assertTrue(ev_payload(b, gone_after=30)["embeds"][0]["title"].startswith("❌ GONE"))
 
 
@@ -5943,9 +5949,8 @@ class PropsInLocks(MixFiles):
                                               "6 sportsbooks price it (2 you can't bet at)",
                                               "no Pinnacle price: stake 30% smaller"])
         card = ev_payload(b)["embeds"][0]
-        self.assertIn("Confidence: **🟢 High** · other books agree (within 1.1% win chance), 6 sportsbooks price it "
-                      "(2 you can't bet at), no Pinnacle price: stake 30% smaller", card["description"])
-        self.assertIn(f"({CONSENSUS_SIX})", card["footer"]["text"])
+        self.assertIn("🟢 Confidence: High\n\n**Fair value**", card["description"])   # (just the rating on the card)
+        self.assertIn("**Sources**: median of 5 books (no Pinnacle price)", card["description"])
         self.assertEqual(b.stake, kelly_stake(0.5, 2.20, self.locks(), 0.7))   # 30% smaller, high = full
         self.assertIn("When Pinnacle doesn't price a prop, its true odds come from the other books: the card names "
                       "them, and the stake is 30% smaller.", _arbbot.GUIDE)
@@ -6129,7 +6134,7 @@ class PropsInLocks(MixFiles):
             self.assertFalse([t for m, t, _ in sent if m == "POST" or t.startswith("❌")], (i, sent))
             self.assertEqual(b.kept, b.confidence == "medium")
         self.assertEqual((b.confidence, b.kept), ("medium", True))                 # 🟡, no "better price" ping
-        self.assertIn("Confidence: **🟡 Medium**", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("🟡 Confidence: Medium", ev_payload(b)["embeds"][0]["description"])
         self.assertEqual(len(_read(cfg.ev_log_file)), 1)                           # one bet, logged once
         # Under medium it does go: 5 sportsbooks that disagree.
         del sent[:]
@@ -6368,7 +6373,7 @@ class PropsInLocks(MixFiles):
         self.assertEqual(res.missed, [["edge over 12%", "book moved first"]])
         for i, books in ((3, further), (4, LOCK_SIX)):                             # nobody followed; then back
             check(i, books)
-        self.assertEqual([m for m, *_ in sent], ["POST"] + ["PATCH"] * 3)          # edited: no GONE, no new ping
+        self.assertEqual([m for m, *_ in sent], ["POST"] + ["PATCH"] * 2)          # edited: no GONE, no new ping
         self.assertFalse([title for _, title, _ in sent if title.startswith("❌")])
         self.assertEqual((op.arb.confidence, op.arb.kept), ("high", False))
         self.assertEqual(len(_read(self.files["ev_log_file"])), 1)                 # one bet, logged once
@@ -7890,7 +7895,7 @@ class KalshiDepth(unittest.TestCase):
         [b] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 30)}})   # $13.50 there
         self.assertEqual(b.stake, 10.0)                                    # rounded down to $5s, never over
         desc = ev_payload(b)["embeds"][0]["description"]
-        self.assertIn("bet **$10 (1u)** on **Home ML", desc)
+        self.assertIn("**BET SIZE: $10 (1u)**\n**ODDS: +114**\n\n**Home ML**", desc)
         self.assertIn("↳ Kalshi only has about $13 at this price; the rest would fill at a worse price.", desc)
         [deep] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 1000)}})
         self.assertEqual((deep.stake, deep.kalshi_room), (15.0, 0.0))     # enough there: unchanged
@@ -8518,7 +8523,7 @@ class ConfirmedPreGame(MixFiles):
         self.assertEqual(b.stake, 9.0)                                       # smaller (a 5.5% bet: $12)
         card = ev_payload(b)["embeds"][0]
         self.assertEqual(card["title"], "📈 +EV 4.0% ✅✅ · Home ML +108 at B")
-        self.assertIn("Confidence: **🟢 High** · tight sharp market (2.6% margin), other books agree, Kalshi agrees\n\n"
+        self.assertIn("🟢 Confidence: High\n\n"
                       "**✅✅ Two sharp books agree: Pinnacle and Kalshi**\n"
                       "A smaller edge than the usual 5% is OK here: both give it almost the same chance to win "
                       "(Pinnacle 50.0%, Kalshi 50.5%). At least +4.0% by both.", card["description"])
@@ -9132,7 +9137,7 @@ class UnitsOnCards(MixFiles):
     def test_every_bet_card_shows_units_and_arbs_stay_in_dollars(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
-        self.assertIn("bet **$11 (1.1u)** on **Home ML +110**", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("**BET SIZE: $11 (1.1u)**\n**ODDS: +110**", ev_payload(b)["embeds"][0]["description"])
         self.assertIn("→ stake $11 (1.1u)", _arbbot.format_ev_text(b))
         [o] = find_outliers([outlier_event(1.85, 1.95)], Config(round_stakes=0), NOW)
         self.assertRegex(outlier_payload(o)["embeds"][0]["description"], r"bet \*\*\$\d+ \(\d+(\.\d)?u\)\*\*")
@@ -9328,7 +9333,7 @@ class KalshiTieNote(unittest.TestCase):
         cfg = Config(min_ev_pct=3, round_stakes=0)
         [b] = find_evs([self.ev_at("Kalshi")], cfg, NOW, kalshi=quotes)
         desc = ev_payload(b)["embeds"][0]["description"]
-        self.assertIn("skip if the price is worse than **+103**\n" + self.NOTE, desc)
+        self.assertIn("🟡 Confidence: Medium\n" + self.NOTE, desc)
         self.assertEqual(b.ev_pct, find_evs([self.ev_at("Kalshi", sport="basketball_nba")], cfg, NOW, kalshi=quotes)[0].ev_pct)
         for other in (self.ev_at("B"), self.ev_at("Kalshi", sport="basketball_nba"),
                       self.ev_at("Kalshi", market="spreads")):
@@ -9476,7 +9481,7 @@ class KalshiBlend(MixFiles):
         card = ev_payload(b)["embeds"][0]
         self.assertIn("**Fair value** -102 · 50.5% to win\n**Sources** 2/2 · Pinnacle 50.0% · Kalshi 52.0%",
                       card["description"])
-        self.assertIn("(Pinnacle + Kalshi)", card["footer"]["text"])
+        self.assertNotIn("footer", card)                                   # (no "+EV = ..." footer any more)
         self.assertIn("(50.5%, Pinnacle + Kalshi no-vig)", _arbbot.format_ev_text(b))
 
     def test_kalshi_blend_off_is_exactly_as_before(self):
@@ -9885,7 +9890,7 @@ class KalshiOnly(MixFiles):
         self.assertEqual(b.stake, kelly_stake(0.5, 2.10, LONE, 0.5))            # half the Pinnacle-priced stake
         self.assertIn("Kalshi's price alone: stake 50% smaller", b.confidence_notes)
         self.assertEqual(sources_line(b), "Sources 1/2 · Kalshi 50.0% (no Pinnacle price)")
-        self.assertIn("Kalshi (no Pinnacle price)", ev_payload(b)["embeds"][0]["footer"]["text"])
+        self.assertIn("**Sources** 1/2 · Kalshi 50.0% (no Pinnacle price)", ev_payload(b)["embeds"][0]["description"])
         self.assertNotIn(("e1", "h2h", None, "Home"), history.points)           # not a sharp price: not kept
         self.assertEqual(find_evs(self.games(), replace(LONE, kalshi_only_stake=1), NOW, kalshi=EVEN)[0].stake,
                          same.stake)
@@ -10895,7 +10900,7 @@ class AlternateLines(MixFiles):
         self.assertEqual((b.sharp_book, round(b.fair_prob, 3)), ("Pinnacle", 0.5))   # Pinnacle's full-confidence price
         self.assertEqual(b.link, "draftkings/player_pass_yds_alternate/245.5/over")
         self.assertEqual(b.key, _arbbot.ev_key("q1", "player_pass_yds", ("Josh Allen", 245.5), "Over"))
-        self.assertIn("**Josh Allen Over 245.5 Passing Yards +130** *(alternate line)*",
+        self.assertIn("**ODDS: +130**\n\n**Josh Allen Over 245.5 Passing Yards** *(alternate line)*",
                       ev_payload(b)["embeds"][0]["description"])
         self.assertIn("on DraftKings (alternate line)", _arbbot.format_ev_text(b))
         self.assertNotEqual(b.fingerprint, replace(b, alt=False).fingerprint)
@@ -12926,6 +12931,268 @@ class PropOutlierBadData(MixFiles):
         self.assertEqual((values.get("OUTLIER_PROP_MAX_PCT"), values.get("OUTLIER_PROP_CLUSTER")), ("40", "4"))
         for key in ("OUTLIER_PROP_MAX_PCT", "OUTLIER_PROP_CLUSTER"):
             self.assertIn(key, readme)
+
+
+from datetime import date, time as dtime   # noqa: E402 (the daily-card tests below)
+
+
+class EVBotSpec(MixFiles):
+    """The Oct 2026 EV BOT changes: sender name, arbs off, book role pings, one alert per bet, one results card
+    a day."""
+
+    PRE = "2026-10-03T18:00:00Z"
+
+    def live(self, sent, **kw):
+        """Trackers as the service runs them (state saved), with every Discord call recorded instead:
+        (method, title, content, allowed_mentions, message id)."""
+        cfg = self.cfg(Config(min_ev_pct=3, max_ev_pct=100, ev_max_odds=10, round_stakes=0, webhook_url="https://main",
+                              kalshi_check=False), **kw)
+        t = _arbbot.Trackers(cfg, self.args(dry_run=False))
+        ids = iter(f"m{i}" for i in range(1, 1000))
+        for a in (t.arbs, t.evs, t.outs, t.prop_arbs, t.prop_evs, t.prop_outs, t.parlays):
+            def fake(payload, message_id=None, url="", a=a):
+                a.send_retryable = False
+                mid = message_id or next(ids)
+                sent.append(("PATCH" if message_id else "POST", payload["embeds"][0].get("title", ""),
+                             payload.get("content", ""), payload.get("allowed_mentions"), mid))
+                return mid
+            a._discord = fake
+        return t
+
+    def main(self, t, evs, secs):
+        return _arbbot.scan_main(t, [stamped(e, secs) for e in evs], ["basketball_nba"], at(secs))
+
+    def game(self, books, ev_id="e1"):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {b: [("Home", p, None)] for b, p in books.items()},
+                      start=self.PRE)
+        ev.update(id=ev_id, sport_key="basketball_nba")
+        return ev
+
+    # ---- 3. The sender is "EV BOT"
+    def test_every_message_is_sent_as_ev_bot(self):
+        [b] = find_evs([self.game({"B": 2.10})], EVCFG, NOW)
+        [o] = find_outliers([outlier_event(1.85, 1.95)], Config(round_stakes=0), NOW)
+        [arb] = find_arbs(demo_events(), Config())
+        for payload in (ev_payload(b), outlier_payload(o), _arbbot.discord_payload(arb), ev_payload(b, gone_after=9)):
+            self.assertEqual(payload["username"], "EV BOT")
+        self.assertNotIn('"Arb Bot"', Path(_arbbot.__file__).read_text())
+        self.assertIn('"username": "EV BOT"', (Path(_arbbot.__file__).parent / "deploy" / "notify.py").read_text())
+        self.assertTrue(_arbbot.online_message(Config()).startswith("🟢 EV BOT online"))
+
+    # ---- 2. Arbs off
+    def test_arbs_off_finds_no_arbs_and_bets_still_go_out(self):
+        from unittest import mock
+        sent = []
+        t = self.live(sent, arbs_enabled=False)
+        with mock.patch("arbbot.find_arbs", side_effect=AssertionError("arbs are off")):
+            res = self.main(t, [self.game({"B": 2.20})], 0)
+            _arbbot.scan_props(t, [], set(), at(0))
+        self.assertEqual((res.arbs, res.sent, res.ev_sent), ([], 0, 1))           # the +EV bet still goes out
+        self.assertIn("Arbs are off", _arbbot.online_message(t.cfg))
+        self.assertTrue(Config().arbs_enabled)                                   # (on unless remote.env says off)
+        import os
+        with mock.patch.dict(os.environ, {"ARBS_ENABLED": "false"}):
+            self.assertFalse(Config.from_env().arbs_enabled)
+
+    def test_arbs_on_still_alert(self):
+        t = _arbbot.Trackers(self.cfg(Config(min_profit_pct=0, alert_mode="balanced")), self.args())
+        res = _arbbot.scan_main(t, demo_events(), ["basketball_nba"])
+        self.assertTrue(res.arbs)
+
+    # ---- 4. Book role pings
+    def test_a_new_bet_pings_its_books_role_and_nobody_else(self):
+        sent = []
+        t = self.live(sent, book_roles={"b": "111", "fanduel": "222"}, ev_mention="@everyone")
+        self.main(t, [self.game({"B": 2.20})], 0)
+        [(method, _, content, allowed, _)] = sent
+        self.assertEqual((method, content), ("POST", "<@&111>"))
+        self.assertEqual(allowed, {"parse": [], "roles": ["111"]})               # can't reach @everyone or other roles
+
+    def test_a_book_with_no_role_pings_nobody(self):
+        sent = []
+        t = self.live(sent, book_roles={"fanduel": "222"}, ev_mention="@everyone")
+        self.main(t, [self.game({"B": 2.20})], 0)
+        self.assertEqual([(c, a) for _, _, c, a, _ in sent], [("", {"parse": []})])
+
+    def test_outliers_ping_the_book_role_instead_of_everyone(self):
+        o_cfg = dict(outlier_mention="@everyone", ev_enabled=False)
+        sent = []
+        t = self.live(sent, book_roles={"stale": "333"}, **o_cfg)
+        ev = outlier_event(1.85, 3.3, start=self.PRE)
+        ev.update(id="e1", sport_key="basketball_nba")
+        self.main(t, [ev], 0)
+        self.assertEqual([(c, a) for m, _, c, a, _ in sent if m == "POST"], [("<@&333>", {"parse": [], "roles": ["333"]})])
+        old = []                                                                 # without BOOK_ROLES: as before
+        self.main(self.live(old, **o_cfg), [ev], 0)
+        self.assertEqual([(c, a) for m, _, c, a, _ in old if m == "POST"], [("@everyone", {"parse": ["everyone"]})])
+
+    def test_parlays_ping_their_books_role(self):
+        a = ParlayAlerter(Config(book_roles={"dk": "444"}, parlay_mention="@here"), dry_run=True)
+        legs = [ev_leg(g, {"DK": 2.20}) for g in ("g1", "g2")]
+        [p] = find_parlays(legs, Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2))
+        self.assertEqual(a.mention_for(p), "<@&444>")
+        self.assertEqual(Alerter(Config(book_roles={"dk": "444"}, discord_mention="@here"), True).mention_for(p),
+                         "@here")                                                # arbs: never a book role
+
+    def test_book_roles_setting(self):
+        import os
+        from unittest import mock
+        from arbbot import parse_book_roles
+        self.assertEqual(parse_book_roles("DraftKings=1; FanDuel = 2,Caesars=3,ESPN Bet=4"),
+                         {"draftkings": "1", "fanduel": "2", "caesars": "3", "espnbet": "4"})
+        for bad in ("DraftKings", "DraftKings=", "DraftKings=@role", "=5"):
+            with self.assertRaises(ValueError):
+                parse_book_roles(bad)
+        with mock.patch.dict(os.environ, {"BOOK_ROLES": "BetMGM=99"}):
+            self.assertEqual(_arbbot.book_role_mention(Config.from_env(), "BetMGM"), "<@&99>")
+
+    # ---- 5. One alert per bet
+    def test_a_better_price_is_not_alerted_again_or_shown(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False)
+        self.main(t, [self.game({"B": 2.20})], 0)
+        self.main(t, [self.game({"B": 2.50})], 60)                               # +25%: was a new ping
+        self.assertEqual([m for m, *_ in sent], ["POST"])                        # no new alert, no edit
+        self.main(t, [], 120)                                                    # gone: GONE as always
+        self.assertEqual([m for m, *_ in sent], ["POST", "PATCH"])
+        self.assertTrue(sent[-1][1].startswith("❌ GONE"))
+        self.assertEqual(sent[-1][4], sent[0][4])                                # on the card that went out
+        self.assertEqual(len(_read(self.files["ev_log_file"])), 1)               # one bet, logged once
+
+    def test_without_the_setting_a_better_price_still_realerts(self):
+        sent = []
+        t = self.live(sent, outliers_enabled=False)
+        self.main(t, [self.game({"B": 2.20})], 0)
+        self.main(t, [self.game({"B": 2.50})], 60)
+        self.assertEqual([m for m, *_ in sent], ["POST", "PATCH", "POST"])
+
+    def test_the_same_bet_at_another_book_or_back_later_is_not_alerted_again(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False)
+        self.main(t, [self.game({"B": 2.20})], 0)
+        self.main(t, [], 60)                                                     # GONE
+        self.main(t, [self.game({"C": 2.25})], 120)                              # back, at another book
+        self.main(t, [self.game({"B": 2.30})], 180)                              # back where it was
+        self.assertEqual([m for m, *_ in sent], ["POST", "PATCH"])
+        other = self.game({"B": 2.20}, ev_id="e2")                               # a different game: a new bet
+        self.main(t, [other], 240)
+        self.assertEqual([m for m, *_ in sent], ["POST", "PATCH", "POST"])
+
+    def test_a_restart_remembers_every_bet_alerted(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False)
+        self.main(t, [self.game({"B": 2.20}), self.game({"B": 2.20}, ev_id="e2")], 0)
+        self.main(t, [self.game({"B": 2.20}, ev_id="e2")], 60)                   # e1 GONE, e2 still up
+        self.assertEqual([m for m, *_ in sent], ["POST", "POST", "PATCH"])
+        again = self.live(sent, one_alert_per_bet=True, outliers_enabled=False)   # deploy / restart
+        res = self.main(again, [self.game({"B": 2.40}), self.game({"B": 2.40}, ev_id="e2")], 120)
+        self.assertEqual([m for m, *_ in sent], ["POST", "POST", "PATCH"])       # neither alerted again
+        self.assertEqual(res.held, {"alerted before": 2})
+
+    def test_alerted_bets_are_forgotten_a_day_after_their_game(self):
+        from arbbot import AlertedBets
+        path = self.d / "state" / "alerted_bets.json"
+        mem = AlertedBets(path)
+        mem.add("old", 1000.0, now=500)
+        mem.add("new", 5000.0, now=2000)                                         # "old" is up by then
+        self.assertEqual((("old" in AlertedBets(path)), ("new" in AlertedBets(path))), (False, True))
+        path.write_text("not json")
+        self.assertNotIn("new", AlertedBets(path))                              # a broken file: start again
+
+    def test_a_bet_that_grows_into_an_outlier_keeps_its_one_card(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, arbs_enabled=False)
+
+        def game(stale_home):
+            ev = outlier_event(stale_home, 3.3, start=self.PRE)
+            ev.update(id="e1", sport_key="basketball_nba")
+            return ev
+        self.assertEqual(self.main(t, [game(1.36)], 0).ev_sent, 1)               # +6.7%: a +EV bet
+        [key] = t.evs.open
+        res = self.main(t, [game(1.85)], 60)                                     # an outlier now
+        self.assertEqual((res.out_sent, list(t.outs.open)), (0, [key]))          # the same card, followed on
+        self.assertEqual([m for m, *_ in sent], ["POST"])                        # no pointer edit, no new card
+        self.main(t, [], 120)
+        self.assertEqual([(m, mid) for m, *_, mid in sent], [("POST", "m1"), ("PATCH", "m1")])
+        self.assertTrue(sent[-1][1].startswith("❌ GONE"))
+
+    def test_the_same_parlay_at_another_book_is_not_alerted_again(self):
+        a = ParlayAlerter(self.cfg(Config(one_alert_per_bet=True, webhook_url="https://main")), dry_run=True)
+        a.alerted = _arbbot.AlertedBets(None)
+        legs = [ev_leg(g, {"DK": 2.20}) for g in ("g1", "g2")]
+        [dk] = find_parlays(legs, Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2))
+        fd = replace(dk, book="FD")                                              # the same legs at another book
+        self.assertNotEqual(dk.key, fd.key)
+        self.assertEqual(a.handle([dk], now=1000), 1)
+        a.handle([], now=1060)
+        self.assertEqual(a.handle([fd], now=1120), 0)
+
+    # ---- 6. One results card a day
+    def results(self, **kw):
+        from arbbot import Results
+        cfg = self.cfg(Config(min_ev_pct=3, round_stakes=0, webhook_url="https://main", results_webhook_url="https://r",
+                              pregame_max_age_seconds=10**9, results_daily_only=True), **kw)
+        res = Results(cfg, dry_run=False)
+        sent = []
+        res.send = lambda payload: sent.append(payload["embeds"][0]) or True
+        return cfg, res, sent
+
+    def log(self, cfg, gid, start):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]}, start=start)
+        ev["id"], ev["sport_key"] = gid, "icehockey_nhl"
+        [b] = find_evs([ev], cfg, _parse(start) - timedelta(hours=1))
+        EVAlerter(cfg, dry_run=True).handle([b], now=1000)
+
+    @staticmethod
+    def scores(finals):
+        class Api:
+            def scores(self, sport, days_from=3):
+                return [{"id": g, "completed": True,
+                         "scores": [{"name": "Home", "score": str(h)}, {"name": "Away", "score": str(a)}]}
+                        for g, (h, a) in finals.items()]
+        return Api()
+
+    def test_results_are_graded_but_not_posted_as_they_settle(self):
+        cfg, res, sent = self.results()
+        self.log(cfg, "g1", "2026-10-03T18:00:00Z")
+        self.assertEqual(res.run(self.scores({"g1": (4, 2)}), datetime(2026, 10, 3, 23, 0, tzinfo=timezone.utc)), 0)
+        self.assertEqual(sent, [])
+        self.assertEqual([r["result"] for r in _read(cfg.ev_results_file)], ["win"])   # graded all the same
+
+    def test_one_card_for_the_new_york_day_after_midnight(self):
+        cfg, res, sent = self.results()
+        self.log(cfg, "early", "2026-10-03T04:30:00Z")      # 12:30am Oct 3 in New York: Oct 3
+        self.log(cfg, "g1", "2026-10-03T18:00:00Z")         # 2pm
+        self.log(cfg, "late", "2026-10-04T03:30:00Z")       # 11:30pm Oct 3: still Oct 3
+        self.log(cfg, "next", "2026-10-04T04:10:00Z")       # 12:10am Oct 4: the next day's card
+        day = date(2026, 10, 3)
+        api = self.scores({"early": (1, 0), "g1": (4, 2), "late": (3, 1)})
+        res.daily(api, day, datetime(2026, 10, 4, 4, 40, tzinfo=timezone.utc))   # 12:40am New York
+        [card] = sent
+        self.assertTrue(card["title"].startswith("📅 Results for Sat Oct 3 · 3-0"), card["title"])
+        self.assertIn("**All:** 3-0", card["description"])
+        self.assertIn("staked (ROI", card["description"])
+        self.assertEqual(card["description"].count("Home ML"), 3)                 # not the 12:10am game
+
+    def test_the_card_waits_for_a_late_game_until_1am(self):
+        cfg, res, sent = self.results()
+        self.log(cfg, "g1", "2026-10-03T18:00:00Z")
+        self.log(cfg, "late", "2026-10-04T03:30:00Z")       # 11:30pm: still playing at 12:30am
+        day, api = date(2026, 10, 3), self.scores({"g1": (4, 2)})
+        res.daily(api, day, datetime(2026, 10, 4, 4, 35, tzinfo=timezone.utc))   # 12:35am: waits
+        self.assertEqual((sent, res.recap_days), ([], []))                       # (still owed: tried again later)
+        res.daily(api, day, datetime(2026, 10, 4, 5, 0, tzinfo=timezone.utc))    # 1:00am: goes out anyway
+        [card] = sent
+        self.assertIn("⏳ 1 still to finish", card["description"])
+        res.recap_tried = 0
+        self.assertFalse(res.recap_due(day))                                     # one card for the day
+        self.assertEqual((_arbbot.RECAP_AT, _arbbot.RECAP_LATEST), (dtime(0, 30), dtime(1, 0)))
+
+    def test_the_card_has_the_days_closing_line_value(self):
+        from arbbot import day_clv_line
+        rows = [{"clv_pct": "2.0"}, {"clv_pct": "-1.0"}, {"clv_pct": "5.0"}, {"clv_pct": ""}]
+        self.assertEqual(day_clv_line(rows), "📐 **CLV:** avg +2.0% · beat the close on 67% (3 bets)")
+        self.assertEqual(day_clv_line([{"clv_pct": ""}]), "")
 
 
 if __name__ == "__main__":

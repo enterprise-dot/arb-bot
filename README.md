@@ -36,6 +36,7 @@ python arbbot.py --post-guide
   The headline edge is always for the stakes printed, after rounding.
 - **Live arbs are marked 🔴 LIVE** and need a bigger edge (1%; 5% in locks mode). They can go to
   their own channel (`DISCORD_LIVE_WEBHOOK_URL`) or be turned off (`ARB_LIVE=false`).
+- **All arbs can be turned off** (`ARBS_ENABLED=false`): main lines and props. Everything else is unchanged.
 - **After-tax line (optional, off by default).** Set `TAX_RATE` to your tax rate as a fraction
   (`0.33`) and each arb card adds a rough after-tax profit: "🧾 After tax (~33%): about +$1.70 per
   $100". The simple model: the winning bet's winnings are taxed, and the losing stakes are
@@ -534,10 +535,23 @@ rule holds when a bet turns from +EV into an outlier or back (its old card point
 the new card pings you only if its edge is 2.5 points better than the edge you were last pinged
 for; otherwise it goes up without the ping.
 
+**One alert per bet (`ONE_ALERT_PER_BET=true`).** A bet goes out once. A better price later, the same bet
+at another book, or the bet turning into an outlier never sends a second alert, and the card isn't edited
+to show the better price: you bet it once, at the stake shown. The bot remembers every bet it has alerted
+(`state/alerted_bets.json`) until a day after its game, so a restart or an update doesn't send any of them
+again. The card is still marked GONE when the price goes.
+
+**Sportsbook pings (`BOOK_ROLES`).** Give each sportsbook a Discord role and list them:
+`BOOK_ROLES=DraftKings=<role id>,FanDuel=<role id>`. Each new +EV, prop, outlier and parlay card then pings
+the role of the book it's at, and nothing else (no @everyone). Edits never ping. A book with no role pings
+nobody. Adding a book later is one more `Book=id` entry.
+
 **Is it working? (what hit)** Every +EV, outlier, prop and parlay alert is logged. As games
 finish, the bot grades them with the final scores (`ev_results.csv`) and posts each result to a
 **results channel**: ✅ won / ❌ lost / ➖ push with the profit at the stake shown, plus the day's
-record so far. Every morning it posts the whole previous day. Parlays are graded leg by leg (a
+record so far. Every morning it posts the whole previous day. With `RESULTS_DAILY_ONLY=true` there are no
+posts as bets settle: one card per New York day (by game start) goes out between 12:30 and 1:00am, once the
+day's games are graded, with the record, profit, amount staked, ROI, each alert type and the day's CLV. Parlays are graded leg by leg (a
 pushed leg drops out, like at the books). Grading main lines costs 2 credits per sport with a
 finished bet, at most every `RESULTS_MINUTES` (30).
 

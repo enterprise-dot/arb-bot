@@ -27,7 +27,8 @@ def main() -> int:
     url = webhook()
     if not url or len(sys.argv) < 2:
         return 0
-    req = urllib.request.Request(url, data=json.dumps({"content": sys.argv[1][:1900]}).encode(), method="POST",
+    body = json.dumps({"username": "EV BOT", "content": sys.argv[1][:1900]}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json", "User-Agent": "arbbot/3.0 (update)"})
     try:
         urllib.request.urlopen(req, timeout=10).close()

@@ -59,7 +59,7 @@ This is the link the bot uses to post alerts into a Discord channel.
    **Create Channel**.
 3. Hover over the new channel, click the **⚙️ gear** (Edit Channel), then **Integrations** →
    **Webhooks** → **New Webhook**.
-4. Click the new webhook, rename it **Arb Bot**, then click **Copy Webhook URL**.
+4. Click the new webhook, rename it **EV BOT**, then click **Copy Webhook URL**.
    It looks like `https://discord.com/api/webhooks/123.../abc...`
 5. Click **Save Changes**.
 6. **Phone alerts:** in the Discord app on your phone, long-press the `#arbs` channel →
