@@ -420,6 +420,11 @@ class Config:
     # 24h can't be checked at full speed, these aren't checked at all before anything else slows down. They come
     # back once everything fits in 90% of the day's credits again. Empty = off.
     shed_sports: str = ""
+    # ✅ bet tracking (DISCORD_BOT_TOKEN, a Discord bot's token; set it on the server with --set, never in remote.env):
+    # the bot puts a ✅ under each new bet card, reads who tapped it every REACTION_MINUTES until the game starts,
+    # and the results card reports the bets members actually took.
+    discord_bot_token: str = ""
+    reaction_minutes: int = 10
     tune_slow_still_pct: float = 40.0
     tune_slow_bets: int = 30
     tune_slow_extra_pct: float = 2.0
@@ -677,6 +682,8 @@ class Config:
             results_daily_only=e("RESULTS_DAILY_ONLY", "false").lower() in ("1", "true", "yes"),
             tune_enabled=e("TUNE_ENABLED", "false").lower() in ("1", "true", "yes"),
             shed_sports=e("SHED_SPORTS", "").strip().lower(),
+            discord_bot_token=e("DISCORD_BOT_TOKEN", "").strip(),
+            reaction_minutes=num("REACTION_MINUTES", d.reaction_minutes, int),
             tune_slow_still_pct=num("TUNE_SLOW_STILL_PCT", d.tune_slow_still_pct, float),
             tune_slow_bets=num("TUNE_SLOW_BETS", d.tune_slow_bets, int),
             tune_slow_extra_pct=num("TUNE_SLOW_EXTRA_PCT", d.tune_slow_extra_pct, float),
@@ -2398,6 +2405,7 @@ class Alerter:
     on_open = None  # optional callback(item, first_seen) when a brand-new alert goes out (markouts)
     on_held = None  # optional callback(item, why, now) when the caps or live rules hold one back (weekly card)
     on_candidate = None  # optional callback(item, decision, now, post_delay) for the candidate log (bets)
+    on_posted = None     # optional callback(log row, message id, webhook) when a bet's card goes up (✅ tracking)
     log_on_open = False  # arbs are logged when they close, so the row has how long it lasted
     log_held = True      # arbs the caps or live rules held back go in the log too, with the reason
 
@@ -2751,6 +2759,11 @@ class Alerter:
             self.alerted.add(self.bet_identity(op.arb), self.bet_expires(op.arb), now)
         if self.once:
             op.sent_item, op.render = op.arb, self.payload
+        if self.on_posted and op.message_id and not self.dry_run:
+            try:
+                self.on_posted({"first_seen": _utc(op.first_seen), **self.row(op)}, op.message_id, op.url)
+            except Exception as e:  # noqa: BLE001 - ✅ tracking must never hold up an alert
+                print(f"  ! ✅ tracking: {e!r:.150}", file=sys.stderr)
         if not op.sent:
             op.sent = True
             if self.log_on_open:
@@ -6930,8 +6943,10 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
                                  if graded else "")
     arbs = arbs_on(cfg, day)
     clv = day_clv_line(day_rows)
+    members = members_lines(cfg, day_rows)
     desc = (body + DIVIDER + f"**{day:%a %b %-d}** (every alert at the stake it showed)\n"
-            + day_summary(day_rows, cfg, now) + (f"\n{clv}" if clv else "") + (f"\n{arbs}" if arbs else ""))
+            + day_summary(day_rows, cfg, now) + (f"\n{clv}" if clv else "") + (f"\n{arbs}" if arbs else "")
+            + (f"\n\n{members}" if members else ""))
     color = 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else GREY)
     return _card(title, desc, color,
                  footer="Results assume every alert was bet at the stake shown. Props are graded from the box "
@@ -7221,6 +7236,208 @@ class Results:
         self.weekly_days = sorted(set(self.weekly_days) | {day.isoformat()})[-8:]
         self._save(now)
         return "sent"
+
+
+# --------------------------------------------------------------------------- ✅ bet tracking (DISCORD_BOT_TOKEN)
+
+DISCORD_API = "https://discord.com/api/v10"
+TAKEN = "✅"
+TAKEN_GRACE = 1800   # seconds after kickoff a ✅ still counts (a bet placed right at the start), then it's final
+
+
+def _bot_api(token: str, method: str, path: str) -> dict | list | None:
+    """One Discord API call as the bot. A "slow down" (429) is waited out, twice at most, up to 10s each."""
+    req = urllib.request.Request(DISCORD_API + path, method=method, data=b"" if method == "PUT" else None,
+                                 headers={"Authorization": f"Bot {token}", "Content-Type": "application/json",
+                                          "User-Agent": "DiscordBot (https://github.com/joeybuffo10-wq/arb-bot, 3.0)"})
+    for _ in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read()
+                return json.loads(body) if body else None
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                raise
+            try:
+                wait = float(e.headers.get("Retry-After", "1"))
+            except (TypeError, ValueError):
+                wait = 1.0
+            time.sleep(min(wait, 10.0))
+    return None
+
+
+def row_bet_id(row: dict) -> str:
+    """A logged row's bet id, as results use it (a parlay's from its legs)."""
+    if "legs_json" in row:
+        row = _parlay_row(row) or row
+    return _bet_id(row)
+
+
+def taken_path(cfg: Config) -> Path | None:
+    return data_path(cfg.state_dir) / "taken_bets.json" if cfg.state_dir else None
+
+
+def read_taken(cfg: Config) -> dict[str, dict]:
+    """{bet id: {"start": game start, "users": {user id: name}}}: who ✅'d each bet card ({} before any)."""
+    path = taken_path(cfg)
+    try:
+        return json.loads(path.read_text()) if path and path.exists() else {}
+    except (OSError, ValueError):
+        return {}
+
+
+class BetReactions:
+    """✅ bet tracking. Each new bet card (+EV, props, outliers, parlays) gets a ✅ from the bot; members tap it
+    when they place the bet. Every REACTION_MINUTES the bot reads who tapped it, until TAKEN_GRACE after the
+    game starts (taking it back before then counts), and keeps that in state/taken_bets.json for the results
+    card. Off without DISCORD_BOT_TOKEN, and for --once, --demo and --dry-run. Needs the bot in the server with
+    View Channel, Read Message History and Add Reactions in the bet channels."""
+
+    def __init__(self, cfg: Config, off: bool = False):
+        self.cfg = cfg
+        self.token = cfg.discord_bot_token
+        self.on = bool(self.token and cfg.state_dir and not off)
+        self.msg_path = data_path(cfg.state_dir) / "bet_messages.json" if self.on else None
+        self.messages: dict[str, dict] = {}   # message id -> {"bet", "channel", "start"}: cards still being read
+        self.channels: dict[str, str] = {}    # webhook URL -> its channel id
+        self.me = ""                          # the bot's own user id (its ✅ isn't a member's)
+        self.last = 0.0
+        self.warned: set[str] = set()         # problems said once (console)
+        if self.msg_path and self.msg_path.exists():
+            try:
+                self.messages = json.loads(self.msg_path.read_text())
+            except (OSError, ValueError):
+                self.messages = {}
+
+    def _say(self, key: str, text: str) -> None:
+        if key not in self.warned:
+            self.warned.add(key)
+            print(f"  ! ✅ tracking: {text}", file=sys.stderr, flush=True)
+
+    def _save(self) -> None:
+        if not self.msg_path:
+            return
+        try:
+            self.msg_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.msg_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.messages))
+            tmp.replace(self.msg_path)
+        except OSError as e:
+            self._say("save", f"couldn't save the bet cards ({e})")
+
+    def channel(self, webhook: str) -> str:
+        """The channel a webhook posts in (asked once: a webhook's own URL says, no token needed)."""
+        if webhook not in self.channels:
+            req = urllib.request.Request(webhook, headers={"User-Agent": "arbbot/3.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.channels[webhook] = json.loads(resp.read())["channel_id"]
+        return self.channels[webhook]
+
+    def add(self, row: dict, message_id: str, webhook: str) -> None:
+        """A bet card went up: put the ✅ under it and start reading it."""
+        if not self.on:
+            return
+        channel = self.channel(webhook)
+        self.messages[message_id] = {"bet": row_bet_id(row), "channel": channel,
+                                     "start": row.get("commence_time") or _parlay_row(row)["commence_time"]}
+        self._save()
+        try:
+            _bot_api(self.token, "PUT", f"/channels/{channel}/messages/{message_id}/reactions/"
+                                        f"{urllib.parse.quote(TAKEN)}/@me")
+        except urllib.error.HTTPError as e:
+            self._say(f"add{e.code}", f"couldn't add the ✅ (Discord said {e.code}): give the bot Add Reactions "
+                                      "and Read Message History in the bet channels")
+
+    def users(self, channel: str, message_id: str) -> dict[str, str]:
+        """{user id: name} of the members who ✅'d a card (not the bot itself, nor other bots)."""
+        out, after = {}, ""
+        while True:
+            page = _bot_api(self.token, "GET", f"/channels/{channel}/messages/{message_id}/reactions/"
+                                               f"{urllib.parse.quote(TAKEN)}?limit=100" + (f"&after={after}" if after else ""))
+            if not page:
+                return out
+            for u in page:
+                if u.get("id") != self.me and not u.get("bot"):
+                    out[u["id"]] = u.get("global_name") or u.get("username") or u["id"]
+            if len(page) < 100:
+                return out
+            after = page[-1]["id"]
+
+    def due(self) -> bool:
+        return self.on and bool(self.messages) and time.time() - self.last >= self.cfg.reaction_minutes * 60
+
+    def tick(self, now: datetime | None = None) -> int:
+        """Read every card still open to ✅s; returns how many bets have at least one taker now."""
+        now = now or datetime.now(timezone.utc)
+        self.last = time.time()
+        if not self.me:
+            try:
+                self.me = (_bot_api(self.token, "GET", "/users/@me") or {}).get("id", "")
+            except urllib.error.HTTPError as e:
+                self._say(f"me{e.code}", f"Discord turned the bot token down ({e.code}): check DISCORD_BOT_TOKEN")
+                return 0
+        taken = read_taken(self.cfg)
+        for mid, m in list(self.messages.items()):
+            start = _parse_time(m["start"])
+            try:
+                users = self.users(m["channel"], mid)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:   # the card was deleted: nothing more to read
+                    self.messages.pop(mid)
+                    continue
+                self._say(f"read{e.code}", f"couldn't read the ✅s (Discord said {e.code}): give the bot View "
+                                           "Channel and Read Message History in the bet channels")
+                continue
+            except OSError as e:
+                self._say("net", f"couldn't reach Discord ({e!r:.100}); trying again later")
+                break
+            entry = taken.setdefault(m["bet"], {"start": m["start"], "users": {}})
+            # Several cards of one bet (a hand-over): anyone who took it on any of them took it.
+            entry.setdefault("cards", {})[mid] = users
+            entry["users"] = {u: n for card in entry["cards"].values() for u, n in card.items()}
+            if now.timestamp() > start.timestamp() + TAKEN_GRACE:
+                self.messages.pop(mid)   # the game's on: what it says now is final
+        keep = now - timedelta(days=self.cfg.log_keep_days or 3650)
+        taken = {b: e for b, e in taken.items() if e["users"] and _parse_time(e["start"]) > keep}
+        path = taken_path(self.cfg)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(taken))
+            tmp.replace(path)
+        except OSError as e:
+            self._say("taken", f"couldn't save who took what ({e})")
+        self._save()
+        return sum(1 for e in taken.values() if e["users"])
+
+
+def members_lines(cfg: Config, rows: list[dict]) -> str:
+    """The results card's ✅ part for these bets: how many members took, their record at the card's stake in
+    units, and the top three ("" when nobody ✅'d any of them)."""
+    taken = read_taken(cfg)
+    took = [(r, taken[_bet_id(r)]["users"]) for r in rows if taken.get(_bet_id(r), {}).get("users")]
+    if not took:
+        return ""
+    unit = cfg.unit() or 1.0
+    people: dict[str, list] = {}
+    graded = []
+    for r, users in took:
+        for uid, name in users.items():
+            people.setdefault(uid, [name, 0.0, 0])
+            if r.get("result") in ("win", "loss", "push") and not r.get("manual_legs"):
+                people[uid][1] += float(r["profit"]) / unit
+                people[uid][2] += 1
+                graded.append(r)
+    w = sum(r["result"] == "win" for r in graded)
+    l = sum(r["result"] == "loss" for r in graded)
+    total = sum(p[1] for p in people.values())
+    line = (f"👥 **Members took {len(took)} of {len(rows)} alerts** ({sum(len(u) for _, u in took)} bets by "
+            f"{len(people)} {'person' if len(people) == 1 else 'people'})"
+            + (f" · {w}-{l} · {total:+.1f}u" if graded else ""))
+    top = sorted((p for p in people.values() if p[2]), key=lambda p: -p[1])[:3]
+    if top:
+        line += "\n" + " · ".join(f"{name} {u:+.1f}u ({n})" for name, u, n in top)
+    return line
 
 
 def _list_games(source: str, sport: str, days: list) -> list[tuple[str, str, str, bool]]:
@@ -9861,6 +10078,11 @@ class Trackers:
                                    else data_path(cfg.state_dir) / "alerted_bets.json")
         for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays):
             a.alerted = self.alerted
+        # ✅ bet tracking (DISCORD_BOT_TOKEN; not --once, --demo or --dry-run).
+        self.reactions = BetReactions(cfg, off)
+        if self.reactions.on:
+            for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays):
+                a.on_posted = self.reactions.add
         # Bets that came close and what happened to them (CANDIDATE_LOG_FILE; not for --once, --demo or --dry-run).
         self.candidates = CandidateLog(replace(cfg, candidate_log_file="") if off else cfg)
         for a in (self.evs, self.outs, self.prop_evs, self.prop_outs):
@@ -10370,6 +10592,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         if (not args.once and cfg.summary_hour >= 0 and local.hour >= cfg.summary_hour and local.weekday() == 0
                 and results.weekly_due(local.date())):
             results.weekly(local.date(), now, t.held.days)   # Monday: last week's report card, once
+        if not args.once and t.reactions.due():
+            try:
+                t.reactions.tick(now)
+            except Exception as e:  # noqa: BLE001 - ✅ tracking must never stop the bot
+                print(f"  ! ✅ tracking failed: {e!r:.200}", file=sys.stderr)
         if not args.once and results.due():
             n_res = results.tick(api, now)
             if n_res:

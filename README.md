@@ -554,6 +554,11 @@ changes for it. Settings: `TUNE_*` in `.env.example`.
 speed, those sports stop being checked before anything else slows down, and the health channel says so. They come
 back once everything fits with 10% to spare.
 
+**✅ bet tracking (`DISCORD_BOT_TOKEN`).** With a Discord bot's token set on the server, every new bet card gets a ✅.
+Members tap it when they place the bet (and can take it back until the game starts). The nightly results card then
+adds "👥 Members took 7 of 12 alerts · 5-2 · +3.1u" and the top three members, in units at each card's stake.
+Who took what is kept in `state/taken_bets.json` on the server.
+
 **Test channel (`DISCORD_TEST_WEBHOOK_URL`).** `arbbot.py --set-webhook test` sets a private channel for
 `--test-discord`: each alert type that's on sends a sample there, pinging its book's role like a real alert.
 

@@ -1,6 +1,7 @@
 import math
 import statistics
 import time
+import json
 import unittest
 import urllib.error
 from dataclasses import replace
@@ -13212,6 +13213,96 @@ class EVBotSpec(MixFiles):
         real = _arbbot.sample_payloads(replace(cfg, test_webhook_url=""))       # no test channel: real channels,
         self.assertEqual({p.get("content", "") for p, _, _ in real}, {""})      # nobody pinged
         self.assertIn("https://ev", {url for _, url, _ in real})
+
+    # ---- 8. ✅ bet tracking
+    def discord_api(self, reactions, calls):
+        """A fake Discord API: reactions = {message id: [user dicts]} (a list, or an HTTP error code)."""
+        import urllib.error
+
+        def api(token, method, path):
+            calls.append((method, path))
+            if path == "/users/@me":
+                return {"id": "bot1"}
+            if method == "PUT":
+                return None
+            mid = path.split("/messages/")[1].split("/")[0]
+            got = reactions.get(mid, [])
+            if isinstance(got, int):
+                raise urllib.error.HTTPError(path, got, "no", {}, None)
+            return got
+        return api
+
+    def tracked(self, sent, **kw):
+        t = self.live(sent, discord_bot_token="tok", **kw)
+        t.reactions.channels = {"https://main": "chan1"}
+        return t
+
+    def test_each_new_bet_card_gets_a_tick_and_its_takers_are_read(self):
+        from unittest import mock
+        sent, calls = [], []
+        member = {"id": "u1", "username": "joey", "global_name": "Joey"}
+        reactions = {"m1": [{"id": "bot1", "bot": True}, member, {"id": "x9", "username": "otherbot", "bot": True}]}
+        with mock.patch("arbbot._bot_api", self.discord_api(reactions, calls)):
+            t = self.tracked(sent, one_alert_per_bet=True, outliers_enabled=False)
+            self.main(t, [self.game({"B": 2.20})], 0)
+            self.assertEqual(calls, [("PUT", "/channels/chan1/messages/m1/reactions/%E2%9C%85/@me")])
+            bid = "e1|h2h|Home|"
+            self.assertEqual(t.reactions.messages["m1"]["bet"], bid)
+            self.assertEqual(t.reactions.tick(at(60)), 1)
+            self.assertEqual(_arbbot.read_taken(t.cfg)[bid]["users"], {"u1": "Joey"})   # not the bots
+            reactions["m1"] = [{"id": "bot1", "bot": True}]                              # taken back before kickoff
+            t.reactions.tick(at(120))
+            self.assertEqual(_arbbot.read_taken(t.cfg), {})
+            reactions["m1"] = [member]
+            again = self.tracked([], one_alert_per_bet=True, outliers_enabled=False)    # restart: still reading it
+            self.assertIn("m1", again.reactions.messages)
+            after = _parse(self.PRE) + timedelta(minutes=31)
+            again.reactions.tick(after)                                                 # game on: final, done
+            self.assertEqual(again.reactions.messages, {})
+            self.assertEqual(_arbbot.read_taken(t.cfg)[bid]["users"], {"u1": "Joey"})
+
+    def test_tracking_is_off_without_a_token_or_in_a_test_run(self):
+        sent = []
+        t = self.live(sent)
+        self.assertFalse(t.reactions.on)
+        self.assertIsNone(t.evs.on_posted)
+        dry = _arbbot.Trackers(self.cfg(Config(discord_bot_token="tok")), self.args(dry_run=True))
+        self.assertFalse(dry.reactions.on)
+
+    def test_discord_problems_never_stop_the_bot(self):
+        from unittest import mock
+        sent, calls = [], []
+        reactions = {"m1": 403, "m2": 404}
+        with mock.patch("arbbot._bot_api", self.discord_api(reactions, calls)):
+            t = self.tracked(sent, one_alert_per_bet=True, outliers_enabled=False)
+            self.main(t, [self.game({"B": 2.20}), self.game({"B": 2.20}, ev_id="e2")], 0)
+            self.assertEqual(t.reactions.tick(at(60)), 0)
+            self.assertEqual(list(t.reactions.messages), ["m1"])      # 403: kept to try again; 404 (deleted): dropped
+        boom = mock.patch("arbbot._bot_api", side_effect=OSError("down"))
+        with boom:
+            t2 = self.tracked(sent, one_alert_per_bet=True, outliers_enabled=False)
+            self.main(t2, [self.game({"B": 2.20}, ev_id="e3")], 0)   # the card still went out
+        self.assertEqual(sent[-1][0], "POST")
+
+    def test_the_results_card_shows_what_members_took(self):
+        cfg, res, sent = self.results()
+        self.log(cfg, "g1", "2026-10-03T18:00:00Z")
+        self.log(cfg, "g2", "2026-10-03T20:00:00Z")
+        self.log(cfg, "g3", "2026-10-03T22:00:00Z")
+        Path(cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        _arbbot.taken_path(cfg).write_text(json.dumps({
+            "g1|h2h|Home|": {"start": "2026-10-03T18:00:00Z", "users": {"u1": "Joey", "u2": "Sam"}},
+            "g2|h2h|Home|": {"start": "2026-10-03T20:00:00Z", "users": {"u1": "Joey"}}}))
+        res.daily(self.scores({"g1": (4, 2), "g2": (1, 3), "g3": (5, 0)}), date(2026, 10, 3),
+                  datetime(2026, 10, 4, 4, 40, tzinfo=timezone.utc))
+        [card] = sent
+        unit = cfg.unit()
+        stake = float(_read(cfg.ev_log_file)[0]["stake"])
+        win, loss = stake * 1.2 / unit, -stake / unit
+        self.assertIn(f"👥 **Members took 2 of 3 alerts** (3 bets by 2 people) · 2-1 · {2 * win + loss:+.1f}u",
+                      card["description"])
+        self.assertIn(f"Sam {win:+.1f}u (1) · Joey {win + loss:+.1f}u (2)", card["description"])
+        self.assertEqual(_arbbot.members_lines(cfg, []), "")
 
     # ---- Tuning from the record (TUNE_ENABLED)
     def tuned(self, markouts=(), clv=(), **kw):
