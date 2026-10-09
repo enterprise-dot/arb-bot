@@ -1340,6 +1340,43 @@ class Budget(unittest.TestCase):
         self.assertAlmostEqual(spend, s.allowance, delta=1)
         self.assertGreater(s.interval(LIVE), 60)
 
+    def test_soccer_goes_first_when_credits_are_tight(self):
+        # SHED_SPORTS=soccer: NBA games all day plus a soccer slate. Tight: soccer isn't checked at all, and the NBA
+        # keeps more of its speed. Plenty: everything is checked. Back only with 10% to spare.
+        cfg = Config(sports=["basketball_nba", "soccer_epl", "soccer_italy_serie_a"], props_enabled=False,
+                     early_minutes=1, shed_sports="soccer")
+        games = {"basketball_nba": [(f"g{i}", NOW + timedelta(hours=2 * i)) for i in range(12)],
+                 "soccer_epl": [("s1", NOW + timedelta(hours=3))], "soccer_italy_serie_a": [("s2", NOW + timedelta(hours=5))]}
+        roomy = sched_with(games, cfg, remaining=5_000_000)
+        roomy.update_budget(NOW)
+        self.assertEqual(roomy.shed, set())
+        self.assertTrue(roomy.lanes("soccer_epl", NOW))
+        tight = sched_with(games, cfg, remaining=20_000)
+        tight.update_budget(NOW)
+        self.assertEqual(tight.shed, {"soccer_epl", "soccer_italy_serie_a"})
+        self.assertEqual((tight.lanes("soccer_epl", NOW), tight.due(NOW)), ([], ["basketball_nba"]))
+        nba_only = sched_with({"basketball_nba": games["basketball_nba"]}, replace(cfg, sports=["basketball_nba"]),
+                              remaining=20_000)
+        nba_only.update_budget(NOW)
+        self.assertAlmostEqual(tight.forecast, nba_only.forecast, delta=1)        # all of it goes to the NBA
+        off = sched_with(games, replace(cfg, shed_sports=""), remaining=20_000)
+        off.update_budget(NOW)
+        self.assertEqual(off.shed, set())                                          # (not set: never)
+
+    def test_shed_sports_come_back_only_with_room_to_spare(self):
+        cfg = Config(sports=["basketball_nba", "soccer_epl"], props_enabled=False, early_minutes=1, shed_sports="soccer")
+        s = sched_with({"basketball_nba": [("g1", NOW + timedelta(hours=3))], "soccer_epl": [("s1", NOW + timedelta(hours=3))]},
+                       cfg, remaining=10**7)
+        s.update_budget(NOW)
+        need = s.forecast
+        s.shed = {"soccer_epl"}                                                    # left out earlier today
+        s.next24_share = lambda now: need / 0.95 / (s.api.remaining * 0.98)       # fits, but not with 10% to spare
+        s.update_budget(NOW)
+        self.assertEqual(s.shed, {"soccer_epl"})
+        s.next24_share = lambda now: need / 0.85 / (s.api.remaining * 0.98)       # 15% to spare: back
+        s.update_budget(NOW)
+        self.assertEqual(s.shed, set())
+
     def test_early_checks_stretch_before_live_ones(self):
         # One live game plus lots of far-out games: the far-out checks slow down, live stays at 60s.
         cfg = Config(sports=["basketball_nba", "icehockey_nhl"], props_enabled=False, early_minutes=1)
@@ -2527,6 +2564,10 @@ class PropGrading(unittest.TestCase):
         self.assertEqual(grade_prop(bills_row(player="Khalil Shakir", market="player_anytime_td", outcome="Yes",
                                               point=""))[0][0], "win")                     # no rushing line: 0 + 1
         self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_pass_completions", point="21.5"))[1], "22")
+        # Rushing and receiving touchdowns (Oct 9): the same columns an anytime TD adds up.
+        self.assertEqual(grade_prop(bills_row(player="Josh Allen", market="player_rush_tds", point="0.5"))[1], "1")
+        self.assertEqual(grade_prop(bills_row(player="James Cook", market="player_rush_tds", point="0.5"))[0][0], "loss")
+        self.assertEqual(grade_prop(bills_row(player="James Cook", market="player_reception_tds", point="0.5"))[1], "1")
         dodgers = self.dodgers
         self.assertEqual(grade_prop(dodgers(player="Shohei Ohtani", market="batter_hits", point="1.5"))[1], "2")
         self.assertEqual(grade_prop(dodgers(player="Yoshinobu Yamamoto", market="pitcher_strikeouts", point="7.5"))[1], "9")
@@ -5121,7 +5162,7 @@ class LiveAlertsHoldUp(MixFiles):
         from unittest import mock
         sent = []
         env = {"DISCORD_WEBHOOK_URL": "https://discord.example/hook", "ALERT_MODE": "locks", "STATE_DIR": "",
-               "LOG_FILE": ""}
+               "LOG_FILE": "", "REMOTE_SETTINGS": "off"}   # (remote.env has arbs off)
         with mock.patch.dict(os.environ, env), mock.patch.object(sys, "argv", ["arbbot.py", "--test-discord"]), \
                 mock.patch("arbbot.load_dotenv"), mock.patch("arbbot.time.sleep"), \
                 mock.patch("arbbot._webhook", lambda url, payload, *a: sent.append(payload) or {"id": "1"}), \
@@ -12936,6 +12977,10 @@ class PropOutlierBadData(MixFiles):
 from datetime import date, time as dtime   # noqa: E402 (the daily-card tests below)
 
 
+def round_stake_for(stake, cfg):
+    return _arbbot.round_stake(stake, cfg.ev_bankroll * cfg.ev_max_stake_pct / 100, cfg)
+
+
 class EVBotSpec(MixFiles):
     """The Oct 2026 EV BOT changes: sender name, arbs off, book role pings, one alert per bet, one results card
     a day."""
@@ -12949,9 +12994,11 @@ class EVBotSpec(MixFiles):
                               kalshi_check=False), **kw)
         t = _arbbot.Trackers(cfg, self.args(dry_run=False))
         ids = iter(f"m{i}" for i in range(1, 1000))
+        self.bodies = []   # each call's card text, in the same order as sent
         for a in (t.arbs, t.evs, t.outs, t.prop_arbs, t.prop_evs, t.prop_outs, t.parlays):
             def fake(payload, message_id=None, url="", a=a):
                 a.send_retryable = False
+                self.bodies.append(payload["embeds"][0].get("description", ""))
                 mid = message_id or next(ids)
                 sent.append(("PATCH" if message_id else "POST", payload["embeds"][0].get("title", ""),
                              payload.get("content", ""), payload.get("allowed_mentions"), mid))
@@ -12993,6 +13040,12 @@ class EVBotSpec(MixFiles):
         import os
         with mock.patch.dict(os.environ, {"ARBS_ENABLED": "false"}):
             self.assertFalse(Config.from_env().arbs_enabled)
+
+    def test_arbs_off_stops_paying_for_live_checks(self):
+        off = Config(arbs_enabled=False, arb_live=True, ev_live=False, outlier_live=False)
+        self.assertFalse(Scheduler(off, None).wants_live("basketball_nba"))      # nothing live would be posted
+        self.assertTrue(Scheduler(replace(off, arbs_enabled=True), None).wants_live("basketball_nba"))
+        self.assertTrue(Scheduler(replace(off, ev_live=True), None).wants_live("basketball_nba"))
 
     def test_arbs_on_still_alert(self):
         t = _arbbot.Trackers(self.cfg(Config(min_profit_pct=0, alert_mode="balanced")), self.args())
@@ -13052,12 +13105,29 @@ class EVBotSpec(MixFiles):
         t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False)
         self.main(t, [self.game({"B": 2.20})], 0)
         self.main(t, [self.game({"B": 2.50})], 60)                               # +25%: was a new ping
-        self.assertEqual([m for m, *_ in sent], ["POST"])                        # no new alert, no edit
+        self.assertEqual([(m, c) for m, _, c, *_ in sent], [("POST", ""), ("PATCH", "")])   # no new alert...
+        self.assertEqual(sent[1][1], sent[0][1])                                 # ...the card as it went out,
+        self.assertIn("**ODDS: +120**", self.bodies[1])                         # at its odds and stake,
+        self.assertNotIn("+150", self.bodies[1])                                # not the better price
+        self.assertIn("✅ **Still good** at B", self.bodies[1])                  # only its ✅ line is new
+        self.main(t, [self.game({"B": 2.50})], 90)
+        self.assertEqual(len(sent), 2)                                           # nothing changed: no edit
         self.main(t, [], 120)                                                    # gone: GONE as always
-        self.assertEqual([m for m, *_ in sent], ["POST", "PATCH"])
+        self.assertEqual([m for m, *_ in sent], ["POST", "PATCH", "PATCH"])
         self.assertTrue(sent[-1][1].startswith("❌ GONE"))
         self.assertEqual(sent[-1][4], sent[0][4])                                # on the card that went out
         self.assertEqual(len(_read(self.files["ev_log_file"])), 1)               # one bet, logged once
+
+    def test_the_card_says_when_its_price_has_moved_and_when_its_back(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False)
+        self.main(t, [self.game({"B": 2.20, "C": 2.10})], 0)                     # posted for B
+        self.main(t, [self.game({"B": 1.95, "C": 2.10})], 60)                    # B moved; C has it (same bet)
+        self.assertIn("⚠️ **Price moved** at B", self.bodies[-1])
+        self.assertIn("**ODDS: +120**", self.bodies[-1])                        # the card as sent otherwise
+        self.main(t, [self.game({"B": 2.15, "C": 2.10})], 120)                   # back
+        self.assertIn("✅ **Still good** at B", self.bodies[-1])
+        self.assertEqual([(m, c) for m, _, c, *_ in sent], [("POST", "")] + [("PATCH", "")] * 2)   # edits: no ping
 
     def test_without_the_setting_a_better_price_still_realerts(self):
         sent = []
@@ -13082,11 +13152,11 @@ class EVBotSpec(MixFiles):
         sent = []
         t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False)
         self.main(t, [self.game({"B": 2.20}), self.game({"B": 2.20}, ev_id="e2")], 0)
-        self.main(t, [self.game({"B": 2.20}, ev_id="e2")], 60)                   # e1 GONE, e2 still up
-        self.assertEqual([m for m, *_ in sent], ["POST", "POST", "PATCH"])
+        self.main(t, [self.game({"B": 2.20}, ev_id="e2")], 60)                   # e1 GONE, e2 still up (✅)
+        self.assertEqual([m for m, *_ in sent], ["POST", "POST", "PATCH", "PATCH"])
         again = self.live(sent, one_alert_per_bet=True, outliers_enabled=False)   # deploy / restart
         res = self.main(again, [self.game({"B": 2.40}), self.game({"B": 2.40}, ev_id="e2")], 120)
-        self.assertEqual([m for m, *_ in sent], ["POST", "POST", "PATCH"])       # neither alerted again
+        self.assertEqual(len(sent), 4)                                           # neither alerted again
         self.assertEqual(res.held, {"alerted before": 2})
 
     def test_alerted_bets_are_forgotten_a_day_after_their_game(self):
@@ -13111,9 +13181,11 @@ class EVBotSpec(MixFiles):
         [key] = t.evs.open
         res = self.main(t, [game(1.85)], 60)                                     # an outlier now
         self.assertEqual((res.out_sent, list(t.outs.open)), (0, [key]))          # the same card, followed on
-        self.assertEqual([m for m, *_ in sent], ["POST"])                        # no pointer edit, no new card
+        self.assertEqual([m for m, *_ in sent], ["POST", "PATCH"])               # no pointer, no new card:
+        self.assertEqual(sent[1][1], sent[0][1])                                 # still the +EV card as sent,
+        self.assertIn("✅ **Still good** at Stale", self.bodies[1])              # with its ✅ line
         self.main(t, [], 120)
-        self.assertEqual([(m, mid) for m, *_, mid in sent], [("POST", "m1"), ("PATCH", "m1")])
+        self.assertEqual([(m, mid) for m, *_, mid in sent], [("POST", "m1"), ("PATCH", "m1"), ("PATCH", "m1")])
         self.assertTrue(sent[-1][1].startswith("❌ GONE"))
 
     def test_the_same_parlay_at_another_book_is_not_alerted_again(self):
@@ -13126,6 +13198,92 @@ class EVBotSpec(MixFiles):
         self.assertEqual(a.handle([dk], now=1000), 1)
         a.handle([], now=1060)
         self.assertEqual(a.handle([fd], now=1120), 0)
+
+    # ---- 12. The test channel
+    def test_samples_go_to_the_test_channel_and_ping_the_book_role(self):
+        cfg = Config(webhook_url="https://main", ev_webhook_url="https://ev", test_webhook_url="https://test",
+                     arbs_enabled=False, book_roles={"fanduel": "7"}, alert_mode="balanced")
+        samples = _arbbot.sample_payloads(cfg)
+        self.assertEqual({url for _, url, _ in samples}, {"https://test"})
+        self.assertNotIn("arb", [kind for *_, kind in samples])                  # arbs off: no arb sample
+        for payload, _, _ in samples:
+            self.assertTrue(payload["embeds"][0]["title"].startswith("🧪 SAMPLE · "))
+            self.assertEqual(payload["allowed_mentions"]["parse"], [])            # never @everyone
+        real = _arbbot.sample_payloads(replace(cfg, test_webhook_url=""))       # no test channel: real channels,
+        self.assertEqual({p.get("content", "") for p, _, _ in real}, {""})      # nobody pinged
+        self.assertIn("https://ev", {url for _, url, _ in real})
+
+    # ---- Tuning from the record (TUNE_ENABLED)
+    def tuned(self, markouts=(), clv=(), **kw):
+        from unittest import mock
+        cfg = self.cfg(Config(min_ev_pct=3, max_ev_pct=100, round_stakes=0, tune_enabled=True), **kw)
+        with mock.patch("arbbot.markout_rows", return_value=list(markouts)), \
+                mock.patch("arbbot.clv_rows", return_value=list(clv)):
+            return cfg, _arbbot.Tuning.load(cfg)
+
+    @staticmethod
+    def still(book, ok, n, player=""):
+        return [{"kind": "ev", "book": book, "player": player, "still_ok": "1" if i < ok else "0"} for i in range(n)]
+
+    @staticmethod
+    def clv(book, sport_key, values, player=""):
+        return [{"book": book, "sport_key": sport_key, "player": player, "clv_pct": v} for v in values]
+
+    def test_a_book_whose_price_is_usually_gone_needs_more_edge(self):
+        cfg, tuning = self.tuned(self.still("B", 10, 30) + self.still("C", 25, 30))   # B 33%, C 83%
+        evs = find_evs([self.game({"B": 2.08, "C": 2.08})], cfg, NOW)
+        b = next(x for x in evs if x.book == "B")
+        a = EVAlerter(cfg, dry_run=True)
+        self.assertEqual(_arbbot.tune_bets([b], cfg, tuning, (a,)), [])           # +4% < 3% + 2
+        self.assertEqual(a.held_counts, {"tuned out": 1})
+        big = find_evs([self.game({"B": 2.12})], cfg, NOW)                       # +6%: enough
+        self.assertEqual(len(_arbbot.tune_bets(big, cfg, tuning, (a,))), 1)
+        self.assertEqual(tuning.extra_edge(cfg, b)[0], 2.0)
+        c = replace(b, book="C")
+        self.assertEqual(tuning.extra_edge(cfg, c), (0.0, ""))
+        few, tuning2 = self.tuned(self.still("B", 0, 29))                          # under 30 bets: no verdict
+        self.assertEqual(tuning2.slow, {})
+
+    def test_a_card_already_up_is_never_tuned(self):
+        cfg, tuning = self.tuned(self.still("B", 0, 30))
+        [b] = find_evs([self.game({"B": 2.08})], cfg, NOW)
+        a = EVAlerter(cfg, dry_run=True)
+        a.handle([b], ["basketball_nba"], now=1000)
+        self.assertEqual(_arbbot.tune_bets([b], cfg, tuning, (a,)), [b])
+
+    def test_stakes_follow_proven_clv(self):
+        good = [2.0, 3.0, 2.5, 1.5, 2.2] * 10                                     # 50 bets, clearly above 0
+        bad = [-2.0, -3.0, -2.5, -1.5, -2.2] * 10
+        cfg, tuning = self.tuned(clv=self.clv("B", "basketball_nba", good) + self.clv("C", "icehockey_nhl", bad))
+        [b] = find_evs([self.game({"B": 2.20})], cfg, NOW)
+        before = b.stake
+        [b] = _arbbot.tune_bets([b], cfg, tuning, (EVAlerter(cfg, dry_run=True),))
+        self.assertEqual(b.stake, round_stake_for(before * 1.25, cfg))           # book (and its sport) boost: capped
+        self.assertTrue(b.tune_note.startswith("Stake ×1.25: B beats the close (+2.2% avg CLV, 50 bets)"), b.tune_note)
+        self.assertIn("📊 Stake ×1.25", ev_payload(b)["embeds"][0]["description"])
+        cut = replace(find_evs([self.game({"B": 2.20})], cfg, NOW)[0], book="C", sport_key="icehockey_nhl")
+        self.assertEqual(tuning.stake_mult(cfg, cut)[0], 0.5)
+        mixed = [3.0, -3.0] * 30                                                  # no clear answer: unchanged
+        cfg2, tuning2 = self.tuned(clv=self.clv("B", "basketball_nba", mixed))
+        self.assertEqual(tuning2.boost, {})
+
+    def test_tuning_is_off_unless_set(self):
+        from unittest import mock
+        cfg = self.cfg(Config(min_ev_pct=3))
+        with mock.patch("arbbot.markout_rows", side_effect=AssertionError("not read")):
+            self.assertEqual(_arbbot.Tuning.load(cfg).slow, {})
+        [b] = find_evs([self.game({"B": 2.20})], cfg, NOW)
+        self.assertEqual(_arbbot.tune_bets([b], cfg, _arbbot.Tuning(slow={("b", False): "x"}), ()), [b])
+        for bad in (dict(tune_clv_cut=0), dict(tune_clv_boost=0.9), dict(tune_slow_extra_pct=-1)):
+            with self.assertRaises(ValueError):
+                Config(**bad).check()
+
+    def test_a_bad_log_never_stops_alerts(self):
+        from unittest import mock
+        cfg = self.cfg(Config(tune_enabled=True))
+        with mock.patch("arbbot.markout_rows", side_effect=ValueError("bad row")):
+            t = _arbbot.Tuning.load(cfg)
+        self.assertEqual((t.slow, t.boost), ({}, {}))
 
     # ---- 6. One results card a day
     def results(self, **kw):

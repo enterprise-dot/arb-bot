@@ -176,6 +176,7 @@ WEBHOOK_SETTINGS = {
     "live": ("DISCORD_LIVE_WEBHOOK_URL", "live arbs"),
     "status": ("DISCORD_STATUS_WEBHOOK_URL", "bot health messages"),
     "results": ("DISCORD_RESULTS_WEBHOOK_URL", "bet results (what hit and what missed)"),
+    "test": ("DISCORD_TEST_WEBHOOK_URL", "sample alerts from --test-discord (nothing else)"),
 }
 
 
@@ -409,6 +410,22 @@ class Config:
     # book, not after a restart), and its card isn't edited except to mark it GONE.
     one_alert_per_bet: bool = False
     results_daily_only: bool = False   # results: one card per finished day (~12:30am), none as bets settle
+    # Tuning from the bot's own record (TUNE_ENABLED), by book and by sport, main lines and props apart:
+    # - a book whose price is still there on the next check under TUNE_SLOW_STILL_PCT% of the time (TUNE_SLOW_BETS+
+    #   bets): its new bets need TUNE_SLOW_EXTRA_PCT more edge (you can't get there in time often enough);
+    # - CLV clearly above 0 (TUNE_CLV_BETS+ bets, the 95% range above 0): stake x TUNE_CLV_BOOST; clearly below 0:
+    #   x TUNE_CLV_CUT. A book and a sport both: multiplied, kept between the two.
+    tune_enabled: bool = False
+    # Sports dropped first when credits get tight (SHED_SPORTS=soccer: a prefix covers every league): when the next
+    # 24h can't be checked at full speed, these aren't checked at all before anything else slows down. They come
+    # back once everything fits in 90% of the day's credits again. Empty = off.
+    shed_sports: str = ""
+    tune_slow_still_pct: float = 40.0
+    tune_slow_bets: int = 30
+    tune_slow_extra_pct: float = 2.0
+    tune_clv_bets: int = 50
+    tune_clv_boost: float = 1.25
+    tune_clv_cut: float = 0.5
     # A new alert (or a much better price's re-alert) isn't posted on odds fetched longer ago than this by the
     # time it's ready (a slow pass, Discord making the bot wait): the next check looks again and sends it on its
     # fresh odds, only if it still qualifies. Seconds, before the game / live; 0 = no limit.
@@ -422,6 +439,8 @@ class Config:
     card_edit_min_seconds: int = 0
     status_webhook_url: str = ""  # health messages; defaults to the alerts webhook
     results_webhook_url: str = ""  # graded bets (what hit); defaults to the health channel
+    test_webhook_url: str = ""     # --test-discord's samples go here when set (with real book-role pings); else to
+                                   # the channels real alerts use, without pings
     results_minutes: int = 30     # look for finished games to grade this often (0 = daily only)
     prop_grading: str = "espn"    # grade player props from ESPN box scores ("off" = check them yourself)
     # Main lines are graded from the Odds API's scores (2 credits per sport). "shadow" also asks
@@ -656,6 +675,14 @@ class Config:
             book_roles=parse_book_roles(e("BOOK_ROLES", "")),
             one_alert_per_bet=e("ONE_ALERT_PER_BET", "false").lower() in ("1", "true", "yes"),
             results_daily_only=e("RESULTS_DAILY_ONLY", "false").lower() in ("1", "true", "yes"),
+            tune_enabled=e("TUNE_ENABLED", "false").lower() in ("1", "true", "yes"),
+            shed_sports=e("SHED_SPORTS", "").strip().lower(),
+            tune_slow_still_pct=num("TUNE_SLOW_STILL_PCT", d.tune_slow_still_pct, float),
+            tune_slow_bets=num("TUNE_SLOW_BETS", d.tune_slow_bets, int),
+            tune_slow_extra_pct=num("TUNE_SLOW_EXTRA_PCT", d.tune_slow_extra_pct, float),
+            tune_clv_bets=num("TUNE_CLV_BETS", d.tune_clv_bets, int),
+            tune_clv_boost=num("TUNE_CLV_BOOST", d.tune_clv_boost, float),
+            tune_clv_cut=num("TUNE_CLV_CUT", d.tune_clv_cut, float),
             min_live_profit_pct=num("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct, float),
             live_arb_max_skew=num("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew, int),
             live_confirm_checks=num("LIVE_CONFIRM_CHECKS", d.live_confirm_checks, int),
@@ -674,6 +701,7 @@ class Config:
             card_edit_min_seconds=num("CARD_EDIT_MIN_SECONDS", d.card_edit_min_seconds, int),
             status_webhook_url=e("DISCORD_STATUS_WEBHOOK_URL", ""),
             results_webhook_url=e("DISCORD_RESULTS_WEBHOOK_URL", ""),
+            test_webhook_url=e("DISCORD_TEST_WEBHOOK_URL", ""),
             results_minutes=num("RESULTS_MINUTES", d.results_minutes, int),
             prop_grading=(e("PROP_GRADING") or d.prop_grading).strip().lower(),
             free_scores=(e("FREE_SCORES") or d.free_scores).strip().lower(),
@@ -782,6 +810,12 @@ class Config:
                        ("PROP_MINUTES", self.prop_minutes if self.props_enabled else 1)):
             if v < 1:
                 raise ValueError(f"{key}={v} should be at least 1")
+        if not 0 < self.tune_clv_cut <= 1 <= self.tune_clv_boost:
+            raise ValueError(f"TUNE_CLV_CUT={self.tune_clv_cut:g} should be over 0 and at most 1, "
+                             f"and TUNE_CLV_BOOST={self.tune_clv_boost:g} at least 1")
+        if self.tune_slow_extra_pct < 0 or self.tune_slow_bets < 1 or self.tune_clv_bets < 2:
+            raise ValueError("TUNE_SLOW_EXTRA_PCT can't be negative, TUNE_SLOW_BETS should be at least 1 "
+                             "and TUNE_CLV_BETS at least 2")
         try:
             ZoneInfo(self.timezone)
         except Exception:  # noqa: BLE001 - unknown or malformed names raise several types
@@ -952,7 +986,8 @@ class Config:
                           ("props_webhook_url", "DISCORD_PROPS_WEBHOOK_URL"),
                           ("live_webhook_url", "DISCORD_LIVE_WEBHOOK_URL"),
                           ("status_webhook_url", "DISCORD_STATUS_WEBHOOK_URL"),
-                          ("results_webhook_url", "DISCORD_RESULTS_WEBHOOK_URL")):
+                          ("results_webhook_url", "DISCORD_RESULTS_WEBHOOK_URL"),
+                          ("test_webhook_url", "DISCORD_TEST_WEBHOOK_URL")):
             value = getattr(self, attr)
             if value and not value.startswith(("https://", "http://")):
                 bad.append(env)
@@ -1782,6 +1817,7 @@ MARKET_NAMES = {
     "player_pass_completions": "Pass Completions", "player_pass_attempts": "Pass Attempts",
     "player_pass_interceptions": "Interceptions Thrown", "player_rush_attempts": "Rush Attempts",
     "player_rush_reception_yds": "Rush + Rec Yards", "player_anytime_td": "Anytime TD",
+    "player_rush_tds": "Rushing TDs", "player_reception_tds": "Receiving TDs",
     # NBA
     "player_blocks": "Blocks", "player_steals": "Steals", "player_blocks_steals": "Blocks + Steals",
     "player_turnovers": "Turnovers", "player_points_rebounds_assists": "Pts + Reb + Ast",
@@ -2109,6 +2145,10 @@ class OpenArb:
                               # one): if it closes before its own post lands, that card says GONE
     edited: float = 0.0       # when its card was last posted or edited (CARD_EDIT_MIN_SECONDS)
     shown: tuple = ()         # (book, price, stake) of the bet as its card shows it (an arb: ())
+    # ONE_ALERT_PER_BET: the bet as its card went out, how that card was drawn, and its ✅ / ⚠️ line ("" = none yet)
+    sent_item: object = None
+    render: object = None
+    status: str = ""
 
 
 def data_path(name: str) -> Path:
@@ -2709,6 +2749,8 @@ class Alerter:
             self.on_candidate(op.arb, "alerted", now, op.post_delay)
         if self.once and self.alerted is not None:
             self.alerted.add(self.bet_identity(op.arb), self.bet_expires(op.arb), now)
+        if self.once:
+            op.sent_item, op.render = op.arb, self.payload
         if not op.sent:
             op.sent = True
             if self.log_on_open:
@@ -2827,10 +2869,10 @@ class Alerter:
                     if not cur.sent and not cur.retry:   # (an alert held back until now goes out as this one)
                         self._went_out(cur, now, fetched)
                     new += 1
+                elif self.once and cur.sent:
+                    self.still_good(cur, arb, now)   # (ONE_ALERT_PER_BET: the card stays as sent, but for ✅ / ⚠️)
                 elif changed and self.edit_waits(arb, cur, now):
                     pass   # (only other books' prices or notes changed: edited by a later check, CARD_EDIT_MIN_SECONDS)
-                elif changed and self.once and cur.sent:
-                    pass   # (ONE_ALERT_PER_BET: the card stays as it went out until it's GONE)
                 elif changed or cur.retry:
                     # (A live bet's better price that the live rules hold back: edited, no new ping yet.)
                     if changed:
@@ -2897,6 +2939,19 @@ class Alerter:
         self._expire_restored(now)
         self._save_state()
         return new
+
+    def still_good(self, op: OpenArb, item, now: float) -> None:
+        """ONE_ALERT_PER_BET: a card that went out keeps its bet, stake and odds as sent; only its last line says
+        whether the book it named still has a good price (✅: at least OK_EDGE_PCT of edge against today's fair
+        price) or not (⚠️). Edited when that changes, never pinging. Not for parlays, nor after a restart."""
+        sent = op.sent_item
+        if sent is None or op.render is None or not op.message_id or not hasattr(item, "worst_ok_price"):
+            return
+        price = next((pr for bk, pr, *_ in item.board if bk == sent.book), None)
+        status = "ok" if price is not None and _printed(price) >= _printed(item.worst_ok_price()) else "moved"
+        if status != op.status:
+            op.status, op.edited = status, now
+            self._discord(op.render(sent, first_seen=op.first_seen, status=status), op.message_id, op.url)
 
     def _close(self, key: str, now: float) -> None:
         op = self.open.pop(key)
@@ -3174,6 +3229,7 @@ class EVBet:
                                      # not its main one: the same bet, priced from main lines (book_offers)
     alt_books: set[str] = field(default_factory=set)   # books on the board whose price is their alternate line's
     hedge_alt: set[str] = field(default_factory=set)   # hedge outcomes priced on an alternate line
+    tune_note: str = ""              # TUNE_ENABLED: why its stake was raised or cut by the bot's own record ("" = not)
 
     def worst_ok_price(self, min_edge_pct: float = OK_EDGE_PCT) -> float:
         """Lowest price that still leaves min_edge_pct of edge against the fair price."""
@@ -4239,8 +4295,17 @@ def confidence_line(confidence: str) -> str:
     return f"{icon} Confidence: {word}"
 
 
+# ONE_ALERT_PER_BET: the card's line on its own price since it went out (no numbers: the card stays as sent).
+STATUS_LINES = {"ok": "✅ **Still good** at {book}",
+                "moved": "⚠️ **Price moved** at {book}: not good value now. Wait for ✅ before betting it."}
+
+
+def status_line(status: str, book: str) -> str:
+    return STATUS_LINES[status].format(book=book) if status in STATUS_LINES else ""
+
+
 def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
-                first_seen: float | None = None) -> dict:
+                first_seen: float | None = None, status: str = "") -> dict:
     """+EV card: the game and when first, then the bet itself (stake, odds, pick), then why (fair value,
     sharp prices), then every book. The title (the bet at its book) opens the bet slip."""
     icon = sport_icon(b.sport_key)
@@ -4250,9 +4315,10 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
     game = f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}{_age_note(b.age)}"
     bet = (f"**BET SIZE: {b.stake_label}**\n**ODDS: {odds(b.price)}**\n\n"
            f"**{b.pick}**{ALT_NOTE if b.alt else ''}")
-    parts = []
+    parts = [status_line(status, b.book)] if status else []
     notes = (confidence_line(b.confidence) + kalshi_room_line(b.kalshi_room)
-             + kalshi_tie_note(b.sport_key, b.market, b.book)).strip("\n")
+             + kalshi_tie_note(b.sport_key, b.market, b.book)
+             + (f"\n📊 {b.tune_note}" if b.tune_note else "")).strip("\n")
     if notes:
         parts.append(notes)
     agree, why = confirm_lines(b)
@@ -4301,8 +4367,8 @@ class EVAlerter(Alerter):
     def text(self, item) -> str:
         return format_ev_text(item)
 
-    def payload(self, item, mention="", gone_after=None, first_seen=None) -> dict:
-        return ev_payload(item, mention, gone_after, first_seen)
+    def payload(self, item, mention="", gone_after=None, first_seen=None, status="") -> dict:
+        return ev_payload(item, mention, gone_after, first_seen, status)
 
     def value(self, item) -> float:
         return item.ev_pct
@@ -5446,7 +5512,7 @@ def without_outliers(evs: list[EVBet], outs: list[EVBet]) -> list[EVBet]:
 
 
 def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
-                    first_seen: float | None = None) -> dict:
+                    first_seen: float | None = None, status: str = "") -> dict:
     """Outlier card: bet-now instruction, optional lock-in, then why and every book."""
     icon = sport_icon(b.sport_key)
     if gone_after is not None:
@@ -5457,8 +5523,10 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
         f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**"
         f"{ALT_NOTE if b.alt else ''}\n"
         f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**" + kalshi_room_line(b.kalshi_room)
-        + kalshi_tie_note(b.sport_key, b.market, b.book),
+        + kalshi_tie_note(b.sport_key, b.market, b.book) + (f"\n📊 {b.tune_note}" if b.tune_note else ""),
     ]
+    if status:
+        parts.insert(0, status_line(status, b.book))
     if b.related:
         parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}.")
     if b.hedge:
@@ -5492,8 +5560,8 @@ class OutlierAlerter(EVAlerter):
                   + ", ".join(f"{o} {odds(pr)} on {bk}" for o, bk, pr, _ in item.hedge))
         return t
 
-    def payload(self, item, mention="", gone_after=None, first_seen=None) -> dict:
-        return outlier_payload(item, mention, gone_after, first_seen)
+    def payload(self, item, mention="", gone_after=None, first_seen=None, status="") -> dict:
+        return outlier_payload(item, mention, gone_after, first_seen, status)
 
     def mention(self) -> str:
         return self.cfg.outlier_mention
@@ -6070,6 +6138,9 @@ BOX_STATS = {   # (sport family, prop market) -> columns added together
     ("icehockey", "player_goal_scorer_anytime"): [_G],   # Yes/No: at least one goal
     ("baseball", "batter_hits_runs_rbis"): [_t(("H",), ("hits",), ("batting",)), _t(("R",), ("runs",), ("batting",)),
                                             _t(("RBI",), ("RBIs", "rbis"), ("batting",))],
+    # Oct 9: touchdowns by kind, the same columns as an anytime TD (read like rushing and receiving yards).
+    ("americanfootball", "player_rush_tds"): [_t(("TD",), ("rushingTouchdowns",), ("rushing",))],
+    ("americanfootball", "player_reception_tds"): [_t(("TD",), ("receivingTouchdowns",), ("receiving",))],
 }
 # Optional columns of which at least one must be in the box score: a player in neither group is left to check by hand.
 NEED_ONE = {"player_rush_reception_yds"}
@@ -8490,6 +8561,7 @@ class Scheduler:
         self.props_ok: dict[str, float] = {}    # event id -> last prop check that worked
         self.odds_ok: dict[str, float] = {s: 0.0 for s in cfg.sports}  # sport -> last good odds check
         self.bad_prop_sports: set[str] = set()  # sports whose prop request the API rejected
+        self.shed: set[str] = set()   # SHED_SPORTS left out right now: credits are tight (update_budget)
         self.bad_near_sports: set[str] = set()  # ...and whose near-kickoff extras (PROP_NEAR_MARKETS) it rejected
         self.bad_prop_markets: dict[str, set[str]] = {}   # sport -> PROP_MARKETS types the API rejected (until restart)
         self.notices: list[str] = []            # messages for the health channel (run() sends them)
@@ -8519,7 +8591,8 @@ class Scheduler:
     def wants_live(self, sport: str) -> bool:
         """Is anything live wanted from this sport? (If not, games in progress aren't paid for.)"""
         cfg = self.cfg
-        return bool((cfg.arb_live or (cfg.ev_enabled and cfg.ev_live) or (cfg.outliers_enabled and cfg.outlier_live))
+        return bool(((cfg.arbs_enabled and cfg.arb_live) or (cfg.ev_enabled and cfg.ev_live)
+                     or (cfg.outliers_enabled and cfg.outlier_live))
                     and (not cfg.live_sports or sport in cfg.live_sports))
 
     def live_games(self, sport: str, now: datetime) -> list[str]:
@@ -8538,7 +8611,9 @@ class Scheduler:
         check (LIVE_MARKETS, every game: upcoming games' moneylines come along for the same credit)
         and a "pre" check (the other bet types, games that haven't started), each on its own clock.
         The "pre" check runs every PREGAME_WITH_LIVE_EVERY live checks (PRE_LIVE), unless the normal
-        pre-game pace of its next game is faster."""
+        pre-game pace of its next game is faster. A sport left out for credits (SHED_SPORTS): none."""
+        if sport in self.shed:
+            return []
         if self.split and self.wants_live(sport) and self.live_games(sport, now):
             pre = self.pre_state(sport, now)
             if pre and self.cfg.pregame_with_live_every and self.base_interval(PRE_LIVE) < self.base_interval(pre):
@@ -8697,21 +8772,22 @@ class Scheduler:
         self.overrun = self._overrun()
 
         cost = {lane: self.lane_cost(lane) for lane in LANE_KINDS}
-        demand = dict.fromkeys((LIVE, PRE_LIVE, PREGAME, EARLY, FAR, PROP_NEAR, PROP_NEAR_X, PROP_EARLY), 0.0)
-        for step in range(0, 86400, STEP):
-            t = now + timedelta(seconds=step)
-            if seconds_until_active(cfg, t):
-                continue
-            for sport in cfg.sports:
-                for lane, st in self.lanes(sport, t):
-                    demand[st] += STEP * cost[lane] / self.base_interval(st)
-            near, near_x, early = self._prop_rates(t)
-            demand[PROP_NEAR] += STEP * near
-            demand[PROP_NEAR_X] += STEP * near_x
-            demand[PROP_EARLY] += STEP * early
+        spare_only = cfg.prop_near_spare_only   # (false: the extras are paid for like the rest of the prop check)
+        was, self.shed = self.shed, set()
+        demand = self._demand(now, cost)
+        # SHED_SPORTS: when the next 24h doesn't fit at full speed, those sports go first (back once all of it fits
+        # in 90% of the allowance, so they don't come and go every few minutes).
+        shed = {sp for sp in cfg.sports if any(sp.startswith(p) for p in _csv(cfg.shed_sports))}
+        need = sum(v for k, v in demand.items() if not (spare_only and k == PROP_NEAR_X))
+        if shed and need > self.allowance * (0.9 if was else 1.0) * (1 + 1e-9):
+            self.shed = shed
+            demand = self._demand(now, cost)
+        if self.shed != was:
+            print(f"Budget: credits are tight, so {', '.join(short(sp) for sp in sorted(self.shed))} "
+                  f"{'is' if len(self.shed) == 1 else 'are'} left out for now (SHED_SPORTS)" if self.shed
+                  else f"Budget: room again, checking {', '.join(short(sp) for sp in sorted(was))} again", flush=True)
         self.demand = demand
         live = demand[LIVE]
-        spare_only = cfg.prop_near_spare_only   # (false: the extras are paid for like the rest of the prop check)
         core = live + demand[PRE_LIVE] + demand[PREGAME] + demand[PROP_NEAR] + (0.0 if spare_only else demand[PROP_NEAR_X])
         extra = demand[EARLY] + demand[FAR] + demand[PROP_EARLY]
         self.forecast = core + extra
@@ -8757,6 +8833,24 @@ class Scheduler:
         # What's left to pay for at extra_scale (early props and 1-2 days out counted at side_scale).
         self.core_demand, self.extra_demand = core, extra - side + side / self.side_scale
         self.budget_at = time.time()
+
+    def _demand(self, now: datetime, cost: dict) -> dict:
+        """Credits each tier would use over the next 24h at full speed, in STEP slices (SHED_SPORTS left out
+        while self.shed has them)."""
+        cfg = self.cfg
+        demand = dict.fromkeys((LIVE, PRE_LIVE, PREGAME, EARLY, FAR, PROP_NEAR, PROP_NEAR_X, PROP_EARLY), 0.0)
+        for step in range(0, 86400, STEP):
+            t = now + timedelta(seconds=step)
+            if seconds_until_active(cfg, t):
+                continue
+            for sport in cfg.sports:
+                for lane, st in self.lanes(sport, t):
+                    demand[st] += STEP * cost[lane] / self.base_interval(st)
+            near, near_x, early = self._prop_rates(t)
+            demand[PROP_NEAR] += STEP * near
+            demand[PROP_NEAR_X] += STEP * near_x
+            demand[PROP_EARLY] += STEP * early
+        return demand
 
     def _overrun(self) -> float:
         """How much faster the credits left are falling than this process's calls cost, when some of
@@ -9627,6 +9721,107 @@ class LiveConfirm:
         return out
 
 
+# --------------------------------------------------------------------------- tuning from the record (TUNE_ENABLED)
+
+def _tune_group(book_or_sport: str, props: bool) -> tuple[str, bool]:
+    return (book_slug(book_or_sport), props)
+
+
+@dataclass
+class Tuning:
+    """What the bot's own record says about each book and sport (main lines and props apart), read from the logs
+    every TUNE_REFRESH_SECONDS: books whose price is usually gone by the next check, and books and sports that
+    clearly beat (or lose to) the closing line. Only new alerts are tuned; a card already up isn't touched."""
+    slow: dict = field(default_factory=dict)    # (book, props) -> "BetMGM props: still there 31% of 44 bets"
+    boost: dict = field(default_factory=dict)   # ("book" | "sport", name, props) -> (stake multiplier, why)
+    loaded: float = 0.0
+
+    @classmethod
+    def load(cls, cfg: Config, now: float | None = None) -> "Tuning":
+        t = cls(loaded=time.time() if now is None else now)
+        if not cfg.tune_enabled:
+            return t
+        try:
+            t._load(cfg)
+        except Exception as e:  # noqa: BLE001 - a bad log row mustn't stop alerts: no tuning until the next load
+            print(f"  ! Tuning: couldn't read the logs ({e!r:.150}); no tuning for now", file=sys.stderr)
+            return cls(loaded=t.loaded)
+        return t
+
+    def _load(self, cfg: Config) -> None:
+        groups: dict[tuple, list[bool]] = {}
+        for r in markout_rows(cfg):
+            if r.get("kind") != "arb" and r.get("still_ok") in ("0", "1"):
+                groups.setdefault(_tune_group(r.get("book", ""), bool(r.get("player"))), []).append(r["still_ok"] == "1")
+        if cfg.tune_slow_still_pct > 0:
+            for (book, props), still in groups.items():
+                pct = sum(still) / len(still) * 100
+                if len(still) >= cfg.tune_slow_bets and pct < cfg.tune_slow_still_pct:
+                    self.slow[(book, props)] = (f"price still there on the next check only {pct:.0f}% of the time "
+                                                f"({len(still)} bets)")
+        clv: dict[tuple, list[float]] = {}
+        for r in clv_rows(cfg, days=cfg.log_keep_days or None):
+            props = bool(r.get("player"))
+            clv.setdefault(("book", book_slug(r.get("book", "")), props), []).append(r["clv_pct"])
+            clv.setdefault(("sport", r.get("sport_key", ""), props), []).append(r["clv_pct"])
+        for key, xs in clv.items():
+            n, mean, _, lo, hi = markout_stats(xs)
+            if n < cfg.tune_clv_bets or lo is None:
+                continue
+            if lo > 0 and cfg.tune_clv_boost > 1:
+                self.boost[key] = (cfg.tune_clv_boost, f"beats the close ({mean:+.1f}% avg CLV, {n} bets)")
+            elif hi < 0 and cfg.tune_clv_cut < 1:
+                self.boost[key] = (cfg.tune_clv_cut, f"loses to the close ({mean:+.1f}% avg CLV, {n} bets)")
+
+    def extra_edge(self, cfg: Config, b: "EVBet") -> tuple[float, str]:
+        """(points of extra edge this bet's book needs, why) — (0, "") for most."""
+        why = self.slow.get(_tune_group(b.book, is_prop(b.line)))
+        return (cfg.tune_slow_extra_pct, why) if why else (0.0, "")
+
+    def stake_mult(self, cfg: Config, b: "EVBet") -> tuple[float, str]:
+        props = is_prop(b.line)
+        found = []
+        for kind, name, key in (("book", b.book, book_slug(b.book)), ("sport", b.sport, b.sport_key)):
+            if hit := self.boost.get((kind, key, props)):
+                found.append((hit[0], f"{name} {'props ' if props else ''}{hit[1]}"))
+        if not found:
+            return 1.0, ""
+        mult = min(max(math.prod(m for m, _ in found), cfg.tune_clv_cut), cfg.tune_clv_boost)
+        return mult, "; ".join(w for _, w in found)
+
+
+TUNE_REFRESH_SECONDS = 3600
+
+
+def tune_bets(bets: list, cfg: Config, tuning: Tuning, alerters: tuple) -> list:
+    """TUNE_ENABLED: new bets (no card up in these alerters) from a book whose price is usually gone by the next
+    check need TUNE_SLOW_EXTRA_PCT more edge (the others are held back, counted as "tuned out"), and each new bet's
+    stake follows its book's and sport's CLV. Bets with a card up go through unchanged."""
+    if not cfg.tune_enabled:
+        return bets
+    up = {k for a in alerters for k in (*a.open, *a.restored)}
+    out = []
+    for b in bets:
+        if b.key in up:
+            out.append(b)
+            continue
+        extra, why = tuning.extra_edge(cfg, b)
+        bar = cfg.prop_min_ev_pct if is_prop(b.line) else max(cfg.min_ev_pct, cfg.sport_min_ev.get(b.sport_key, 0))
+        if extra and b.ev_pct < bar + extra:
+            alerters[0].held_counts["tuned out"] = alerters[0].held_counts.get("tuned out", 0) + 1
+            print(f"  ✂️ {b.pick} at {b.book} +{b.ev_pct:.1f}%: needs +{bar + extra:g}% ({b.book} {why})", flush=True)
+            continue
+        mult, note = tuning.stake_mult(cfg, b)
+        if mult != 1.0 and b.stake:
+            cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
+            if b.kalshi_room:   # (cut to what Kalshi's order book holds: never more than that)
+                cap = min(cap, b.stake)
+            b.stake = round_stake(b.stake * mult, cap, cfg)
+            b.tune_note = f"Stake ×{mult:g}: {note}"
+        out.append(b)
+    return out
+
+
 class Trackers:
     """Every alert tracker the main loop keeps, wired together the way run() uses them: the hourly
     caps (arbs and prop arbs share one count, outliers and prop outliers another, and every live
@@ -9673,6 +9868,7 @@ class Trackers:
         self.sharp_history = SharpHistory(cfg.move_window_minutes)
         self.sharp_down: set[str] = set()   # sports the sharp book is missing from (Health; run() keeps it)
         self.price_history = PriceHistory()
+        self.tuning = Tuning()   # TUNE_ENABLED: read from the logs by tuned(), at most every TUNE_REFRESH_SECONDS
         # +EV props no sharp prices: spots a book that moved first on news. Its own memory: outliers
         # store the same keys against a different bar and fair price.
         self.prop_prices = PriceHistory()
@@ -9692,6 +9888,12 @@ class Trackers:
         self.arb_live = LiveConfirm(cfg.live_confirm_checks, cfg.live_max_age_alert)
         self.bet_live = LiveConfirm(cfg.live_confirm_checks, cfg.live_max_age_alert)
         self.set_live_interval(cfg.poll_seconds)
+
+    def tuned(self) -> Tuning:
+        """The current tuning (TUNE_ENABLED), read again from the logs once it's TUNE_REFRESH_SECONDS old."""
+        if self.cfg.tune_enabled and time.time() - self.tuning.loaded >= TUNE_REFRESH_SECONDS:
+            self.tuning = Tuning.load(self.cfg)
+        return self.tuning
 
     def singles(self) -> list[Alerter]:
         """Every alerter but parlays."""
@@ -9720,7 +9922,8 @@ HELD_LABELS = {"waiting": "live, waiting for another check", "unconfirmed": "liv
                "old price": "live, price too old", "capped": "over the hourly cap",
                "live cap": "over the live-alert cap", "old data": "odds too old by sending time (checked again)",
                "not sent": "Discord didn't take it (tried again next check)",
-               "alerted before": "alerted once already (ONE_ALERT_PER_BET)"}
+               "alerted before": "alerted once already (ONE_ALERT_PER_BET)",
+               "tuned out": "edge too small for a book whose price is usually gone (TUNE_ENABLED)"}
 
 
 def take_held(*alerters: Alerter) -> dict[str, int]:
@@ -9777,6 +9980,8 @@ def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: d
     evs = without_outliers(find_evs(events, cfg, at, history=t.sharp_history, kalshi=kq, keep=up,
                                     confirm_misses=misses, sharp_down=t.sharp_down, rejects=rejects), outs)
     t.candidates.extend(rejects, at.timestamp())
+    outs = tune_bets(outs, cfg, t.tuned(), (t.outs, t.evs))
+    evs = tune_bets(evs, cfg, t.tuned(), (t.evs, t.outs))
     hand_over(evs, outs, t.evs, t.outs, at.timestamp())
     kept = {id(b) for b in t.screen(t.bet_live, outs + evs, scope, at.timestamp(), (t.outs, t.evs))}
     post_outs, post_evs = [b for b in outs if id(b) in kept], [b for b in evs if id(b) in kept]
@@ -9817,6 +10022,8 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
                                       keep=carded, alt_seen=alt_seen, sharp_down=t.sharp_down, rejects=rejects), p_outs)
     t.candidates.extend(rejects, ts)
     t.prop_prices.prune(at)
+    p_outs = tune_bets(p_outs, cfg, t.tuned(), (t.prop_outs, t.prop_evs))
+    p_evs = tune_bets(p_evs, t.prop_cfg, t.tuned(), (t.prop_evs, t.prop_outs))
     hand_over(p_evs, p_outs, t.prop_evs, t.prop_outs, ts)
     note_related([(p_outs, t.prop_outs, checked), (p_evs, t.prop_evs, checked),
                   ([], t.outs, set()), ([], t.evs, set())], ts)
@@ -9897,6 +10104,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     health = Health(cfg, status)        # outage messages (and which sports the sharp book is missing from)
     t.sharp_down = health.sharp_down
     short_credits = CreditsShort(cfg)   # checks held 3x slower or more for half an hour: said once a day
+    shed_before: set[str] = set()       # SHED_SPORTS left out when the health channel was last told
 
     def update_parlays() -> int:
         open_bets = parlay_bets(ev_alerter, prop_evs, out_alerter, prop_outs)
@@ -10054,6 +10262,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 health.say("✅ Credits available again: scanning resumed.")
             if note := short_credits.check(sched, now, api.remaining):
                 status.send(note)
+            if sched.shed != shed_before:
+                status.send(f"⚠️ Credits are tight: {', '.join(short(sp) for sp in sorted(sched.shed))} left out "
+                            "for now so everything else keeps its speed (SHED_SPORTS)." if sched.shed else
+                            "✅ Credits have room again: back to checking every sport.")
+                shed_before = set(sched.shed)
             if pace_changed(old, sched):
                 print(f"Budget: {sched.allowance:,.0f} credits/day, next 24h needs "
                       f"{sched.forecast:,.0f} at full speed → live checks every "
@@ -10169,6 +10382,52 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 print("Nothing live or starting soon to check right now.")
             return
         time.sleep(max(1.0, sched.seconds_to_next(now)))
+
+
+def sample_payloads(cfg: Config) -> list[tuple[dict, str, str]]:
+    """--test-discord's samples, as (payload, webhook, kind): each alert type that's on, made up from the demo
+    games. With DISCORD_TEST_WEBHOOK_URL all go there and ping their book's role (BOOK_ROLES), so you see the
+    notification exactly as a real one; without it they go to the real channels and ping nobody."""
+    cfg = cfg.with_mode()
+    events = demo_events(live_arb=False)
+    test = cfg.test_webhook_url
+    ev_url = test or cfg.ev_webhook_url or cfg.webhook_url
+    samples = []
+    if cfg.arbs_enabled:
+        samples += [(discord_payload(arb), test or cfg.webhook_url, "arb") for arb in find_arbs(events, cfg)[:1]]
+    if cfg.ev_enabled:
+        samples += [(ev_payload(b, book_role_mention(cfg, b.book) if test else ""), ev_url, "+EV")
+                    for b in find_evs(events, cfg)[:1]]
+    if cfg.outliers_enabled:
+        samples += [(outlier_payload(o, book_role_mention(cfg, o.book) if test else ""),
+                     test or cfg.outlier_webhook_url or ev_url, "outlier") for o in find_outliers(events, cfg)[:1]]
+    for payload, _, _ in samples:
+        emb = payload["embeds"][0]
+        emb["title"] = ("🧪 SAMPLE · " + emb["title"])[:256]
+        emb["footer"] = {"text": "SAMPLE ALERT: made-up game and prices. Don't bet this."}
+        emb.pop("url", None)
+    return samples
+
+
+def send_samples(cfg: Config) -> None:
+    """--test-discord: one sample of each alert type that's on, each to its channel (or the test channel)."""
+    if not (cfg.webhook_url or cfg.test_webhook_url):
+        sys.exit("Set DISCORD_WEBHOOK_URL in .env first.")
+    cfg.bad_webhooks()
+    samples = sample_payloads(cfg)
+    ids = []
+    for payload, url, kind in samples:
+        ids.append((kind, payload, url, (_webhook(url, payload) or {}).get("id")))
+        where = ("the test channel" if url == cfg.test_webhook_url
+                 else "the main channel" if url == cfg.webhook_url else "its own channel")
+        print(f"  sent the {kind} sample to {where}" + (f" (pinging {payload['content']})" if payload.get("content") else ""))
+    print(f"Sent {len(samples)} sample alerts.")
+    arb = next(((p, u, i) for kind, p, u, i in ids if kind == "arb" and i), None)
+    if arb:
+        print("In 5 seconds the arb turns 'GONE'...")
+        time.sleep(5)
+        _webhook(arb[1], discord_payload(find_arbs(demo_events(live_arb=False), cfg)[0], gone_after=5), "PATCH", arb[2])
+    print("Done. Check your Discord channel.")
 
 
 # --------------------------------------------------------------------------- the blueprint (--blueprint)
@@ -10355,28 +10614,7 @@ def main() -> None:
         return
 
     if args.test_discord:
-        if not cfg.webhook_url:
-            sys.exit("Set DISCORD_WEBHOOK_URL in .env first.")
-        events = demo_events(live_arb=False)
-        arb = find_arbs(events, cfg)[0]
-        cfg.bad_webhooks()
-        ev_url = cfg.ev_webhook_url or cfg.webhook_url
-        samples = [(discord_payload(arb), cfg.webhook_url, "arb")] \
-            + [(ev_payload(b), ev_url, "+EV") for b in find_evs(events, cfg)[:1]] \
-            + [(outlier_payload(o), cfg.outlier_webhook_url or ev_url, "outlier") for o in find_outliers(events, cfg)[:1]]
-        ids = []
-        for payload, url, kind in samples:  # each to the channel real alerts of that kind use
-            emb = payload["embeds"][0]
-            emb["title"] = ("🧪 SAMPLE · " + emb["title"])[:256]
-            emb["footer"] = {"text": "SAMPLE ALERT: made-up game and prices. Don't bet this."}
-            emb.pop("url", None)
-            ids.append((_webhook(url, payload) or {}).get("id"))
-            print(f"  sent the {kind} sample to {'the main channel' if url == cfg.webhook_url else 'its own channel'}")
-        print(f"Sent {len(samples)} sample alerts. In 5 seconds the arb turns 'GONE'...")
-        time.sleep(5)
-        if ids and ids[0]:
-            _webhook(cfg.webhook_url, discord_payload(arb, gone_after=5), "PATCH", ids[0])
-        print("Done. Check your Discord channel.")
+        send_samples(cfg)
         return
 
     if not args.demo and not cfg.api_key:

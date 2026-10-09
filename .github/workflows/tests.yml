@@ -1,0 +1,14 @@
+# Runs the full test suite on every push and pull request, the same way the server does before it updates
+# (Python 3.12, a clean environment, no .env). A red ❌ on GitHub means the server won't take that commit either.
+name: tests
+on: [push, pull_request]
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: env -i PATH="$PATH" HOME="$HOME" python3 -m unittest -q test_arbbot

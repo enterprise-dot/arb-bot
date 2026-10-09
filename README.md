@@ -541,6 +541,22 @@ to show the better price: you bet it once, at the stake shown. The bot remembers
 (`state/alerted_bets.json`) until a day after its game, so a restart or an update doesn't send any of them
 again. The card is still marked GONE when the price goes.
 
+While it's up, the card's only change is one line, edited without a ping: **✅ Still good at <book>** while that book
+still has a good price, **⚠️ Price moved** when it doesn't.
+
+**Tuning from the record (`TUNE_ENABLED=true`).** Every hour the bot reads its own logs. A book whose price is
+usually gone by the next check (still there under 40% of the time, 30+ bets) needs 2 more points of edge before its
+bets go out. A book or sport that clearly beats the closing line (50+ bets) gets 25% bigger stakes; one that clearly
+loses to it gets half. The card says so ("📊 Stake ×1.25: ..."). Until a book or sport has enough bets, nothing
+changes for it. Settings: `TUNE_*` in `.env.example`.
+
+**Sports to drop when credits get tight (`SHED_SPORTS=soccer`).** If the next 24 hours can't be checked at full
+speed, those sports stop being checked before anything else slows down, and the health channel says so. They come
+back once everything fits with 10% to spare.
+
+**Test channel (`DISCORD_TEST_WEBHOOK_URL`).** `arbbot.py --set-webhook test` sets a private channel for
+`--test-discord`: each alert type that's on sends a sample there, pinging its book's role like a real alert.
+
 **Sportsbook pings (`BOOK_ROLES`).** Give each sportsbook a Discord role and list them:
 `BOOK_ROLES=DraftKings=<role id>,FanDuel=<role id>`. Each new +EV, prop, outlier and parlay card then pings
 the role of the book it's at, and nothing else (no @everyone). Edits never ping. A book with no role pings
