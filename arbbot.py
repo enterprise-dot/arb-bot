@@ -1825,9 +1825,17 @@ MARKET_NAMES = {
     "player_pass_interceptions": "Interceptions Thrown", "player_rush_attempts": "Rush Attempts",
     "player_rush_reception_yds": "Rush + Rec Yards", "player_anytime_td": "Anytime TD",
     "player_rush_tds": "Rushing TDs", "player_reception_tds": "Receiving TDs",
+    "player_rush_longest": "Longest Rush", "player_reception_longest": "Longest Reception",
+    "player_pass_rush_yds": "Pass + Rush Yards", "player_pass_rush_reception_yds": "Pass + Rush + Rec Yards",
+    "player_pass_rush_reception_tds": "Pass + Rush + Rec TDs", "player_sacks": "Sacks",
+    "player_solo_tackles": "Solo Tackles", "player_tackles_assists": "Tackles + Assists",
+    "player_defensive_interceptions": "Interceptions", "player_field_goals": "Field Goals Made",
+    "player_pats": "Extra Points Made", "player_kicking_points": "Kicking Points",
     # NBA
     "player_blocks": "Blocks", "player_steals": "Steals", "player_blocks_steals": "Blocks + Steals",
     "player_turnovers": "Turnovers", "player_points_rebounds_assists": "Pts + Reb + Ast",
+    "player_frees_made": "Free Throws Made", "player_frees_attempts": "Free Throw Attempts",
+    "player_double_double": "Double-Double", "player_triple_double": "Triple-Double",
     "player_points_rebounds": "Pts + Reb", "player_points_assists": "Pts + Ast", "player_rebounds_assists": "Reb + Ast",
     # NHL
     "player_blocked_shots": "Blocked Shots", "player_goal_scorer_anytime": "Anytime Goal Scorer",
@@ -6154,9 +6162,40 @@ BOX_STATS = {   # (sport family, prop market) -> columns added together
     # Oct 9: touchdowns by kind, the same columns as an anytime TD (read like rushing and receiving yards).
     ("americanfootball", "player_rush_tds"): [_t(("TD",), ("rushingTouchdowns",), ("rushing",))],
     ("americanfootball", "player_reception_tds"): [_t(("TD",), ("receivingTouchdowns",), ("receiving",))],
+    # Oct 9, more props, from columns ESPN's box scores have (checked against a real one): longest plays, yards and
+    # TDs added across passing / rushing / receiving, defense (a defender missing from a group had none of it) and
+    # the kicker.
+    ("americanfootball", "player_rush_longest"): [_t(("LONG",), ("longRushing",), ("rushing",))],
+    ("americanfootball", "player_reception_longest"): [_t(("LONG",), ("longReception",), ("receiving",))],
+    ("americanfootball", "player_pass_rush_yds"): [_t(("YDS",), ("passingYards",), ("passing",)),
+                                                   _t(("YDS",), ("rushingYards",), ("rushing",), optional=True)],
+    ("americanfootball", "player_pass_rush_reception_yds"): [
+        _t(("YDS",), ("passingYards",), ("passing",), optional=True),
+        _t(("YDS",), ("rushingYards",), ("rushing",), optional=True),
+        _t(("YDS",), ("receivingYards",), ("receiving",), optional=True)],
+    ("americanfootball", "player_pass_rush_reception_tds"): [
+        _t(("TD",), ("passingTouchdowns",), ("passing",), optional=True),
+        _t(("TD",), ("rushingTouchdowns",), ("rushing",), optional=True),
+        _t(("TD",), ("receivingTouchdowns",), ("receiving",), optional=True)],
+    ("americanfootball", "player_sacks"): [_t(("SACKS",), ("sacks",), ("defensive",), optional=True)],
+    ("americanfootball", "player_solo_tackles"): [_t(("SOLO",), ("soloTackles",), ("defensive",), optional=True)],
+    ("americanfootball", "player_tackles_assists"): [_t(("TOT",), ("totalTackles",), ("defensive",), optional=True)],
+    ("americanfootball", "player_defensive_interceptions"): [_t(("INT",), ("interceptions",), ("interceptions",),
+                                                                optional=True)],
+    ("americanfootball", "player_field_goals"): [_t(("FG",), ("fieldGoalsMade/fieldGoalAttempts",), ("kicking",), 0)],
+    ("americanfootball", "player_pats"): [_t(("XP",), ("extraPointsMade/extraPointAttempts",), ("kicking",), 0)],
+    ("americanfootball", "player_kicking_points"): [_t(("PTS",), ("totalKickingPoints",), ("kicking",))],
+    ("basketball", "player_field_goals"): [_t(("FG",), ("fieldGoalsMade-fieldGoalsAttempted",), part=0)],
+    ("basketball", "player_frees_made"): [_t(("FT",), ("freeThrowsMade-freeThrowsAttempted",), part=0)],
+    ("basketball", "player_frees_attempts"): [_t(("FT",), ("freeThrowsMade-freeThrowsAttempted",), part=1)],
+    # Yes/No: 10+ in two (three) of points, rebounds, assists, steals and blocks (see _read_stat).
+    ("basketball", "player_double_double"): [_PTS, _REB, _AST, _t(("STL",), ("steals",)), _t(("BLK",), ("blocks",))],
+    ("basketball", "player_triple_double"): [_PTS, _REB, _AST, _t(("STL",), ("steals",)), _t(("BLK",), ("blocks",))],
 }
 # Optional columns of which at least one must be in the box score: a player in neither group is left to check by hand.
-NEED_ONE = {"player_rush_reception_yds"}
+NEED_ONE = {"player_rush_reception_yds", "player_pass_rush_reception_yds", "player_pass_rush_reception_tds"}
+# Yes/No props on how many of their columns reach 10: market -> how many must.
+DOUBLES = {"player_double_double": 2, "player_triple_double": 3}
 # Total bases isn't in the ESPN box score (no doubles/triples column); MLB's own box score has it.
 
 
@@ -6495,6 +6534,9 @@ def _read_stat(player: dict, market: str, sport_key: str) -> float | None:
     terms = BOX_STATS[(_family(sport_key), market)]
     if market in NEED_ONE and all(_read(player, [t[:4] + (False,)]) is None for t in terms):
         return None
+    if market in DOUBLES:   # 1 = yes, 0 = no
+        values = [_read(player, [t]) for t in terms]
+        return None if None in values else float(sum(v >= 10 for v in values) >= DOUBLES[market])
     value = _read(player, terms)
     if market == "player_anytime_td" and value is not None:
         value += max((_read(player, [t]) or 0) for t in _DEFENSE_TD)

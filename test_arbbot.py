@@ -2648,9 +2648,81 @@ class PropGrading(unittest.TestCase):
         self.assertIn("✅ win (box score: 1)", text)
         self.assertFalse(Path(self.cfg.ev_results_file).exists())          # a check saves nothing
 
+    def test_more_nfl_and_nba_props_are_graded(self):
+        # Oct 9: the columns as ESPN's real box scores name them (labels and keys copied from one).
+        from arbbot import grade_prop
+        self.add_other_sports()
+        g = lambda name, labels, keys, rows: (name, labels, keys, rows)
+        self.games.append({"sport": "football/nfl", "id": "6", "date": "2026-10-04T20:00Z", "final": True,
+                           "home": ("15", "Miami Dolphins", "Miami", "Dolphins", 24),
+                           "away": ("17", "New England Patriots", "New England", "Patriots", 17),
+                           "groups": {"15": [
+                               g("passing", ["C/ATT", "YDS", "AVG", "TD", "INT", "SACKS", "QBR", "RTG"],
+                                 ["completions/passingAttempts", "passingYards", "yardsPerPassAttempt", "passingTouchdowns",
+                                  "interceptions", "sacks-sackYardsLost", "adjQBR", "QBRating"],
+                                 [("Tua Tagovailoa", ["5/8", "251", "7.6", "2", "1", "2-14", "60.1", "98.0"], False)]),
+                               g("rushing", ["CAR", "YDS", "AVG", "TD", "LONG"],
+                                 ["rushingAttempts", "rushingYards", "yardsPerRushAttempt", "rushingTouchdowns", "longRushing"],
+                                 [("Tua Tagovailoa", ["3", "9", "3.0", "1", "6"], False),
+                                  ("De'Von Achane", ["18", "95", "5.3", "0", "34"], False)]),
+                               g("receiving", ["REC", "YDS", "AVG", "TD", "LONG", "TGTS"],
+                                 ["receptions", "receivingYards", "yardsPerReception", "receivingTouchdowns", "longReception",
+                                  "receivingTargets"],
+                                 [("De'Von Achane", ["5", "42", "8.4", "1", "19", "6"], False)]),
+                               g("defensive", ["TOT", "SOLO", "SACKS", "TFL", "PD", "QB HTS", "TD"],
+                                 ["totalTackles", "soloTackles", "sacks", "tacklesForLoss", "passesDefended", "QBHits",
+                                  "defensiveTouchdowns"],
+                                 [("Jordyn Brooks", ["8", "5", "1.5", "1", "0", "1", "0"], False),
+                                  ("Jalen Ramsey", ["3", "3", "0", "0", "1", "0", "0"], False)]),
+                               g("interceptions", ["INT", "YDS", "TD"], ["interceptions", "interceptionYards",
+                                                                         "interceptionTouchdowns"],
+                                 [("Jalen Ramsey", ["1", "7", "0"], False)]),
+                               g("kicking", ["FG", "PCT", "LONG", "XP", "PTS"],
+                                 ["fieldGoalsMade/fieldGoalAttempts", "fieldGoalPct", "longFieldGoalMade",
+                                  "extraPointsMade/extraPointAttempts", "totalKickingPoints"],
+                                 [("Jason Sanders", ["1/2", "50.0", "48", "3/3", "6"], False)])],
+                                      "17": [g("passing", ["C/ATT", "YDS", "TD"], ["completions/passingAttempts", "passingYards",
+                                                                                    "passingTouchdowns"],
+                                               [("Drake Maye", ["3/5", "40", "0"], False)]),
+                                             g("receiving", ["REC", "YDS", "TD"], ["receptions", "receivingYards",
+                                                                                  "receivingTouchdowns"],
+                                               [("Hunter Henry", ["3", "40", "0"], False)])]}})
+        dol = lambda **kw: dict(self.row(home="Miami Dolphins", away="New England Patriots", sport="americanfootball_nfl"),
+                                commence_time="2026-10-04T20:00:00Z", **kw)
+        said = lambda who, market, point="0.5", outcome="Over": grade_prop(dol(player=who, market=market, point=point,
+                                                                                 outcome=outcome))
+        self.assertEqual(said("De'Von Achane", "player_rush_longest", "29.5")[1], "34")
+        self.assertEqual(said("De'Von Achane", "player_reception_longest", "19.5")[0][0], "loss")    # 19
+        self.assertEqual(said("Tua Tagovailoa", "player_pass_rush_yds", "250.5")[1], "260")          # 251 + 9
+        self.assertEqual(said("De'Von Achane", "player_pass_rush_reception_yds", "130.5")[1], "137")  # no passing
+        self.assertEqual(said("Tua Tagovailoa", "player_pass_rush_reception_tds", "2.5")[1], "3")
+        self.assertEqual(said("Jordyn Brooks", "player_sacks")[1], "1.5")
+        self.assertEqual(said("Jordyn Brooks", "player_solo_tackles", "4.5")[1], "5")
+        self.assertEqual(said("Jordyn Brooks", "player_tackles_assists", "7.5")[1], "8")
+        self.assertEqual(said("Jalen Ramsey", "player_defensive_interceptions")[1], "1")
+        self.assertEqual(said("Jordyn Brooks", "player_defensive_interceptions")[1], "0")              # none listed: 0
+        self.assertEqual(said("Jalen Ramsey", "player_sacks")[1], "0")
+        self.assertEqual(said("Jason Sanders", "player_field_goals", "1.5")[1], "1")                    # made, not tried
+        self.assertEqual(said("Jason Sanders", "player_pats", "2.5")[1], "3")
+        self.assertEqual(said("Jason Sanders", "player_kicking_points", "6.5")[0][0], "loss")
+        # NBA: field goals and free throws made / tried; double- and triple-doubles from 10+ in 2 / 3 categories.
+        celtics = next(x for x in self.games if x["sport"] == "basketball/nba")["groups"]["2"][0][3]
+        celtics[0] = ("Jayson Tatum", ["38", "10-21", "3-8", "5-6", "11", "10", "2", "1", "28"], False)   # 28-11-10
+        celtics.append(("Al Horford", ["30", "0-4", "0-2", "0-0", "10", "10", "1", "2", "0"], False))     # 0-10-10
+        cel = lambda **kw: grade_prop(self.celtics(**kw))
+        self.assertEqual(cel(player="Jayson Tatum", market="player_field_goals", point="9.5")[1], "10")
+        self.assertEqual(cel(player="Jayson Tatum", market="player_frees_made", point="4.5")[1], "5")
+        self.assertEqual(cel(player="Jayson Tatum", market="player_frees_attempts", point="5.5")[1], "6")
+        yes = lambda who, market: cel(player=who, market=market, point="", outcome="Yes")[0][0]
+        self.assertEqual((yes("Jayson Tatum", "player_double_double"), yes("Jayson Tatum", "player_triple_double")),
+                         ("win", "win"))
+        self.assertEqual((yes("Al Horford", "player_double_double"), yes("Al Horford", "player_triple_double")),
+                         ("win", "loss"))
+        self.assertEqual(cel(player="Jaylen Brown", market="player_double_double", point="", outcome="No")[0][0], "win")
+
     def test_unsupported_props_stay_manual(self):
         from arbbot import gradable
-        self.assertFalse(gradable(self.row(market="player_double_double", sport="basketball_nba")))
+        self.assertFalse(gradable(self.row(market="player_first_basket", sport="basketball_nba")))   # no box column
         self.assertTrue(gradable(self.row(market="batter_total_bases", sport="baseball_mlb")))   # MLB's own box
         self.assertTrue(gradable(self.row()))
 
