@@ -13596,6 +13596,17 @@ class EVBotSpec(MixFiles):
         self.assertIsNone(_arbbot.site_due(replace(cfg, results_site_token=""), now))
         self.assertTrue((Path(_arbbot.__file__).parent / "site" / "index.html").exists())
 
+    def test_the_results_cards_link_to_the_public_page(self):
+        cfg, res, sent = self.results(results_site_repo="joeybuffo10-wq/ev-bot-results")
+        self.assertEqual(_arbbot.site_url(cfg), "https://joeybuffo10-wq.github.io/ev-bot-results/")
+        self.log(cfg, "g1", "2026-10-03T18:00:00Z")
+        res.daily(self.scores({"g1": (4, 2)}), date(2026, 10, 3), datetime(2026, 10, 4, 4, 40, tzinfo=timezone.utc))
+        link = "[EV BOT results](https://joeybuffo10-wq.github.io/ev-bot-results/)"
+        self.assertTrue(sent[0]["description"].endswith(link))
+        self.assertTrue(_arbbot.scoreboard_payload(cfg, NOW)["embeds"][0]["description"].endswith(link))
+        self.assertNotIn("EV BOT results", _arbbot.scoreboard_payload(replace(cfg, results_site_repo=""), NOW)
+                         ["embeds"][0]["description"])
+
     def test_an_unchanged_page_isnt_uploaded_again(self):
         import base64
         from unittest import mock

@@ -7064,9 +7064,10 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
     arbs = arbs_on(cfg, day)
     clv = day_clv_line(day_rows)
     members = members_lines(cfg, day_rows)
+    link = site_link(cfg)
     desc = (body + DIVIDER + f"**{day:%a %b %-d}** (every alert at the stake it showed)\n"
             + day_summary(day_rows, cfg, now) + (f"\n{clv}" if clv else "") + (f"\n{arbs}" if arbs else "")
-            + (f"\n\n{members}" if members else ""))
+            + (f"\n\n{members}" if members else "") + (f"\n\n{link}" if link else ""))
     color = 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else GREY)
     return _card(title, desc, color,
                  footer="Results assume every alert was bet at the stake shown. Props are graded from the box "
@@ -7144,8 +7145,10 @@ def scoreboard_payload(cfg: Config, now: datetime | None = None) -> dict:
     today = now.astimezone(ZoneInfo(cfg.timezone)).date()
     profit = _record([r for r in day_bets(cfg, today) if r.get("result")])[3]
     text = scoreboard_text(cfg, now)
-    if len(text) > 4000:   # very long: drop the CLV table rather than cut a section in half
-        text = text.split("\n```")[0][:4000]
+    link = site_link(cfg)
+    if len(text) + len(link) > 3998:   # very long: drop the CLV table rather than cut a section in half
+        text = text.split("\n```")[0][:3998 - len(link)]
+    text += f"\n\n{link}" if link else ""
     return _card("📊 Scoreboard", text,
                  0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else 0x5865F2),
                  footer="Every alert at the stake it showed. Updates by itself as games finish. Pin this message.")
@@ -10924,6 +10927,18 @@ def send_backup(cfg: Config, day: date) -> None:
 
 SITE_AT = dtime(1, 20)   # New York time: after the day's results card and the backup
 SITE_PAGE = "site/index.html"   # the page itself, kept with the code so it changes with it
+
+
+def site_url(cfg: Config) -> str:
+    """The public results page's address (GitHub Pages of RESULTS_SITE_REPO), or "" when there's none."""
+    owner, _, name = cfg.results_site_repo.partition("/")
+    return f"https://{owner.lower()}.github.io/{name}/" if owner and name else ""
+
+
+def site_link(cfg: Config) -> str:
+    """The results cards' line pointing to the public page ("" without one)."""
+    url = site_url(cfg)
+    return f"🌐 **Full record, every bet:** [EV BOT results]({url})" if url else ""
 
 
 def site_data(cfg: Config, now: datetime | None = None) -> dict:
