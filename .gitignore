@@ -11,3 +11,4 @@ candidates.csv
 parlays.csv
 state/
 .update-skipped
+.update-fetch-failed

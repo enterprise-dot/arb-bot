@@ -1875,6 +1875,7 @@ ODDS_FORMAT = "american"  # set from ODDS_FORMAT in .env at startup
 
 
 OK_EDGE_PCT = 1.5  # a single-side bet is still worth taking down to this much edge
+VOID_WARN_PCT = 40   # an outlier with at least this much edge says it may be a pricing error the book can void
 
 
 def american(dec: float) -> str:
@@ -2126,6 +2127,37 @@ def _webhook(url: str, payload: dict, method: str = "POST", message_id: str | No
                 continue
             raise
     return None
+
+
+# Webhooks Discord refused a new card on (webhook URL -> HTTP code), for the main loop to report (discord_trouble).
+DISCORD_TROUBLE: dict[str, int] = {}
+TROUBLE_HINTS = {404: "the webhook was deleted: make a new one in that channel and run --set-webhook {channel}",
+                 401: "the webhook isn't valid any more: make a new one and run --set-webhook {channel}",
+                 403: "the webhook isn't allowed to post there: check the channel's permissions",
+                 400: "Discord didn't accept the card itself: send Claude this message"}
+
+
+def channel_name(cfg: "Config", url: str) -> tuple[str, str]:
+    """(--set-webhook name, what it's for) of the channel a webhook URL is set for."""
+    for name, (env, what) in WEBHOOK_SETTINGS.items():
+        if getattr(cfg, env.lower()[len("discord_"):], None) == url:
+            return name, what
+    return "main", "alerts"
+
+
+def discord_trouble(cfg: "Config", status: "Status", told: dict[str, float], now: float | None = None) -> None:
+    """Tell the health channel about each webhook Discord refuses new cards on, once a day per webhook (those
+    cards are retried every check and would otherwise only show in the server log)."""
+    now = time.time() if now is None else now
+    for url, code in list(DISCORD_TROUBLE.items()):
+        DISCORD_TROUBLE.pop(url)
+        if url in told and now - told[url] < 86400:
+            continue
+        told[url] = now
+        name, what = channel_name(cfg, url)
+        hint = TROUBLE_HINTS.get(code, "").format(channel=name)
+        status.send(f"⚠️ Discord turned down new alerts for the {name} channel ({what}): error {code}. "
+                    f"They aren't reaching Discord. Fix: {hint}.")
 
 
 def send_discord(webhook_url: str, arb: Arb, mention: str = "") -> str | None:
@@ -2720,6 +2752,8 @@ class Alerter:
             return msg.get("id") if msg else None
         except Exception as e:  # keep scanning even if Discord hiccups
             print(f"  ! Discord send failed: {e}", file=sys.stderr)
+            if not message_id and isinstance(e, urllib.error.HTTPError) and e.code in (400, 401, 403, 404):
+                DISCORD_TROUBLE[url] = e.code   # a new card Discord refuses for good: the health channel is told
             # urllib wraps errors before Discord has the message (refused, DNS, an HTTP error
             # reply) in URLError. A timeout or drop while reading the reply isn't: the post may
             # have gone through, so sending it again could double the alert.
@@ -5548,6 +5582,9 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
     ]
     if status:
         parts.insert(0, status_line(status, b.book))
+    if b.ev_pct >= VOID_WARN_PCT:
+        parts.append(f"⚠️ An edge this big may be a pricing error: {b.book} can void the bet. Bet a normal stake, "
+                     f"not more.")
     if b.related:
         parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}.")
     if b.hedge:
@@ -6065,9 +6102,12 @@ def record_line(rows: list[dict]) -> str:
     return f"{w}-{l}" + (f"-{pu}" if pu else "") + f" · {signed_money(profit)} on {money(staked)} staked{roi}"
 
 
-def ev_record(cfg: Config, days: int | None = None, kinds: tuple[str, ...] = ("ev", "")) -> str:
+def ev_record(cfg: Config, days: int | None = None, kinds: tuple[str, ...] = ("ev", ""),
+              live: bool | None = None) -> str:
+    """The record of these alert types (live=False: pre-game bets only; None: both)."""
     rows = [r for r in _read_csv(cfg.ev_results_file) if r.get("kind", "") in kinds and not r.get("manual_legs")
-            and cfg.counts(r.get("book", ""))]
+            and cfg.counts(r.get("book", ""))
+            and (live is None or (str(r.get("live")).lower() == "true") == live)]
     if days is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         rows = [r for r in rows if _parse_time(r["commence_time"]) >= cutoff]
@@ -8347,9 +8387,29 @@ def markout_span(cfg: Config) -> str:
     return f"last {cfg.log_keep_days} days" if cfg.log_keep_days else "all time"
 
 
+def groups_off(cfg: Config) -> set[str]:
+    """Markout groups for alert types that are turned off now: the daily summary leaves them out (their past
+    numbers stay in --results)."""
+    off = set()
+    if not cfg.arbs_enabled:
+        off.add("Arbs")
+    if not (cfg.outliers_enabled and cfg.outlier_live):
+        off.add("Live outliers")
+    if not (cfg.ev_enabled and cfg.ev_live):
+        off.add("Live +EV")
+    if not cfg.outliers_enabled:
+        off.add("Pre-game outliers")
+    if not cfg.ev_enabled:
+        off.add("Pre-game +EV")
+    if not cfg.props_enabled:
+        off.add("Props")
+    return off
+
+
 def markout_summary(cfg: Config) -> str:
-    """The daily summary's 📏 section ("" with no markouts yet)."""
-    groups = markout_breakdown(cfg)["Alert type"]
+    """The daily summary's 📏 section ("" with no markouts yet), for the alert types that are on."""
+    off = groups_off(cfg)
+    groups = [g for g in markout_breakdown(cfg)["Alert type"] if g["name"] not in off]
     if not groups:
         return ""
     note = _pregame_note(cfg)
@@ -10369,6 +10429,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     t.sharp_down = health.sharp_down
     short_credits = CreditsShort(cfg)   # checks held 3x slower or more for half an hour: said once a day
     shed_before: set[str] = set()       # SHED_SPORTS left out when the health channel was last told
+    results_warned = 0.0                # when the health channel was last told grading or results failed
+    trouble_told: dict[str, float] = {}   # webhook -> when the health channel was last told Discord refused it
 
     def update_parlays() -> int:
         open_bets = parlay_bets(ev_alerter, prop_evs, out_alerter, prop_outs)
@@ -10477,13 +10539,17 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             sections = ([("💰 **Arbs**", f"{alerter.summary()}; props: {prop_arbs.summary()}")]
                         if cfg.arbs_enabled else [])
             if cfg.ev_enabled:
-                sections.append(("📈 **+EV**", f"{ev_alerter.summary()}\nIf you bet every alert: "
-                                 f"last 7 days {ev_record(cfg, 7)}; all time {ev_record(cfg)}"))
+                live = None if cfg.ev_live else False   # (live +EV off: its old bets aren't in the record shown)
+                sections.append(("📈 **+EV**", f"{ev_alerter.summary()}\nIf you bet every "
+                                 f"{'alert' if cfg.ev_live else 'pre-game alert'}: last 7 days "
+                                 f"{ev_record(cfg, 7, live=live)}; all time {ev_record(cfg, live=live)}"))
             if cfg.props_enabled:
                 sections.append(("🎯 **Props**", f"{prop_evs.summary()}; {prop_outs.summary()}"))
             if cfg.outliers_enabled:
-                sections.append(("🚨 **Outliers**", f"{out_alerter.summary()}\nIf you bet every alert: last 7 days "
-                                 f"{ev_record(cfg, 7, kinds=('outlier',))}"))
+                live = None if cfg.outlier_live else False   # (live outliers off: only what can still be alerted)
+                sections.append(("🚨 **Outliers**", f"{out_alerter.summary()}\nIf you bet every "
+                                 f"{'alert' if cfg.outlier_live else 'pre-game alert'}: last 7 days "
+                                 f"{ev_record(cfg, 7, kinds=('outlier',), live=live)}"))
             if cfg.parlays_enabled:
                 sections.append(("📦 **Parlays**", parlay_alerter.summary()))
             book = getattr(api, "costs", None)
@@ -10629,20 +10695,27 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         # (RESULTS_DAILY_ONLY: just after midnight, as the day's only results post; else with the morning summary.)
         recap_time = (local.time() >= RECAP_AT if cfg.results_daily_only
                       else cfg.summary_hour >= 0 and local.hour >= cfg.summary_hour)
-        if not args.once and recap_time and results.recap_due(yesterday):
-            results.daily(api, yesterday, now)   # yesterday's full card, once (survives restarts)
-        if (not args.once and cfg.summary_hour >= 0 and local.hour >= cfg.summary_hour and local.weekday() == 0
-                and results.weekly_due(local.date())):
-            results.weekly(local.date(), now, t.held.days)   # Monday: last week's report card, once
+        # Results never stop the bot: a bad row in a log used to crash it, and systemd restarted it every minute
+        # (paying for a fresh check each time). Now it's said in the health channel, at most once a day, and the
+        # alerts keep going.
+        try:
+            if not args.once and recap_time and results.recap_due(yesterday):
+                results.daily(api, yesterday, now)   # yesterday's full card, once (survives restarts)
+            if (not args.once and cfg.summary_hour >= 0 and local.hour >= cfg.summary_hour and local.weekday() == 0
+                    and results.weekly_due(local.date())):
+                results.weekly(local.date(), now, t.held.days)   # Monday: last week's report card, once
+            if not args.once and results.due():
+                n_res = results.tick(api, now)
+                if n_res:
+                    print(f"  📋 {n_res} bet result(s) posted", flush=True)
+        except Exception as e:  # noqa: BLE001
+            results_warned = results_trouble(status, e, results_warned)
+        discord_trouble(cfg, status, trouble_told)
         if not args.once and t.reactions.due():
             try:
                 t.reactions.tick(now)
             except Exception as e:  # noqa: BLE001 - ✅ tracking must never stop the bot
                 print(f"  ! ✅ tracking failed: {e!r:.200}", file=sys.stderr)
-        if not args.once and results.due():
-            n_res = results.tick(api, now)
-            if n_res:
-                print(f"  📋 {n_res} bet result(s) posted", flush=True)
 
         if args.once:
             if line := links_line(main_events + prop_events, cfg):
@@ -10651,6 +10724,18 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 print("Nothing live or starting soon to check right now.")
             return
         time.sleep(max(1.0, sched.seconds_to_next(now)))
+
+
+def results_trouble(status: "Status", e: Exception, warned: float, now: float | None = None) -> float:
+    """Grading or posting results failed: print it, and tell the health channel once a day. Returns when it last
+    told it."""
+    now = time.time() if now is None else now
+    print(f"! Results failed: {e!r:.300}", file=sys.stderr, flush=True)
+    if warned and now - warned < 86400:
+        return warned
+    status.send(f"⚠️ Couldn't grade or post results ({type(e).__name__}: {str(e)[:150]}). Bet alerts keep going; "
+                "the server log has the details (journalctl -u arbbot | grep 'Results failed').")
+    return now
 
 
 def sample_payloads(cfg: Config) -> list[tuple[dict, str, str]]:

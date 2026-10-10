@@ -13376,6 +13376,72 @@ class EVBotSpec(MixFiles):
         self.assertIn(f"Sam {win:+.1f}u (1) · Joey {win + loss:+.1f}u (2)", card["description"])
         self.assertEqual(_arbbot.members_lines(cfg, []), "")
 
+    # ---- Oct 10: summary cleanup, outlier void warning, results and Discord problems said in the health channel
+    def test_the_daily_summary_leaves_out_alert_types_that_are_off(self):
+        on = Config(arbs_enabled=True, outlier_live=True, ev_live=True)
+        self.assertEqual(_arbbot.groups_off(on), set())
+        prod = Config(arbs_enabled=False, outlier_live=False, ev_live=False)
+        self.assertEqual(_arbbot.groups_off(prod), {"Arbs", "Live outliers", "Live +EV"})
+        from unittest import mock
+        groups = [{"name": n, "n": 5, "of": 5, "sent": 5.0, "mean": 4.0, "lo": 1.0, "hi": 7.0, "se": 1.0,
+                   "still": 80.0, "book_moved": None, "pulled": None, "secs": 60, "verdict": ""}
+                  for n in ("Live outliers", "Props", "Arbs")]
+        with mock.patch("arbbot.markout_breakdown", return_value={"Alert type": groups, "Book": [], "Sport": []}), \
+                mock.patch("arbbot.markout_rows", return_value=[]):
+            text = _arbbot.markout_summary(prod)
+        self.assertIn("Props:", text)
+        self.assertNotIn("Live outliers", text)
+        self.assertNotIn("Arbs", text)
+
+    def test_records_can_leave_out_live_bets(self):
+        cfg = self.cfg(Config())
+        rows = [{"kind": "outlier", "live": "True", "result": "loss", "stake": "10", "profit": "-10", "book": "B",
+                 "best_ev_pct": "30", "commence_time": "2026-10-03T18:00:00Z", "manual_legs": ""},
+                {"kind": "outlier", "live": "False", "result": "win", "stake": "10", "profit": "15", "book": "B",
+                 "best_ev_pct": "20", "commence_time": "2026-10-03T18:00:00Z", "manual_legs": ""}]
+        for r in rows:
+            append_csv(cfg.ev_results_file, list(r), r)
+        self.assertTrue(_arbbot.ev_record(cfg, kinds=("outlier",)).startswith("2 bets, 1-1-0"))
+        self.assertTrue(_arbbot.ev_record(cfg, kinds=("outlier",), live=False).startswith("1 bets, 1-0-0"))
+
+    def test_a_huge_outlier_edge_warns_the_book_may_void_it(self):
+        [o] = find_outliers([outlier_event(1.85, 1.95)], Config(round_stakes=0), NOW)     # +44.8%
+        self.assertIn("may be a pricing error: Stale can void the bet", outlier_payload(o)["embeds"][0]["description"])
+        small = replace(o, price=1.40)
+        self.assertLess(small.ev_pct, _arbbot.VOID_WARN_PCT)
+        self.assertNotIn("pricing error", outlier_payload(small)["embeds"][0]["description"])
+
+    def test_results_failing_is_said_once_a_day_and_the_bot_keeps_going(self):
+        said = []
+        status = SimpleNamespace(send=said.append)
+        told = _arbbot.results_trouble(status, ValueError("bad row"), 0.0, now=100_000)
+        told = _arbbot.results_trouble(status, ValueError("bad row"), told, now=100_600)
+        self.assertEqual(len(said), 1)
+        self.assertIn("Couldn't grade or post results (ValueError: bad row)", said[0])
+        _arbbot.results_trouble(status, ValueError("bad row"), told, now=100_000 + 86400)
+        self.assertEqual(len(said), 2)
+
+    def test_a_webhook_discord_refuses_is_said_in_the_health_channel(self):
+        import io, urllib.error
+        from unittest import mock
+        cfg = Config(webhook_url="https://main", ev_webhook_url="https://ev")
+        a = EVAlerter(cfg, dry_run=False)
+        err = lambda code: urllib.error.HTTPError("https://ev", code, "x", {}, io.BytesIO(b""))
+        _arbbot.DISCORD_TROUBLE.clear()
+        with mock.patch("arbbot._webhook", side_effect=err(404)):
+            a._discord({"embeds": [{}]}, "m1", "https://ev")                        # an edit of a deleted card: not it
+            self.assertEqual(_arbbot.DISCORD_TROUBLE, {})
+            a._discord({"embeds": [{}]}, url="https://ev")                          # a new card: the webhook's gone
+        self.assertEqual(_arbbot.DISCORD_TROUBLE, {"https://ev": 404})
+        said, told = [], {}
+        _arbbot.discord_trouble(cfg, SimpleNamespace(send=said.append), told, now=1000)
+        self.assertEqual(len(said), 1)
+        self.assertIn("for the ev channel", said[0])
+        self.assertIn("run --set-webhook ev", said[0])
+        _arbbot.DISCORD_TROUBLE["https://ev"] = 404
+        _arbbot.discord_trouble(cfg, SimpleNamespace(send=said.append), told, now=2000)
+        self.assertEqual(len(said), 1)                                             # once a day
+
     # ---- Tuning from the record (TUNE_ENABLED)
     def tuned(self, markouts=(), clv=(), **kw):
         from unittest import mock
@@ -13514,6 +13580,35 @@ class EVBotSpec(MixFiles):
         rows = [{"clv_pct": "2.0"}, {"clv_pct": "-1.0"}, {"clv_pct": "5.0"}, {"clv_pct": ""}]
         self.assertEqual(day_clv_line(rows), "📐 **CLV:** avg +2.0% · beat the close on 67% (3 bets)")
         self.assertEqual(day_clv_line([{"clv_pct": ""}]), "")
+
+
+class UpdateStall(unittest.TestCase):
+    """deploy/auto-update.sh says when GitHub has been out of reach for a while (an expired token stops updates
+    silently), once, and again when it's back."""
+
+    def test_a_long_github_outage_is_said_once_then_its_end(self):
+        import os, subprocess, tempfile, shutil
+        if not shutil.which("git"):
+            self.skipTest("no git")
+        script = Path(_arbbot.__file__).parent / "deploy" / "auto-update.sh"
+        with tempfile.TemporaryDirectory() as d:
+            app, origin = Path(d) / "app", Path(d) / "origin.git"
+            git = lambda *a, cwd=app: subprocess.run(["git", *a], cwd=cwd, capture_output=True, check=True)
+            app.mkdir()
+            git("init", "-q", "-b", "main")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "start")
+            git("remote", "add", "origin", str(origin))                      # not there yet: unreachable
+
+            def run():
+                env = {"PATH": os.environ["PATH"], "HOME": d, "ARBBOT_DIR": str(app), "ARBBOT_STALL_SECONDS": "0"}
+                return subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True).stdout
+            self.assertEqual(run(), "")                                        # first miss: just noted
+            self.assertIn("hasn't been able to get updates from GitHub", run())
+            self.assertEqual(run(), "")                                        # said once
+            git("clone", "-q", "--bare", str(app), str(origin), cwd=d)          # GitHub back (nothing new)
+            self.assertIn("Updates from GitHub are working again", run())
+            self.assertFalse((app / ".update-fetch-failed").exists())
+            self.assertEqual(run(), "")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ APP="${ARBBOT_DIR:-/opt/arb-bot}"
 SERVICE="${ARBBOT_SERVICE:-arbbot}"
 SETTLE="${ARBBOT_SETTLE_SECONDS:-150}"   # how long the bot must run without crashing after an update
 SKIP="$APP/.update-skipped"               # a version that failed: not tried again
+STALL="$APP/.update-fetch-failed"         # GitHub unreachable since (epoch seconds), then "told" once said
+STALL_SECONDS="${ARBBOT_STALL_SECONDS:-10800}"   # say so after this long without reaching GitHub (3 hours)
 TMP=""                                    # scratch copy for the tests (removed on exit)
 SYSTEMCTL="${ARBBOT_SYSTEMCTL:-systemctl}"
 RESTART="${ARBBOT_RESTART:-sudo -n /usr/bin/systemctl restart $SERVICE}"
@@ -19,7 +21,11 @@ main() {
   cd "$APP" || exit 1
   local before after changes
   before=$(git rev-parse HEAD) || exit 1
-  git fetch -q origin main || exit 0           # GitHub unreachable: try again next time
+  if ! git fetch -q origin main; then         # GitHub unreachable: try again next time, and say so if it lasts
+    fetch_failed
+    exit 0
+  fi
+  fetch_ok
   after=$(git rev-parse FETCH_HEAD) || exit 0
   [ "$before" = "$after" ] && exit 0
   if ! git merge-base --is-ancestor "$before" "$after"; then
@@ -81,6 +87,26 @@ rollback() {
 tell() {
   echo "$1"
   python3 "$APP/deploy/notify.py" "$1" || true
+}
+
+fetch_failed() {   # updates can stop silently (an expired GitHub token): say so once it's been STALL_SECONDS
+  local now first
+  now=$(date +%s)
+  if [ ! -f "$STALL" ]; then
+    echo "$now" >"$STALL"
+    return 0
+  fi
+  first=$(head -n 1 "$STALL")
+  if [ $((now - first)) -ge "$STALL_SECONDS" ] && ! grep -q '^told$' "$STALL"; then
+    echo told >>"$STALL"
+    tell "⚠️ The bot hasn't been able to get updates from GitHub for $(( (now - first) / 3600 )) hours, so new changes aren't reaching it. It keeps running the current version. Usually the GitHub token on the server expired: see step 5 of the handoff guide."
+  fi
+}
+
+fetch_ok() {
+  [ -f "$STALL" ] || return 0
+  grep -q '^told$' "$STALL" && tell "✅ Updates from GitHub are working again."
+  rm -f "$STALL"
 }
 
 tell_once() {   # the same warning only once per new version
