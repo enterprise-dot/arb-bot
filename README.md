@@ -563,6 +563,12 @@ Who took what is kept in `state/taken_bets.json` on the server.
 together, so the first two alerts on a game are at full stake, the next ones at half (the card says so), and there
 are at most four per game.
 
+**First half and first quarter.** Period markets (`h2h_h1`, `spreads_h1`, `totals_h1`, `spreads_q1`, `totals_q1`...)
+listed in `PROP_MARKETS` come with each game's prop check, but are treated as game lines: the same bars as full-game
+bets (`MIN_EV_PCT`, `SPORT_MIN_EV`), the +EV channel, their own trackers, and grading from the box score's period
+scores (ESPN). A first-half moneyline is only compared with the sharp book's when both have the same number of
+outcomes (a 2-way line refunds a tie; a 3-way one has the draw as its own bet). Cards say "1H" / "1Q".
+
 **Keeping it safe.** `HEALTHCHECK_URL` (healthchecks.io) tells you when the bot stops checking in.
 `DISCORD_BACKUP_WEBHOOK_URL` gets a zipped copy of the betting record every night. The health channel is told when
 results can't be graded, when Discord refuses cards, and when updates stop reaching the server.

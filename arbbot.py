@@ -1522,6 +1522,36 @@ def base_market(key: str) -> str:
     return key[len("alternate_"):] if key.startswith("alternate_") else key
 
 
+# Period markets (first half, first quarter...): the same three bet types on part of a game. The Odds API sends them
+# per game, with the player props (PROP_MARKETS), and they're graded from the box score's period scores.
+PERIOD_NAMES = {"h1": "1st Half", "h2": "2nd Half", "q1": "1st Quarter", "q2": "2nd Quarter", "q3": "3rd Quarter",
+                "q4": "4th Quarter"}
+PERIOD_SHORT = {"h1": "1H", "h2": "2H", "q1": "1Q", "q2": "2Q", "q3": "3Q", "q4": "4Q"}
+PERIOD_QUARTERS = {"h1": (0, 1), "h2": (2, 3), "q1": (0,), "q2": (1,), "q3": (2,), "q4": (3,)}   # box-score periods
+_PERIOD_RE = re.compile(r"^(h2h|spreads|totals)_(h1|h2|q[1-4])$")
+
+
+def split_period(key: str) -> tuple[str, str]:
+    """("spreads", "h1") for spreads_h1; (the key, "") for anything that isn't a period market."""
+    m = _PERIOD_RE.match(base_market(key))
+    return (m.group(1), m.group(2)) if m else (base_market(key), "")
+
+
+def market_kind(key: str) -> str:
+    """h2h / spreads / totals for a full-game or period market (spreads_h1 -> spreads); any other key: itself."""
+    return split_period(key)[0]
+
+
+def is_period(key: str) -> bool:
+    return bool(split_period(key)[1])
+
+
+def period_prefix(market: str) -> str:
+    """"1H " for a first-half market, "" for a full-game one."""
+    period = split_period(market)[1]
+    return f"{PERIOD_SHORT[period]} " if period else ""
+
+
 def book_offers(bm: dict, ev: dict, now: datetime, is_live: bool,
                 cfg: Config) -> list[tuple[dict, dict, tuple, bool, str | None]]:
     """One book's prices to bet in one game, one per line and side: (market, outcome, (market, line),
@@ -1699,7 +1729,7 @@ def _line_for(market: str, outcome: dict, home_team: str):
         return (outcome["description"], point)
     if point is None:
         return None
-    if market == "spreads":
+    if market_kind(market) == "spreads":
         return point if outcome["name"] == home_team else -point
     return point
 
@@ -1851,6 +1881,8 @@ def find_arbs(events: list[dict], cfg: Config, now: datetime | None = None) -> l
 
 MARKET_NAMES = {
     "h2h": "Moneyline", "spreads": "Spread", "totals": "Total",
+    "h2h_h1": "1st Half Moneyline", "spreads_h1": "1st Half Spread", "totals_h1": "1st Half Total",
+    "h2h_q1": "1st Quarter Moneyline", "spreads_q1": "1st Quarter Spread", "totals_q1": "1st Quarter Total",
     # player props
     "player_pass_yds": "Passing Yards", "player_pass_tds": "Passing TDs", "player_rush_yds": "Rushing Yards",
     "player_reception_yds": "Receiving Yards", "player_receptions": "Receptions",
@@ -1897,7 +1929,7 @@ def market_label(market: str, line) -> str:
         return f"{player} · {name}" + (f" {point:g}" if point is not None else "")
     if line is None:
         return name
-    return f"{name} {line:+g}" if market == "spreads" else f"{name} {line:g}"
+    return f"{name} {line:+g}" if market_kind(market) == "spreads" else f"{name} {line:g}"
 
 
 def _line_label(arb: Arb) -> str:
@@ -3361,11 +3393,12 @@ class EVBet:
             player, point = self.line
             stat = MARKET_NAMES.get(self.market, self.market)
             return f"{player} {self.outcome}" + (f" {point:g}" if point is not None else "") + f" {stat}"
-        if self.market == "h2h":
-            return self.outcome if self.outcome == "Draw" else f"{self.outcome} ML"
+        pre, kind = period_prefix(self.market), market_kind(self.market)
+        if kind == "h2h":
+            return pre + (self.outcome if self.outcome == "Draw" else f"{self.outcome} ML")
         if self.point is None:
-            return self.outcome
-        return f"{self.outcome} {self.point:+g}" if self.market == "spreads" else f"{self.outcome} {self.point:g}"
+            return pre + self.outcome
+        return pre + (f"{self.outcome} {self.point:+g}" if kind == "spreads" else f"{self.outcome} {self.point:g}")
 
 
 def devig(prices: list[float], method: str = "multiplicative") -> list[float]:
@@ -5886,9 +5919,10 @@ RAIN_HELD = "rain-shortened"
 
 
 def settle(bet: dict, home_score: float, away_score: float) -> tuple[str, float]:
-    """Grade one logged +EV bet against the final score. Returns (win/loss/push, profit)."""
+    """Grade one logged +EV bet against the final score (a period bet: against that period's score). Returns
+    (win/loss/push, profit)."""
     home, away = bet["home_team"], bet["away_team"]
-    pick, market = bet["outcome"], bet["market"]
+    pick, market = bet["outcome"], market_kind(bet["market"])
     point = float(bet["point"]) if bet.get("point") not in ("", None) else 0.0
     if market == "h2h":
         if pick == "Draw":
@@ -6046,8 +6080,8 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
             continue   # already lost through a leg's own alert: no scores needed
         last = max(end(l) for l in legs)
         for leg in legs:
-            if leg.get("player") or (r["kind"] == "parlay" and _bet_id(leg) in known):
-                continue
+            if leg.get("player") or is_period(leg.get("market", "")) or (r["kind"] == "parlay" and _bet_id(leg) in known):
+                continue   # (props and period bets: graded from the free box score, not the paid scores)
             if recent(end(leg)) or (end(leg) <= now and recent(last)):
                 sports.add(leg["sport_key"])
                 need.setdefault(leg["event_id"], leg)
@@ -6073,6 +6107,14 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
                 continue
             res, said = grade_prop(r)
             if res is None:
+                continue
+            extra = {"actual": said}
+        elif is_period(r.get("market", "")):
+            # First half / quarter: from the box score's period scores (free, ESPN), once the game should be over.
+            if not recent(end(r)):
+                continue
+            res, said = grade_period(r)
+            if res is None or res[0] == "unknown":
                 continue
             extra = {"actual": said}
         elif r["kind"] == "parlay":
@@ -6570,7 +6612,9 @@ def parse_box(summary: dict) -> dict:
     for c in comp.get("competitors", []):
         tid = str(c.get("id") or c.get("team", {}).get("id"))
         teams[tid] = {"name": c.get("team", {}).get("displayName", ""), "score": _num(str(c.get("score", ""))),
-                      "players": {}}
+                      "players": {}, "home": c.get("homeAway") == "home",
+                      # (each period's points, overtime last: first-half and quarter bets are graded from these)
+                      "periods": [_num(str(x.get("displayValue", x.get("value", "")))) for x in c.get("linescores") or []]}
     for side in summary.get("boxscore", {}).get("players", []):
         tid = str(side.get("team", {}).get("id"))
         team = teams.setdefault(tid, {"name": side.get("team", {}).get("displayName", ""), "score": None,
@@ -6863,6 +6907,37 @@ def find_player(box: dict, name: str) -> dict | None:
     return close[0] if len(close) == 1 else None
 
 
+def period_scores(box: dict, market: str) -> tuple[float, float] | None:
+    """(home, away) points in a period market's part of the game (spreads_h1: quarters 1 and 2), from the box
+    score's period scores, or None when they aren't all there or don't add up to the final score."""
+    quarters = PERIOD_QUARTERS[split_period(market)[1]]
+    sides = {t["home"]: t for t in box["teams"].values()}
+    if set(sides) != {True, False}:
+        return None
+    out = []
+    for team in (sides[True], sides[False]):
+        per = team.get("periods") or []
+        if len(per) <= max(quarters) or None in per or team["score"] is None or sum(per) != team["score"]:
+            return None
+        out.append(float(sum(per[i] for i in quarters)))
+    return out[0], out[1]
+
+
+def grade_period(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
+    """((result, profit), the period's score) for a first-half / quarter bet, or (None, why not yet)."""
+    try:
+        box, why = game_box(row["sport_key"], row["home_team"], row["away_team"], row["commence_time"])
+    except Exception as e:  # noqa: BLE001 - ESPN down or changed: leave it for later / manual
+        return None, f"ESPN error: {e!r:.120}"
+    if box is None:
+        return None, why
+    pts = period_scores(box, row["market"])
+    if pts is None:
+        return None, "no period scores in the box score"
+    home, away = pts
+    return settle(row, home, away), f"{away:g}-{home:g}"
+
+
 def settle_prop(row: dict, value: float) -> tuple[str, float]:
     """Over/Under the line, or Yes/No (anytime TD: at least one)."""
     point = float(row["point"]) if row.get("point") not in ("", None) else None
@@ -6916,11 +6991,12 @@ def row_pick(r: dict) -> str:
     if r.get("player"):
         stat = MARKET_NAMES.get(r["market"], r["market"])
         return f"{r['player']} {r['outcome']}" + (f" {float(point):g}" if point not in ("", None) else "") + f" {stat}"
-    if r["market"] == "h2h":
-        return r["outcome"] if r["outcome"] == "Draw" else f"{r['outcome']} ML"
+    pre, kind = period_prefix(r["market"]), market_kind(r["market"])
+    if kind == "h2h":
+        return pre + (r["outcome"] if r["outcome"] == "Draw" else f"{r['outcome']} ML")
     if point in ("", None):
-        return r["outcome"]
-    return f"{r['outcome']} {float(point):+g}" if r["market"] == "spreads" else f"{r['outcome']} {float(point):g}"
+        return pre + r["outcome"]
+    return pre + (f"{r['outcome']} {float(point):+g}" if kind == "spreads" else f"{r['outcome']} {float(point):g}")
 
 
 def local_day(cfg: Config, ts: str):
@@ -7705,7 +7781,7 @@ def _row_line(row: dict) -> float | None:
     if row.get("point") in ("", None):
         return None
     point = float(row["point"])
-    if row["market"] == "spreads":
+    if market_kind(row["market"]) == "spreads":
         return point if row["outcome"] == row["home_team"] else -point
     return point
 
@@ -7827,6 +7903,8 @@ def clv_rows(cfg: Config, days: int | None = None) -> list[dict]:
 def _market_group(row: dict) -> str:
     if row.get("player"):
         return "Player props"
+    if is_period(row["market"]):
+        return "Halves & quarters"
     return {"h2h": "Moneylines", "spreads": "Spreads", "totals": "Totals"}.get(row["market"], row["market"])
 
 
@@ -10184,7 +10262,7 @@ def same_game(bets: list, cfg: Config, t: "Trackers", alerters: tuple) -> list:
     if not (cfg.same_game_full or cfg.same_game_max):
         return bets
     up = {k for a in alerters for k in (*a.open, *a.restored)}
-    every = (t.evs, t.outs, t.prop_evs, t.prop_outs)
+    every = (t.evs, t.outs, t.prop_evs, t.prop_outs, t.period_evs, t.period_outs)
     out_on: dict[str, set[str]] = {}
     for key in {*t.alerted.until, *(k for a in every for k in (*a.open, *a.restored))}:
         if key.startswith("ev|"):
@@ -10256,35 +10334,41 @@ class Trackers:
         self.prop_evs = EVAlerter(cfg, dry_run=dry, noun="+EV props", props=True)
         self.prop_outs = OutlierAlerter(cfg, dry_run=dry, noun="prop outliers", props=True)
         self.parlays = ParlayAlerter(cfg, dry_run=dry)
+        # First half / quarter bets (PROP_MARKETS' period markets): game-line bets with their own trackers, since they
+        # come with the props (a prop check must never close a full-game card, nor a main-line check one of these).
+        self.period_evs = EVAlerter(cfg, dry_run=dry, noun="+EV halves and quarters")
+        self.period_outs = OutlierAlerter(cfg, dry_run=dry, noun="outlier halves and quarters")
         self.closing = ClosingTracker(cfg)
-        for a in (self.evs, self.prop_evs):
+        for a in (self.evs, self.prop_evs, self.period_evs):
             a.on_log = self.closing.add
-        for a in (self.outs, self.prop_outs):
+        for a in (self.outs, self.prop_outs, self.period_outs):
             a.on_log = functools.partial(self.closing.add, kind="outlier")
         # Every new alert's price is checked again on the next checks (markouts; not for --once,
         # --demo or --dry-run).
-        self.markouts = make_markouts(cfg, args, [self.arbs, self.evs, self.outs,
-                                                  self.prop_arbs, self.prop_evs, self.prop_outs])
+        self.markouts = make_markouts(cfg, args, [self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs,
+                                                  self.prop_outs, self.period_evs, self.period_outs])
         # What the caps and live rules hold back, per day and alert type, for the weekly report card
         # (saved by run(); not for --once, --demo or --dry-run, which mustn't write the service's files).
         off = any(getattr(args, flag, False) for flag in ("once", "demo", "dry_run"))
         self.held = HeldTally(cfg, None if off else held_path(cfg))
-        for a in (self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs, self.prop_outs, self.parlays):
+        for a in (self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs, self.prop_outs, self.parlays,
+                  self.period_evs, self.period_outs):
             a.on_held = self.held.add
         # Bets alerted once already (ONE_ALERT_PER_BET), one memory for every bet alerter: +EV and outliers share
         # keys. Saved only by the service (not --once, --demo or --dry-run), so a restart remembers them.
         self.alerted = AlertedBets(None if off or not cfg.state_dir or not cfg.webhook_url
                                    else data_path(cfg.state_dir) / "alerted_bets.json")
-        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays):
+        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.period_evs, self.period_outs):
             a.alerted = self.alerted
         # ✅ bet tracking (DISCORD_BOT_TOKEN; not --once, --demo or --dry-run).
         self.reactions = BetReactions(cfg, off)
         if self.reactions.on:
-            for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays):
+            for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.period_evs,
+                      self.period_outs):
                 a.on_posted = self.reactions.add
         # Bets that came close and what happened to them (CANDIDATE_LOG_FILE; not for --once, --demo or --dry-run).
         self.candidates = CandidateLog(replace(cfg, candidate_log_file="") if off else cfg)
-        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs):
+        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.period_evs, self.period_outs):
             a.on_candidate = self.candidates.add
         self.sharp_history = SharpHistory(cfg.move_window_minutes)
         self.sharp_down: set[str] = set()   # sports the sharp book is missing from (Health; run() keeps it)
@@ -10295,7 +10379,9 @@ class Trackers:
         self.prop_prices = PriceHistory()
         # Prop markets left out as bad data, kept out until back in line (prop_glitches).
         self.prop_glitch_hold: dict = {}
-        self.evs.max_per_hour = cfg.max_ev_per_hour
+        self.evs.max_per_hour = self.period_evs.max_per_hour = cfg.max_ev_per_hour
+        self.period_evs.posted_at = self.evs.posted_at   # (one hourly count for +EV game lines, halves included)
+        self.period_outs.max_per_hour = cfg.max_outlier_per_hour
         self.prop_evs.max_per_hour = cfg.max_prop_per_hour
         self.parlays.max_per_hour = cfg.max_parlay_per_hour
         self.arbs.max_per_hour = self.prop_arbs.max_per_hour = cfg.max_arb_per_hour
@@ -10318,7 +10404,8 @@ class Trackers:
 
     def singles(self) -> list[Alerter]:
         """Every alerter but parlays."""
-        return [self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs, self.prop_outs]
+        return [self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs, self.prop_outs, self.period_evs,
+                self.period_outs]
 
     def set_live_interval(self, seconds: float) -> None:
         """How often live games are checked right now (POLL_SECONDS, or slower on a tight budget):
@@ -10430,6 +10517,9 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
     at = now or datetime.now(timezone.utc)
     ts = at.timestamp()
     take_held(t.prop_arbs, t.prop_outs, t.prop_evs)
+    # First half / quarter prices come in the same answers: checked on their own, as game lines (scan_periods).
+    periods = scan_periods(t, keep_markets(prop_events, is_period), checked, at)
+    prop_events = keep_markets(prop_events, lambda key: not is_period(key))
     t.prop_prices.held, t.prop_prices.missed = {}, []
     carded = {k for a in (t.prop_evs, t.prop_outs) for k in (*a.open, *a.restored)}
     alt_seen: set = set()   # alternate-line prices with a fair price at exactly their line
@@ -10469,7 +10559,79 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
                                   if k not in carded and op.arb.alt))
     return SimpleNamespace(n_arb=n_arb, n_out=n_out, n_ev=n_ev, held=take_held(t.prop_arbs, t.prop_outs, t.prop_evs),
                            prices_held=dict(t.prop_prices.held), missed=list(t.prop_prices.missed), alt=alt,
-                           events=prop_events)
+                           events=join_markets(prop_events, periods.events), n_period=periods.sent,
+                           period_held=periods.held)
+
+
+def periods_on(cfg: Config) -> bool:
+    """Is any first-half / quarter market asked for (PROP_MARKETS)?"""
+    return any(is_period(m) for v in cfg.prop_markets.values() for m in _csv(v.replace("|", ",")))
+
+
+def keep_markets(events: list[dict], want) -> list[dict]:
+    """The same games with only the markets whose key passes want(key) (copies; books left with none dropped)."""
+    out = []
+    for ev in events:
+        books = [{**bm, "markets": [m for m in bm.get("markets", []) if want(m.get("key", ""))]}
+                 for bm in ev.get("bookmakers", [])]
+        out.append({**ev, "bookmakers": [bm for bm in books if bm["markets"]]})
+    return out
+
+
+def join_markets(a: list[dict], b: list[dict]) -> list[dict]:
+    """Two market-split copies of the same games put back together (markouts and closing lines read both)."""
+    extra = {ev["id"]: {bm["key"]: bm["markets"] for bm in ev.get("bookmakers", [])} for ev in b}
+    out = []
+    for ev in a:
+        more = dict(extra.pop(ev["id"], {}))
+        books = [{**bm, "markets": bm["markets"] + more.pop(bm["key"], [])} for bm in ev.get("bookmakers", [])]
+        books += [bm for bm in next((e["bookmakers"] for e in b if e["id"] == ev["id"]), []) if bm["key"] in more]
+        out.append({**ev, "bookmakers": books})
+    return out + [ev for ev in b if ev["id"] in extra]
+
+
+def same_period_shape(events: list[dict], cfg: Config) -> list[dict]:
+    """A first-half moneyline is 2-way at some books (a tie refunds) and 3-way at others (a tie loses, and the draw
+    is a bet of its own): they aren't the same bet. Each book's period moneyline is kept only when it has as many
+    outcomes as the sharp book's (no sharp price: left as it is; find_evs then has no fair price for it anyway)."""
+    sharp = set(_csv(cfg.sharp_books))
+    out = []
+    for ev in events:
+        shape = {m["key"]: len(m.get("outcomes", [])) for bm in ev.get("bookmakers", []) if bm["key"] in sharp
+                 for m in bm.get("markets", []) if market_kind(m.get("key", "")) == "h2h"}
+        books = [{**bm, "markets": [m for m in bm.get("markets", [])
+                                    if market_kind(m.get("key", "")) != "h2h" or m["key"] not in shape
+                                    or len(m.get("outcomes", [])) == shape[m["key"]]]}
+                 for bm in ev.get("bookmakers", [])]
+        out.append({**ev, "bookmakers": [bm for bm in books if bm["markets"]]})
+    return out
+
+
+def scan_periods(t: Trackers, events: list[dict], checked: set[str], now: datetime) -> SimpleNamespace:
+    """First half / quarter bets (pre-game, from the per-game check): the same finders, bars and rules as game lines
+    (MIN_EV_PCT, SPORT_MIN_EV, confidence, tuning, the same-game limit), on their own trackers."""
+    cfg = t.cfg
+    ts = now.timestamp()
+    events = same_period_shape(events, cfg)
+    take_held(t.period_outs, t.period_evs)
+    if not any(bm.get("markets") for ev in events for bm in ev.get("bookmakers", [])):
+        return SimpleNamespace(sent=0, held={}, events=events)
+    up = set(t.period_evs.open) | set(t.period_evs.restored)
+    rejects: list = []
+    outs = find_outliers(events, cfg, now, history=t.price_history, rejects=rejects)
+    evs = without_outliers(find_evs(events, cfg, now, history=t.sharp_history, keep=up, sharp_down=t.sharp_down,
+                                    rejects=rejects), outs)
+    t.candidates.extend(rejects, ts)
+    outs = tune_bets(outs, cfg, t.tuned(), (t.period_outs, t.period_evs))
+    evs = tune_bets(evs, cfg, t.tuned(), (t.period_evs, t.period_outs))
+    kept = {b.key for b in same_game(outs + evs, cfg, t, (t.period_evs, t.period_outs))}
+    outs, evs = [b for b in outs if b.key in kept], [b for b in evs if b.key in kept]
+    hand_over(evs, outs, t.period_evs, t.period_outs, ts)
+    fetched = fetched_at(events)
+    sent = t.period_outs.handle(outs, checked_events=checked, now=ts, fetched=fetched)
+    sent += t.period_evs.handle(evs, checked_events=checked, now=ts, fetched=fetched)
+    t.closing.observe(events, now)
+    return SimpleNamespace(sent=sent, held=take_held(t.period_outs, t.period_evs), events=events)
 
 
 def confirmed_text(sent: int, misses: dict[str, int]) -> str:
@@ -10655,11 +10817,14 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 sections.append(("🚨 **Outliers**", f"{out_alerter.summary()}\nIf you bet every "
                                  f"{'alert' if cfg.outlier_live else 'pre-game alert'}: last 7 days "
                                  f"{ev_record(cfg, 7, kinds=('outlier',), live=live)}"))
+            if periods_on(cfg):
+                sections.append(("🕐 **Halves & quarters**", f"{t.period_evs.summary()}; {t.period_outs.summary()}"))
             if cfg.parlays_enabled:
                 sections.append(("📦 **Parlays**", parlay_alerter.summary()))
             book = getattr(api, "costs", None)
             status.send_card(summary_payload(cfg, sections, api.remaining, book.take_today() if book else None))
-            for a in (alerter, ev_alerter, out_alerter, parlay_alerter, prop_arbs, prop_evs, prop_outs):
+            for a in (alerter, ev_alerter, out_alerter, parlay_alerter, prop_arbs, prop_evs, prop_outs, t.period_evs,
+                      t.period_outs):
                 a.reset_stats()
 
         if cfg.log_keep_days and not (args.once or args.dry_run) and local.date() != pruned_day:
@@ -10780,7 +10945,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             prop_events = p.events   # without prices that looked like bad data (markouts read these too)
             left = f"{api.remaining:,.0f}" if api.remaining is not None else "?"
             print(f"[{datetime.now():%H:%M:%S}] props: {len(prop_games)} games ({time.time() - t0:.1f}s) | "
-                  f"{p.n_arb} new arbs, {p.n_ev} new +EV, {p.n_out} new outliers{held_text(p.held)}"
+                  f"{p.n_arb} new arbs, {p.n_ev} new +EV, {p.n_out} new outliers"
+                  + (f", {p.n_period} new half/quarter" if periods_on(cfg) else "") +
+                  f"{held_text({k: p.held.get(k, 0) + p.period_held.get(k, 0) for k in {*p.held, *p.period_held}})}"
                   f"{prop_guard_text(p.prices_held, p.missed, (_csv(cfg.sharp_books) or ['sharp'])[0].title())}"
                   f"{alt_text(p.alt)} | "
                   f"credits left {left}", flush=True)

@@ -2421,7 +2421,10 @@ def espn_fake(games):
         g = next(g for g in games if g["id"] == eid)
         return {"header": {"competitions": [{
                     "status": {"type": {"completed": g["final"], "state": "post" if g["final"] else "in"}},
-                    "competitors": [{"id": t[0], "team": team(t), "score": str(t[4])} for t in (g["home"], g["away"])]}]},
+                    "competitors": [{"id": t[0], "team": team(t), "score": str(t[4]), "homeAway": ha,
+                                     **({"linescores": [{"displayValue": str(x)} for x in g["periods"][ha]]}
+                                        if g.get("periods") else {})}
+                                    for t, ha in ((g["home"], "home"), (g["away"], "away"))]}]},
                 "boxscore": {"players": [{"team": {"id": tid}, "statistics": [
                     {"name": gname, "labels": labels, "keys": keys, "athletes": [
                         {"athlete": {"displayName": who}, "stats": stats, "didNotPlay": dnp}
@@ -2719,6 +2722,47 @@ class PropGrading(unittest.TestCase):
         self.assertEqual((yes("Al Horford", "player_double_double"), yes("Al Horford", "player_triple_double")),
                          ("win", "loss"))
         self.assertEqual(cel(player="Jaylen Brown", market="player_double_double", point="", outcome="No")[0][0], "win")
+
+    def test_first_half_and_quarter_bets_are_graded_from_the_period_scores(self):
+        # Oct 10: ESPN's game header has each team's points by quarter (overtime last); a half is quarters 1 + 2.
+        from arbbot import grade_period
+        g = lambda name, labels, keys, rows: (name, labels, keys, rows)
+        passing = (["C/ATT", "YDS", "TD"], ["completions/passingAttempts", "passingYards", "passingTouchdowns"])
+        receiving = (["REC", "YDS", "TD"], ["receptions", "receivingYards", "receivingTouchdowns"])
+        self.games.append({"sport": "football/nfl", "id": "8", "date": "2026-10-04T17:00Z", "final": True,
+                           "home": ("2", "Buffalo Bills", "Buffalo", "Bills", 27),
+                           "away": ("20", "New York Jets", "New York", "Jets", 23),
+                           "periods": {"home": [7, 10, 3, 7], "away": [3, 3, 7, 7, 3]},   # Jets: overtime FG
+                           "groups": {"2": [g("passing", *passing, [("Josh Allen", ["2/3", "40", "0"], False)]),
+                                            g("receiving", *receiving, [("Khalil Shakir", ["2", "40", "0"], False)])],
+                                      "20": [g("passing", *passing, [("Justin Fields", ["1/2", "10", "0"], False)]),
+                                             g("receiving", *receiving, [("Garrett Wilson", ["1", "10", "0"], False)])]}})
+        self.games[-1]["home"] = ("2", "Buffalo Bills", "Buffalo", "Bills", 27)
+        self.games[-1]["away"] = ("20", "New York Jets", "New York", "Jets", 23)
+        row = lambda market, outcome, point="", n=2: dict(
+            self.row(home="Buffalo Bills", away="New York Jets", sport="americanfootball_nfl"),
+            commence_time="2026-10-04T17:00:00Z", market=market, outcome=outcome, point=point, player="",
+            n_outcomes=n)
+        self.assertEqual(grade_period(row("spreads_h1", "Buffalo Bills", "-9.5"))[0][0], "win")    # 17-6: by 11
+        self.assertEqual(grade_period(row("spreads_h1", "Buffalo Bills", "-9.5"))[1], "6-17")
+        self.assertEqual(grade_period(row("totals_h1", "Over", "23.5"))[0][0], "loss")             # 23
+        self.assertEqual(grade_period(row("h2h_h1", "New York Jets"))[0][0], "loss")
+        self.assertEqual(grade_period(row("spreads_q1", "New York Jets", "+4.5"))[0][0], "win")    # 7-3
+        self.assertEqual(grade_period(row("spreads_q1", "New York Jets", "+3.5"))[0][0], "loss")
+        self.assertEqual(grade_period(row("totals_q1", "Under", "10"))[0][0], "push")
+        self.assertEqual(_arbbot.row_pick(row("spreads_h1", "Buffalo Bills", "-9.5")), "1H Buffalo Bills -9.5")
+        self.assertEqual(_arbbot.row_pick(row("h2h_h1", "New York Jets")), "1H New York Jets ML")
+        self.assertEqual(_arbbot.row_pick(row("totals_q1", "Under", "10")), "1Q Under 10")
+
+    def test_a_period_bet_waits_when_the_period_scores_dont_add_up(self):
+        box = {"teams": {"1": {"home": True, "score": 20, "periods": [7, 7, 3, 0]},       # adds to 17, not 20
+                         "2": {"home": False, "score": 10, "periods": [0, 3, 7, 0]}}}
+        self.assertIsNone(_arbbot.period_scores(box, "spreads_h1"))
+        box["teams"]["1"]["periods"] = [7, 7, 3, 3]
+        self.assertEqual(_arbbot.period_scores(box, "spreads_h1"), (14.0, 3.0))
+        self.assertEqual(_arbbot.period_scores(box, "totals_q1"), (7.0, 0.0))
+        box["teams"]["2"]["periods"] = [0]
+        self.assertIsNone(_arbbot.period_scores(box, "spreads_h1"))                     # not all there
 
     def test_unsupported_props_stay_manual(self):
         from arbbot import gradable
@@ -8492,7 +8536,7 @@ class HeldBackCount(MixFiles):
         self.assertEqual(t.held.days, {"2026-10-03": {"+EV": {"capped": 1, "old price": 1}}})
         t.held.save()
         self.assertEqual(_arbbot.read_held(Path(cfg.state_dir) / _arbbot.HELD_FILE), t.held.days)
-        self.assertEqual([a.on_held for a in (*t.singles(), t.parlays)], [t.held.add] * 7)   # every alerter
+        self.assertEqual([a.on_held for a in (*t.singles(), t.parlays)], [t.held.add] * 9)   # every alerter
         for flags in ({"dry_run": True}, {"once": True, "dry_run": False}, {"demo": True, "dry_run": False}):
             self.assertIsNone(_arbbot.Trackers(cfg, self.args(**flags)).held.path, flags)   # they write nothing
 
@@ -13072,7 +13116,7 @@ class EVBotSpec(MixFiles):
         t = _arbbot.Trackers(cfg, self.args(dry_run=False))
         ids = iter(f"m{i}" for i in range(1, 1000))
         self.bodies = []   # each call's card text, in the same order as sent
-        for a in (t.arbs, t.evs, t.outs, t.prop_arbs, t.prop_evs, t.prop_outs, t.parlays):
+        for a in (t.arbs, t.evs, t.outs, t.prop_arbs, t.prop_evs, t.prop_outs, t.parlays, t.period_evs, t.period_outs):
             def fake(payload, message_id=None, url="", a=a):
                 a.send_retryable = False
                 self.bodies.append(payload["embeds"][0].get("description", ""))
@@ -13629,6 +13673,57 @@ class EVBotSpec(MixFiles):
         text = _arbbot.weekly_payload(cfg, date(2026, 10, 5))["embeds"][0]["description"]
         self.assertIn("🏆 Members this week", text)
         self.assertIn("Joey +", text)
+
+    # ---- Oct 10: first half and first quarter lines
+    def period_game(self, books, ev_id="e1", market="spreads_h1"):
+        lines = {"spreads_h1": [("Home", 1.91, -3.5), ("Away", 1.91, 3.5)],
+                 "h2h_h1": [("Home", 1.91, None), ("Away", 1.91, None)]}
+        ev = event({"Pinnacle": [(market, lines[market])], **{b: [(market, o)] for b, o in books.items()}}, start=self.PRE)
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        ev.update(id=ev_id, sport_key="basketball_nba")
+        return ev
+
+    def test_first_half_bets_go_out_as_game_lines_on_their_own_trackers(self):
+        sent = []
+        t = self.live(sent, ev_webhook_url="https://ev", props_webhook_url="https://props", one_alert_per_bet=True)
+        full = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]}, start=self.PRE)
+        full.update(id="e1", sport_key="basketball_nba")
+        self.main(t, [full], 0)                                                         # a full-game card is up
+        half = self.period_game({"B": [("Home", 2.15, -3.5), ("Away", 1.70, 3.5)]})
+        p = _arbbot.scan_props(t, [stamped(half, 60)], {"e1"}, at(60))
+        self.assertEqual(p.n_period, 1)
+        [op] = t.period_evs.open.values()
+        self.assertEqual((op.arb.pick, op.url), ("1H Home -3.5", "https://ev"))          # +EV channel, not props
+        self.assertTrue(sent[-1][1].startswith("📈 +EV") and "1H Home -3.5 +115 at B" in sent[-1][1])
+        self.assertEqual(len(t.evs.open), 1)                                             # the full-game card: untouched
+        self.assertEqual((t.prop_evs.open, t.prop_outs.open), ({}, {}))
+        self.assertEqual(_arbbot.market_label("spreads_h1", -3.5), "1st Half Spread -3.5")
+        _arbbot.scan_props(t, [stamped(self.period_game({"B": [("Home", 1.90, -3.5), ("Away", 1.92, 3.5)]}), 120)],
+                           {"e1"}, at(120))
+        self.assertEqual(t.period_evs.open, {})                                          # gone: GONE as always
+        self.assertEqual(len(t.evs.open), 1)
+
+    def test_a_2_way_half_moneyline_is_never_priced_against_a_3_way_one(self):
+        cfg = Config(min_ev_pct=3)
+        ev = event({"Pinnacle": [("h2h_h1", [("Home", 2.6, None), ("Away", 3.2, None), ("Draw", 5.5, None)])],
+                    "B": [("h2h_h1", [("Home", 2.2, None), ("Away", 1.7, None)])],
+                    "C": [("h2h_h1", [("Home", 2.9, None), ("Away", 3.3, None), ("Draw", 5.0, None)])]})
+        ev["bookmakers"][0]["key"] = "pinnacle"
+        books = {bm["title"]: [m["key"] for m in bm["markets"]] for bm in _arbbot.same_period_shape([ev], cfg)[0]["bookmakers"]}
+        self.assertEqual(books, {"Pinnacle": ["h2h_h1"], "C": ["h2h_h1"]})                # B's 2-way line is left out
+
+    def test_split_markets_come_back_together(self):
+        ev = event({"Pinnacle": [("spreads_h1", [("Home", 1.9, -1.5)]), ("player_points", [("Over", 1.9, 20.5)])],
+                    "B": [("player_points", [("Over", 2.0, 20.5)])]})
+        periods = _arbbot.keep_markets([ev], _arbbot.is_period)
+        props = _arbbot.keep_markets([ev], lambda k: not _arbbot.is_period(k))
+        self.assertEqual([b["title"] for b in periods[0]["bookmakers"]], ["Pinnacle"])      # B had no period market
+        back = _arbbot.join_markets(props, periods)
+        self.assertEqual({b["title"]: sorted(m["key"] for m in b["markets"]) for b in back[0]["bookmakers"]},
+                         {"Pinnacle": ["player_points", "spreads_h1"], "B": ["player_points"]})
+        self.assertEqual(_arbbot.split_period("alternate_spreads_h1"), ("spreads", "h1"))      # (the same bet)
+        self.assertEqual(_arbbot.split_period("totals_q1"), ("totals", "q1"))
+        self.assertFalse(_arbbot.is_period("player_points"))
 
     # ---- Tuning from the record (TUNE_ENABLED)
     def tuned(self, markouts=(), clv=(), **kw):
