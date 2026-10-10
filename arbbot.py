@@ -437,6 +437,9 @@ class Config:
     # The public results page (GitHub Pages): the repo it lives in ("owner/name", in remote.env) and a GitHub token
     # that can write only that repo (RESULTS_SITE_TOKEN, set with --set). Nightly, the bot uploads the page and the
     # graded pre-game bets (finished games only: nothing a non-member could bet). Either empty = off.
+    # Parlay cards at these books get one link that puts every leg in the bet slip (PARLAY_LINK_BOOKS=fanduel,draftkings).
+    # The books don't document a multi-leg link, so each can be turned off here if its link stops working. Empty = off.
+    parlay_link_books: str = ""
     results_site_repo: str = ""
     results_site_token: str = ""
     reaction_minutes: int = 10
@@ -708,6 +711,7 @@ class Config:
             healthcheck_url=e("HEALTHCHECK_URL", "").strip(),
             backup_webhook_url=e("DISCORD_BACKUP_WEBHOOK_URL", ""),
             results_site_repo=e("RESULTS_SITE_REPO", "").strip(),
+            parlay_link_books=e("PARLAY_LINK_BOOKS", "").strip().lower(),
             results_site_token=e("RESULTS_SITE_TOKEN", "").strip(),
             reaction_minutes=num("REACTION_MINUTES", d.reaction_minutes, int),
             tune_slow_still_pct=num("TUNE_SLOW_STILL_PCT", d.tune_slow_still_pct, float),
@@ -1622,6 +1626,44 @@ def _fanduel_link(ev: dict, bm: dict, mkt: dict, oc: dict) -> str:
         return ""
     q = functools.partial(urllib.parse.quote, safe="")
     return f"https://sportsbook.fanduel.com/addToBetslip?marketId={q(str(market))}&selectionId={q(str(bet))}"
+
+
+def _query(link: str) -> dict[str, str]:
+    """A link's query parameters (the first value of each)."""
+    return {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlsplit(link).query).items() if v}
+
+
+def _fanduel_slip(links: list[str]) -> str:
+    """FanDuel: every leg's (marketId, selectionId) in one addToBetslip link, numbered marketId[0], selectionId[0]..."""
+    pairs = [(q.get("marketId"), q.get("selectionId")) for q in map(_query, links)]
+    if not all(m and sel for m, sel in pairs):
+        return ""
+    params = [(f"{name}[{i}]", value) for i, (m, sel) in enumerate(pairs)
+              for name, value in (("marketId", m), ("selectionId", sel))]
+    return "https://sportsbook.fanduel.com/addToBetslip?" + urllib.parse.urlencode(params)
+
+
+def _draftkings_slip(links: list[str]) -> str:
+    """DraftKings: every leg's outcome id in one link's outcomes, joined with "+"."""
+    outcomes = [_query(link).get("outcomes") for link in links]
+    if not all(outcomes):
+        return ""
+    game = urllib.parse.urlsplit(links[0]).path.rstrip("/").rsplit("/", 1)[-1]
+    joined = "+".join(urllib.parse.quote(o, safe="") for o in outcomes)
+    return f"https://sportsbook.draftkings.com/event/{urllib.parse.quote(game, safe='')}?outcomes={joined}"
+
+
+# One bet-slip link for a whole parlay, from its legs' own bet-slip links, by book (PARLAY_LINK_BOOKS turns each on).
+SLIP_BUILDERS = {"fanduel": _fanduel_slip, "draftkings": _draftkings_slip}
+
+
+def parlay_slip_link(cfg: Config, book: str, links: list[str]) -> str:
+    """The parlay's one link with every leg in the slip, or "" (the book isn't on, or a leg has no bet-slip link)."""
+    slug = book_slug(book)
+    build = SLIP_BUILDERS.get(slug)
+    if not build or slug not in {book_slug(b) for b in _csv(cfg.parlay_link_books)} or not all(links):
+        return ""
+    return build(links)
 
 
 def _feed_link_only(ev: dict, bm: dict, mkt: dict, oc: dict) -> str:
@@ -5835,7 +5877,7 @@ def format_parlay_text(p: Parlay) -> str:
 
 
 def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None,
-                   first_seen: float | None = None) -> dict:
+                   first_seen: float | None = None, slip: str = "") -> dict:
     if gone_after is not None:
         return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~📦 +{p.ev_pct:.1f}%~~ parlay at {p.book}",
                           "Ignore this one. A leg's price moved and the parlay isn't worth it anymore.")
@@ -5846,13 +5888,15 @@ def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None
         + ("🔴 LIVE" if b.is_live else f"<t:{int(_parse_time(b.commence_time).timestamp())}:t>")
         for i, (b, pr, ln) in enumerate(p.legs))
     worst = (1 + OK_EDGE_PCT / 100) / p.fair_prob
+    one = (f"🔗 **[Add all {len(p.legs)} legs to the {p.book} bet slip]({slip})** (or tap each leg below)\n\n"
+           if slip else "")
     desc = (f"👉 **DO THIS: one parlay ticket at {p.book}.** Every leg must win. Pays big, wins less often.\n\n"
-            f"Open **{p.book}** → add these {len(p.legs)} legs → bet **{p.stake_label}**\n\n{legs}\n\n"
+            f"{one}Open **{p.book}** → add these {len(p.legs)} legs → bet **{p.stake_label}**\n\n{legs}\n\n"
             f"Ticket should pay about **{odds(p.price)}** · skip if it's worse than **{odds(worst)}**"
             f"{DIVIDER}**Chance all legs win:** {p.fair_prob:.1%} (fair) · each leg is +EV on its own.\n"
             f"Legs are from different games, so they don't affect each other.")
     return _card(f"📦 PARLAY +{p.ev_pct:.1f}% EV · {len(p.legs)} legs at {p.book} · {odds(p.price)}", desc,
-                 0x9B59B6, footer="PARLAY = several +EV bets on one ticket. Small stake: parlays swing a lot.",
+                 0x9B59B6, url=slip, footer="PARLAY = several +EV bets on one ticket. Small stake: parlays swing a lot.",
                  mention=mention)
 
 
@@ -5874,7 +5918,8 @@ class ParlayAlerter(Alerter):
         return format_parlay_text(item)
 
     def payload(self, item, mention="", gone_after=None, first_seen=None) -> dict:
-        return parlay_payload(item, mention, gone_after, first_seen)
+        slip = parlay_slip_link(self.cfg, item.book, [ln for _, _, ln in item.legs])
+        return parlay_payload(item, mention, gone_after, first_seen, slip)
 
     def value(self, item) -> float:
         return item.ev_pct

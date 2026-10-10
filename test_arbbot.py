@@ -13725,6 +13725,42 @@ class EVBotSpec(MixFiles):
         self.assertEqual(_arbbot.split_period("totals_q1"), ("totals", "q1"))
         self.assertFalse(_arbbot.is_period("player_points"))
 
+    # ---- Oct 10: one bet-slip link for a whole parlay
+    def test_a_fanduel_parlay_gets_one_link_with_every_leg(self):
+        import urllib.parse
+        cfg = Config(parlay_link_books="fanduel,draftkings")
+        legs = ["https://sportsbook.fanduel.com/addToBetslip?marketId=734.1&selectionId=11",
+                "https://sportsbook.fanduel.com/addToBetslip?marketId=734.2&selectionId=22"]
+        link = _arbbot.parlay_slip_link(cfg, "FanDuel", legs)
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)
+        self.assertTrue(link.startswith("https://sportsbook.fanduel.com/addToBetslip?"))
+        self.assertEqual((q["marketId[0]"], q["selectionId[0]"], q["marketId[1]"], q["selectionId[1]"]),
+                         (["734.1"], ["11"], ["734.2"], ["22"]))
+        self.assertEqual(_arbbot.parlay_slip_link(cfg, "FanDuel", legs[:1] + [""]), "")       # a leg with no link
+        self.assertEqual(_arbbot.parlay_slip_link(cfg, "FanDuel", legs[:1] + ["https://fanduel.com/nba"]), "")
+        self.assertEqual(_arbbot.parlay_slip_link(Config(parlay_link_books="draftkings"), "FanDuel", legs), "")  # off
+        self.assertEqual(_arbbot.parlay_slip_link(cfg, "BetMGM", legs), "")                     # no builder
+
+    def test_a_draftkings_parlay_gets_one_link_with_every_leg(self):
+        cfg = Config(parlay_link_books="draftkings")
+        legs = ["https://sportsbook.draftkings.com/event/31234?outcomes=0QA1%2311_1",
+                "https://sportsbook.draftkings.com/event/31299?outcomes=0QA2%2322_2"]
+        self.assertEqual(_arbbot.parlay_slip_link(cfg, "DraftKings", legs),
+                         "https://sportsbook.draftkings.com/event/31234?outcomes=0QA1%2311_1+0QA2%2322_2")
+
+    def test_the_parlay_card_shows_the_one_link(self):
+        legs = [ev_leg(g, {"FanDuel": 2.20}) for g in ("g1", "g2")]
+        [p] = find_parlays(legs, Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2))
+        p.legs = [(b, pr, f"https://sportsbook.fanduel.com/addToBetslip?marketId=1.{i}&selectionId={i}")
+                  for i, (b, pr, _) in enumerate(p.legs)]
+        card = ParlayAlerter(Config(parlay_link_books="fanduel"), dry_run=True).payload(p)["embeds"][0]
+        self.assertIn("🔗 **[Add all 2 legs to the FanDuel bet slip](https://sportsbook.fanduel.com/addToBetslip?",
+                      card["description"])
+        self.assertTrue(card["url"].startswith("https://sportsbook.fanduel.com/addToBetslip?marketId%5B0%5D=1.0"))
+        plain = ParlayAlerter(Config(), dry_run=True).payload(p)["embeds"][0]
+        self.assertNotIn("Add all", plain["description"])
+        self.assertNotIn("url", plain)
+
     # ---- Tuning from the record (TUNE_ENABLED)
     def tuned(self, markouts=(), clv=(), **kw):
         from unittest import mock
