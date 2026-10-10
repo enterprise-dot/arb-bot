@@ -4659,8 +4659,12 @@ class Markouts(unittest.TestCase):
         self.rows(3, 2.0, kind="ev", live=True)
         self.rows(3, 2.0, player="LeBron James", live=False)
         self.arb("a1", [("FanDuel", 1), ("DraftKings", 1)])
-        table = _arbbot.markout_table(self.cfg).split("```")[1].strip("\n").split("\n")
+        every = replace(self.cfg, ev_live=True, outlier_live=True, arbs_enabled=True)   # (every alert type on)
+        table = _arbbot.markout_table(every).split("```")[1].strip("\n").split("\n")
         self.assertEqual([l.split("  ")[0] for l in table[1:]], _arbbot.MARKOUT_GROUP_ORDER)
+        shown = _arbbot.markout_table(replace(every, ev_live=False, arbs_enabled=False))   # off: not on the scoreboard
+        self.assertNotIn("Live +EV", shown)
+        self.assertNotIn("Arbs", shown)
         self.assertEqual(len({len(l.removesuffix(" ✅").removesuffix(" ⚠️")) for l in table}), 1, "\n".join(table))
 
     def test_scoreboard_keeps_clv_and_drops_markouts_when_too_long(self):
@@ -13392,6 +13396,25 @@ class EVBotSpec(MixFiles):
         self.assertIn("Props:", text)
         self.assertNotIn("Live outliers", text)
         self.assertNotIn("Arbs", text)
+
+    def test_the_scoreboard_counts_pre_game_bets_once_live_alerts_are_off(self):
+        cfg = self.cfg(Config(ev_live=False, outlier_live=False, arbs_enabled=False))
+        rows = [{"live": "True", "x": 1}, {"live": "False", "x": 2}, {"live": "", "x": 3}]
+        self.assertEqual([r["x"] for r in _arbbot.bettable(cfg, rows)], [2, 3])
+        self.assertEqual(len(_arbbot.bettable(replace(cfg, outlier_live=True), rows)), 3)
+        self.assertIn("Last 7 days (pre-game bets)", _arbbot.scoreboard_text(cfg, NOW))
+
+    def test_tuning_can_count_only_recent_bets(self):
+        old = [{"kind": "ev", "book": "B", "player": "", "still_ok": "0", "first_seen": "2026-10-05T12:00:00+00:00"}] * 30
+        new = [{"kind": "ev", "book": "B", "player": "", "still_ok": "0", "first_seen": "2026-10-09T16:00:00+00:00"}] * 30
+        _, before = self.tuned(old + new)
+        self.assertIn(("b", False), before.slow)
+        _, after = self.tuned(old, tune_since="2026-10-09")
+        self.assertEqual(after.slow, {})                                          # the old bets don't count
+        _, still = self.tuned(old + new, tune_since="2026-10-09")
+        self.assertIn(("b", False), still.slow)
+        with self.assertRaises(ValueError):
+            Config(tune_since="Oct 9").check()
 
     def test_records_can_leave_out_live_bets(self):
         cfg = self.cfg(Config())

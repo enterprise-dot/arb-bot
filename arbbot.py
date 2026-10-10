@@ -431,6 +431,7 @@ class Config:
     tune_clv_bets: int = 50
     tune_clv_boost: float = 1.25
     tune_clv_cut: float = 0.5
+    tune_since: str = ""   # YYYY-MM-DD: tuning counts only bets alerted from this day on (older data was off); "" = all
     # A new alert (or a much better price's re-alert) isn't posted on odds fetched longer ago than this by the
     # time it's ready (a slow pass, Discord making the bot wait): the next check looks again and sends it on its
     # fresh odds, only if it still qualifies. Seconds, before the game / live; 0 = no limit.
@@ -690,6 +691,7 @@ class Config:
             tune_clv_bets=num("TUNE_CLV_BETS", d.tune_clv_bets, int),
             tune_clv_boost=num("TUNE_CLV_BOOST", d.tune_clv_boost, float),
             tune_clv_cut=num("TUNE_CLV_CUT", d.tune_clv_cut, float),
+            tune_since=e("TUNE_SINCE", "").strip(),
             min_live_profit_pct=num("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct, float),
             live_arb_max_skew=num("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew, int),
             live_confirm_checks=num("LIVE_CONFIRM_CHECKS", d.live_confirm_checks, int),
@@ -820,6 +822,11 @@ class Config:
         if not 0 < self.tune_clv_cut <= 1 <= self.tune_clv_boost:
             raise ValueError(f"TUNE_CLV_CUT={self.tune_clv_cut:g} should be over 0 and at most 1, "
                              f"and TUNE_CLV_BOOST={self.tune_clv_boost:g} at least 1")
+        if self.tune_since:
+            try:
+                date.fromisoformat(self.tune_since)
+            except ValueError:
+                raise ValueError(f"TUNE_SINCE={self.tune_since} should be a date like 2026-10-09") from None
         if self.tune_slow_extra_pct < 0 or self.tune_slow_bets < 1 or self.tune_clv_bets < 2:
             raise ValueError("TUNE_SLOW_EXTRA_PCT can't be negative, TUNE_SLOW_BETS should be at least 1 "
                              "and TUNE_CLV_BETS at least 2")
@@ -7035,6 +7042,17 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
                         "score; 🎯 means check that one yourself.")
 
 
+def live_off(cfg: Config) -> bool:
+    """No live alerts of any kind go out now (live +EV, live outliers and arbs all off)."""
+    return not (cfg.ev_live or cfg.outlier_live or (cfg.arbs_enabled and cfg.arb_live))
+
+
+def bettable(cfg: Config, rows: list[dict]) -> list[dict]:
+    """The rows the scoreboard counts: with no live alerts going out now, pre-game bets only (the live ones are
+    history members can't repeat; --results still shows them)."""
+    return [r for r in rows if str(r.get("live")).lower() != "true"] if live_off(cfg) else rows
+
+
 def _graded(cfg: Config, since: datetime | None = None) -> list[dict]:
     rows = [r for r in _read_csv(cfg.ev_results_file)
             if r.get("result") in ("win", "loss", "push") and not r.get("manual_legs") and cfg.counts(r.get("book", ""))]
@@ -7063,11 +7081,12 @@ def scoreboard_text(cfg: Config, now: datetime | None = None) -> str:
     arbbot.py --results, kept up to date in one Discord message."""
     now = now or datetime.now(timezone.utc)
     today = now.astimezone(ZoneInfo(cfg.timezone)).date()
+    pre = " (pre-game bets)" if live_off(cfg) else ""
     rows = day_bets(cfg, today)
     arbs = arbs_on(cfg, today)
     parts = [f"__**Today · {today:%a %b %-d}**__\n" + day_summary(rows, cfg, now) + (f"\n{arbs}" if arbs else ""),
-             "__**Last 7 days**__\n" + "\n".join(record_block(_graded(cfg, now - timedelta(days=7)))),
-             "__**All time**__\n" + "\n".join(record_block(_graded(cfg)))]
+             f"__**Last 7 days{pre}**__\n" + "\n".join(record_block(bettable(cfg, _graded(cfg, now - timedelta(days=7))))),
+             f"__**All time{pre}**__\n" + "\n".join(record_block(bettable(cfg, _graded(cfg))))]
     ever = clv_rows(cfg)
     if ever:
         good = sum(r["clv_pct"] for r in ever) > 0 and sum(r["beat_close"] for r in ever) * 2 > len(ever)
@@ -8339,8 +8358,9 @@ def _pregame_note(cfg: Config) -> str:
 
 
 def markout_table(cfg: Config) -> str:
-    """The scoreboard's 📏 part: one line per alert type, all time."""
-    groups = markout_breakdown(cfg)["Alert type"]
+    """The scoreboard's 📏 part: one line per alert type that's on, all time."""
+    off = groups_off(cfg)
+    groups = [g for g in markout_breakdown(cfg)["Alert type"] if g["name"] not in off]
     if not groups:
         return ""
     w = max(len(name) for name in MARKOUT_GROUP_ORDER)   # every name fits, so the columns line up
@@ -10068,9 +10088,14 @@ class Tuning:
         return t
 
     def _load(self, cfg: Config) -> None:
+        since = (datetime.combine(date.fromisoformat(cfg.tune_since), dtime.min, ZoneInfo(cfg.timezone))
+                 if cfg.tune_since else None)
+
+        def recent(r: dict) -> bool:   # (TUNE_SINCE: alerted on or after that day, New York time)
+            return since is None or bool(r.get("first_seen")) and _parse_time(r["first_seen"]) >= since
         groups: dict[tuple, list[bool]] = {}
         for r in markout_rows(cfg):
-            if r.get("kind") != "arb" and r.get("still_ok") in ("0", "1"):
+            if r.get("kind") != "arb" and r.get("still_ok") in ("0", "1") and recent(r):
                 groups.setdefault(_tune_group(r.get("book", ""), bool(r.get("player"))), []).append(r["still_ok"] == "1")
         if cfg.tune_slow_still_pct > 0:
             for (book, props), still in groups.items():
@@ -10080,6 +10105,8 @@ class Tuning:
                                                 f"({len(still)} bets)")
         clv: dict[tuple, list[float]] = {}
         for r in clv_rows(cfg, days=cfg.log_keep_days or None):
+            if not recent(r):
+                continue
             props = bool(r.get("player"))
             clv.setdefault(("book", book_slug(r.get("book", "")), props), []).append(r["clv_pct"])
             clv.setdefault(("sport", r.get("sport_key", ""), props), []).append(r["clv_pct"])
