@@ -13465,6 +13465,160 @@ class EVBotSpec(MixFiles):
         _arbbot.discord_trouble(cfg, SimpleNamespace(send=said.append), told, now=2000)
         self.assertEqual(len(said), 1)                                             # once a day
 
+    # ---- Oct 10, batch 2: same-game limit, uptime ping, backups, public results page, weekly leaderboard
+    def test_bets_on_one_game_get_smaller_stakes_then_stop(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False, same_game_full=2, same_game_max=3)
+        def game(ev_id, outcome_prices):
+            ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                          {"B": [(o, p, None) for o, p in outcome_prices]}, start=self.PRE)
+            ev.update(id=ev_id, sport_key="basketball_nba")
+            return ev
+        totals = ev_event([("Over", 1.91, 220.5), ("Under", 1.91, 220.5)], {"B": [("Over", 2.20, 220.5)]},
+                          start=self.PRE, market="totals")
+        totals.update(id="e1", sport_key="basketball_nba")
+        spreads = ev_event([("Home", 1.91, -3.5), ("Away", 1.91, 3.5)], {"B": [("Home", 2.15, -3.5)]},
+                           start=self.PRE, market="spreads")
+        spreads.update(id="e1", sport_key="basketball_nba")
+        ml = game("e1", [("Home", 2.30)])
+        posts = lambda: [b for (m, *_), b in zip(sent, self.bodies) if m == "POST"]
+        self.main(t, [ml], 0)
+        self.main(t, [totals], 60)                     # (each check closes the card it didn't see: GONE as always)
+        self.assertEqual(len(posts()), 2)
+        self.assertNotIn("alert #", "".join(posts()))                            # two at full stake
+        self.main(t, [spreads], 120)                                              # the third: half
+        self.assertIn("Stake ×0.5: alert #3 on this game", posts()[-1])
+        other = game("e9", [("Home", 2.30)])
+        self.main(t, [other], 180)
+        self.assertNotIn("alert #", posts()[-1])                                  # another game: full again
+        evs = [b for b in find_evs([game("e1", [("Away", 2.40)])], t.cfg, NOW)]
+        self.assertEqual(_arbbot.same_game(evs, t.cfg, t, (t.evs, t.outs)), [])   # fourth on e1: over the cap
+        self.assertEqual(t.evs.held_counts.get("same game"), 1)
+        with self.assertRaises(ValueError):
+            Config(same_game_stake=0).check()
+
+    def test_the_uptime_monitor_hears_from_the_bot_every_5_minutes(self):
+        from unittest import mock
+        cfg = Config(healthcheck_url="https://hc-ping.com/abc")
+        with mock.patch("urllib.request.urlopen") as call:
+            last = _arbbot.heartbeat(cfg, 0.0, now=1000)
+            _arbbot.heartbeat(cfg, last, now=1100)                                # too soon
+            _arbbot.heartbeat(cfg, last, now=1300)
+            self.assertEqual(call.call_count, 2)
+            self.assertEqual(_arbbot.heartbeat(Config(), 0.0, now=1000), 0.0)     # off without a URL
+            self.assertEqual(call.call_count, 2)
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            self.assertEqual(_arbbot.heartbeat(cfg, 0.0, now=5000), 5000)          # a failed ping never stops the bot
+
+    def test_the_nightly_backup_zips_the_record(self):
+        import io, zipfile
+        from unittest import mock
+        cfg = self.cfg(Config(backup_webhook_url="https://backup"))
+        Path(cfg.ev_results_file).write_text("result\nwin\n")
+        Path(cfg.ev_log_file).write_text("first_seen\nx\n")
+        Path(cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        (Path(cfg.state_dir) / "taken_bets.json").write_text("{}")
+        data, left_out = _arbbot.backup_zip(cfg)
+        names = zipfile.ZipFile(io.BytesIO(data)).namelist()
+        self.assertIn(Path(cfg.ev_results_file).name, names)
+        self.assertIn("state/taken_bets.json", names)
+        self.assertEqual(left_out, [])
+        with mock.patch.object(_arbbot, "BACKUP_LIMIT", 1):                       # too big for Discord: drop the
+            _, left_out = _arbbot.backup_zip(cfg)                                 # optional logs, biggest first
+        self.assertEqual(left_out, [Path(cfg.candidate_log_file).name, Path(cfg.markout_file).name,
+                                    Path(cfg.log_file).name])
+        before = datetime(2026, 10, 10, 5, 0, tzinfo=timezone.utc)                # 1:00am New York: not yet
+        after = datetime(2026, 10, 10, 5, 20, tzinfo=timezone.utc)
+        self.assertIsNone(_arbbot.backup_due(cfg, before))
+        self.assertEqual(_arbbot.backup_due(cfg, after), date(2026, 10, 10))
+        posted = []
+        with mock.patch("arbbot.post_file", lambda url, name, data, text: posted.append((url, name, text))):
+            _arbbot.send_backup(cfg, date(2026, 10, 10))
+        self.assertEqual(posted[0][:2], ("https://backup", "ev-bot-backup-2026-10-10.zip"))
+        self.assertIn("1 graded bets", posted[0][2])
+        self.assertIsNone(_arbbot.backup_due(cfg, after))                         # once a day
+        self.assertIsNone(_arbbot.backup_due(replace(cfg, backup_webhook_url=""), after))
+
+    def test_the_multipart_post_carries_the_file(self):
+        from unittest import mock
+        seen = {}
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"id": "1"}'
+        def fake(req, timeout=0):
+            seen["body"], seen["type"] = req.data, req.headers["Content-type"]
+            return Resp()
+        with mock.patch("urllib.request.urlopen", fake):
+            self.assertEqual(_arbbot.post_file("https://w", "b.zip", b"PK\x03\x04", "hi"), {"id": "1"})
+        self.assertTrue(seen["type"].startswith("multipart/form-data; boundary="))
+        self.assertIn(b'filename="b.zip"', seen["body"])
+        self.assertIn(b"PK\x03\x04", seen["body"])
+        self.assertIn(b'"username": "EV BOT"', seen["body"])
+
+    def test_the_public_page_shows_only_finished_pre_game_bets(self):
+        cfg = self.cfg(Config(ev_live=False, outlier_live=False, arbs_enabled=False, unit_size=10))
+        base = {"first_seen": "2026-10-03T12:00:00+00:00", "event_id": "g1", "sport": "NHL", "sport_key": "icehockey_nhl",
+                "matchup": "Away @ Home", "home_team": "Home", "away_team": "Away", "commence_time": "2026-10-03T23:00:00Z",
+                "market": "h2h", "outcome": "Home", "point": "", "n_outcomes": 2, "book": "BetMGM", "price": 2.2,
+                "stake": 20, "player": "", "kind": "ev", "clv_pct": 3.5, "manual_legs": ""}
+        rows = [dict(base, live=False, result="win", profit=24),
+                dict(base, event_id="g2", live=True, result="loss", profit=-20),                 # live: not shown
+                dict(base, event_id="g3", live=False, result="", profit="")]                    # ungraded: not shown
+        for r in rows:
+            append_csv(cfg.ev_results_file, _arbbot.RESULT_FIELDS, r)
+        data = _arbbot.site_data(cfg, NOW)
+        self.assertEqual(len(data["bets"]), 1)
+        self.assertEqual(data["bets"][0], {"date": "2026-10-03", "sport": "NHL", "game": "Away @ Home", "bet": "Home ML",
+                                           "book": "BetMGM", "odds": "+120", "units": 2.0, "result": "win",
+                                           "profit": 2.4, "clv": 3.5, "type": "+EV"})
+        self.assertFalse(data["live"])
+
+    def test_the_public_page_is_uploaded_once_a_night(self):
+        from unittest import mock
+        cfg = self.cfg(Config(results_site_repo="joey/ev-bot-results", results_site_token="tok"))
+        calls = []
+        def gh(token, method, path, body=None):
+            calls.append((method, path, body and sorted(body)))
+            if method == "GET":
+                return {"sha": "s1", "content": ""}
+            return {}
+        now = datetime(2026, 10, 10, 15, 0, tzinfo=timezone.utc)
+        self.assertEqual(_arbbot.site_due(cfg, now), date(2026, 10, 10))           # never yet: right away
+        with mock.patch("arbbot._github", gh):
+            _arbbot.publish_site(cfg, date(2026, 10, 10), now)
+        self.assertEqual([(m, p.rsplit("/", 1)[1]) for m, p, _ in calls],
+                         [("GET", "index.html"), ("PUT", "index.html"), ("GET", "results.json"), ("PUT", "results.json")])
+        self.assertEqual(calls[1][2], ["content", "message", "sha"])
+        self.assertIsNone(_arbbot.site_due(cfg, now))                               # done today
+        self.assertIsNone(_arbbot.site_due(cfg, datetime(2026, 10, 11, 4, 0, tzinfo=timezone.utc)))   # midnight NY
+        self.assertEqual(_arbbot.site_due(cfg, datetime(2026, 10, 11, 5, 30, tzinfo=timezone.utc)), date(2026, 10, 11))
+        self.assertIsNone(_arbbot.site_due(replace(cfg, results_site_token=""), now))
+        self.assertTrue((Path(_arbbot.__file__).parent / "site" / "index.html").exists())
+
+    def test_an_unchanged_page_isnt_uploaded_again(self):
+        import base64
+        from unittest import mock
+        cfg = Config(results_site_repo="joey/r", results_site_token="tok")
+        calls = []
+        def gh(token, method, path, body=None):
+            calls.append(method)
+            return {"sha": "s", "content": base64.b64encode(b"same").decode()}
+        with mock.patch("arbbot._github", gh):
+            _arbbot.github_put(cfg, "results.json", b"same", "m")
+        self.assertEqual(calls, ["GET"])
+
+    def test_the_weekly_card_has_the_members_leaderboard(self):
+        cfg, res, sent = self.results()
+        self.log(cfg, "g1", "2026-10-03T18:00:00Z")
+        settle_pending(cfg, self.scores({"g1": (4, 2)}), datetime(2026, 10, 4, 4, 0, tzinfo=timezone.utc))
+        Path(cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        _arbbot.taken_path(cfg).write_text(json.dumps({"g1|h2h|Home|": {"start": "2026-10-03T18:00:00Z",
+                                                                         "users": {"u1": "Joey"}}}))
+        text = _arbbot.weekly_payload(cfg, date(2026, 10, 5))["embeds"][0]["description"]
+        self.assertIn("🏆 Members this week", text)
+        self.assertIn("Joey +", text)
+
     # ---- Tuning from the record (TUNE_ENABLED)
     def tuned(self, markouts=(), clv=(), **kw):
         from unittest import mock

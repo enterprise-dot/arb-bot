@@ -559,6 +559,18 @@ Members tap it when they place the bet (and can take it back until the game star
 adds "👥 Members took 7 of 12 alerts · 5-2 · +3.1u" and the top three members, in units at each card's stake.
 Who took what is kept in `state/taken_bets.json` on the server.
 
+**Bets on one game (`SAME_GAME_FULL`, `SAME_GAME_STAKE`, `SAME_GAME_MAX`).** Bets on one game win and lose
+together, so the first two alerts on a game are at full stake, the next ones at half (the card says so), and there
+are at most four per game.
+
+**Keeping it safe.** `HEALTHCHECK_URL` (healthchecks.io) tells you when the bot stops checking in.
+`DISCORD_BACKUP_WEBHOOK_URL` gets a zipped copy of the betting record every night. The health channel is told when
+results can't be graded, when Discord refuses cards, and when updates stop reaching the server.
+
+**Public results page (`RESULTS_SITE_REPO`, `RESULTS_SITE_TOKEN`).** Every night the bot uploads `site/index.html` and
+every graded pre-game bet (in units, with CLV, losses included; nothing before its game is over) to a GitHub Pages
+repo. The token can write only that repo, never this one.
+
 **Test channel (`DISCORD_TEST_WEBHOOK_URL`).** `arbbot.py --set-webhook test` sets a private channel for
 `--test-discord`: each alert type that's on sends a sample there, pinging its book's role like a real alert.
 

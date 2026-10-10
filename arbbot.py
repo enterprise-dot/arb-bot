@@ -23,11 +23,13 @@ Standard library only. Run `python arbbot.py --help`.
 from __future__ import annotations
 
 import argparse
+import base64
 import calendar
 import csv
 import functools
 import gzip
 import hashlib
+import io
 import itertools
 import json
 import math
@@ -39,6 +41,8 @@ import textwrap
 import threading
 import time
 import unicodedata
+import uuid
+import zipfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -177,6 +181,7 @@ WEBHOOK_SETTINGS = {
     "status": ("DISCORD_STATUS_WEBHOOK_URL", "bot health messages"),
     "results": ("DISCORD_RESULTS_WEBHOOK_URL", "bet results (what hit and what missed)"),
     "test": ("DISCORD_TEST_WEBHOOK_URL", "sample alerts from --test-discord (nothing else)"),
+    "backup": ("DISCORD_BACKUP_WEBHOOK_URL", "a nightly copy of the betting record (keep this channel private)"),
 }
 
 
@@ -424,6 +429,16 @@ class Config:
     # the bot puts a ✅ under each new bet card, reads who tapped it every REACTION_MINUTES until the game starts,
     # and the results card reports the bets members actually took.
     discord_bot_token: str = ""
+    # An uptime monitor's ping URL (healthchecks.io: https://hc-ping.com/...; set it with --set). The bot calls it
+    # every HEARTBEAT_SECONDS while it's running; when the calls stop, the monitor tells you. Empty = off.
+    healthcheck_url: str = ""
+    # A private Discord channel for a nightly copy of the betting record (the bet logs and results, zipped).
+    backup_webhook_url: str = ""
+    # The public results page (GitHub Pages): the repo it lives in ("owner/name", in remote.env) and a GitHub token
+    # that can write only that repo (RESULTS_SITE_TOKEN, set with --set). Nightly, the bot uploads the page and the
+    # graded pre-game bets (finished games only: nothing a non-member could bet). Either empty = off.
+    results_site_repo: str = ""
+    results_site_token: str = ""
     reaction_minutes: int = 10
     tune_slow_still_pct: float = 40.0
     tune_slow_bets: int = 30
@@ -431,6 +446,12 @@ class Config:
     tune_clv_bets: int = 50
     tune_clv_boost: float = 1.25
     tune_clv_cut: float = 0.5
+    # Bets on one game move together (a player's shots and points, the game's total...). SAME_GAME_FULL: that many
+    # alerts on a game at full stake, the next ones at x SAME_GAME_STAKE, and at most SAME_GAME_MAX in all (main lines
+    # and props of the game together; parlays apart). 0 = off.
+    same_game_full: int = 0
+    same_game_stake: float = 0.5
+    same_game_max: int = 0
     tune_since: str = ""   # YYYY-MM-DD: tuning counts only bets alerted from this day on (older data was off); "" = all
     # A new alert (or a much better price's re-alert) isn't posted on odds fetched longer ago than this by the
     # time it's ready (a slow pass, Discord making the bot wait): the next check looks again and sends it on its
@@ -684,6 +705,10 @@ class Config:
             tune_enabled=e("TUNE_ENABLED", "false").lower() in ("1", "true", "yes"),
             shed_sports=e("SHED_SPORTS", "").strip().lower(),
             discord_bot_token=e("DISCORD_BOT_TOKEN", "").strip(),
+            healthcheck_url=e("HEALTHCHECK_URL", "").strip(),
+            backup_webhook_url=e("DISCORD_BACKUP_WEBHOOK_URL", ""),
+            results_site_repo=e("RESULTS_SITE_REPO", "").strip(),
+            results_site_token=e("RESULTS_SITE_TOKEN", "").strip(),
             reaction_minutes=num("REACTION_MINUTES", d.reaction_minutes, int),
             tune_slow_still_pct=num("TUNE_SLOW_STILL_PCT", d.tune_slow_still_pct, float),
             tune_slow_bets=num("TUNE_SLOW_BETS", d.tune_slow_bets, int),
@@ -692,6 +717,9 @@ class Config:
             tune_clv_boost=num("TUNE_CLV_BOOST", d.tune_clv_boost, float),
             tune_clv_cut=num("TUNE_CLV_CUT", d.tune_clv_cut, float),
             tune_since=e("TUNE_SINCE", "").strip(),
+            same_game_full=num("SAME_GAME_FULL", d.same_game_full, int),
+            same_game_stake=num("SAME_GAME_STAKE", d.same_game_stake, float),
+            same_game_max=num("SAME_GAME_MAX", d.same_game_max, int),
             min_live_profit_pct=num("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct, float),
             live_arb_max_skew=num("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew, int),
             live_confirm_checks=num("LIVE_CONFIRM_CHECKS", d.live_confirm_checks, int),
@@ -822,6 +850,8 @@ class Config:
         if not 0 < self.tune_clv_cut <= 1 <= self.tune_clv_boost:
             raise ValueError(f"TUNE_CLV_CUT={self.tune_clv_cut:g} should be over 0 and at most 1, "
                              f"and TUNE_CLV_BOOST={self.tune_clv_boost:g} at least 1")
+        if not 0 < self.same_game_stake <= 1 or self.same_game_full < 0 or self.same_game_max < 0:
+            raise ValueError("SAME_GAME_STAKE should be over 0 and at most 1, SAME_GAME_FULL and SAME_GAME_MAX 0 or more")
         if self.tune_since:
             try:
                 date.fromisoformat(self.tune_since)
@@ -1001,7 +1031,8 @@ class Config:
                           ("live_webhook_url", "DISCORD_LIVE_WEBHOOK_URL"),
                           ("status_webhook_url", "DISCORD_STATUS_WEBHOOK_URL"),
                           ("results_webhook_url", "DISCORD_RESULTS_WEBHOOK_URL"),
-                          ("test_webhook_url", "DISCORD_TEST_WEBHOOK_URL")):
+                          ("test_webhook_url", "DISCORD_TEST_WEBHOOK_URL"),
+                          ("backup_webhook_url", "DISCORD_BACKUP_WEBHOOK_URL")):
             value = getattr(self, attr)
             if value and not value.startswith(("https://", "http://")):
                 bad.append(env)
@@ -7512,7 +7543,7 @@ class BetReactions:
         return sum(1 for e in taken.values() if e["users"])
 
 
-def members_lines(cfg: Config, rows: list[dict]) -> str:
+def members_lines(cfg: Config, rows: list[dict], top: int = 3) -> str:
     """The results card's ✅ part for these bets: how many members took, their record at the card's stake in
     units, and the top three ("" when nobody ✅'d any of them)."""
     taken = read_taken(cfg)
@@ -7535,9 +7566,9 @@ def members_lines(cfg: Config, rows: list[dict]) -> str:
     line = (f"👥 **Members took {len(took)} of {len(rows)} alerts** ({sum(len(u) for _, u in took)} bets by "
             f"{len(people)} {'person' if len(people) == 1 else 'people'})"
             + (f" · {w}-{l} · {total:+.1f}u" if graded else ""))
-    top = sorted((p for p in people.values() if p[2]), key=lambda p: -p[1])[:3]
-    if top:
-        line += "\n" + " · ".join(f"{name} {u:+.1f}u ({n})" for name, u, n in top)
+    best = sorted((p for p in people.values() if p[2]), key=lambda p: -p[1])[:top]
+    if best:
+        line += "\n" + " · ".join(f"{name} {u:+.1f}u ({n})" for name, u, n in best)
     return line
 
 
@@ -8759,6 +8790,9 @@ def weekly_text(cfg: Config, end_day: date, held: dict | None = None) -> tuple[s
 
 def weekly_payload(cfg: Config, end_day: date, held: dict | None = None) -> dict:
     title, text, profit = weekly_text(cfg, end_day, held)
+    week = [r for d in range(1, 8) for r in day_bets(cfg, end_day - timedelta(days=d))]
+    if members := members_lines(cfg, week, top=5):   # (✅ tracking: the week's leaderboard)
+        text = (text + "\n\n__**🏆 Members this week**__\n" + members)[:4000]
     return _card(title, text, 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else 0x5865F2),
                  footer="Suggestions only: the bot never changes a setting by itself. Each arb counts once a "
                         "day, placed at BANKROLL.")
@@ -10139,6 +10173,39 @@ class Tuning:
 TUNE_REFRESH_SECONDS = 3600
 
 
+def same_game(bets: list, cfg: Config, t: "Trackers", alerters: tuple) -> list:
+    """SAME_GAME_FULL / SAME_GAME_STAKE / SAME_GAME_MAX: a game's first new alerts at full stake, the next ones smaller
+    (they win and lose together), none past the cap. Counts every alert already out on the game (main lines and
+    props; remembered across restarts) and the ones before it in this check, best edge first. Cards already up
+    go through unchanged; what's held back is counted as "same game"."""
+    if not (cfg.same_game_full or cfg.same_game_max):
+        return bets
+    up = {k for a in alerters for k in (*a.open, *a.restored)}
+    every = (t.evs, t.outs, t.prop_evs, t.prop_outs)
+    out_on: dict[str, set[str]] = {}
+    for key in {*t.alerted.until, *(k for a in every for k in (*a.open, *a.restored))}:
+        if key.startswith("ev|"):
+            out_on.setdefault(key.split("|")[1], set()).add(key)
+    keep = []
+    for b in sorted(bets, key=lambda b: -b.ev_pct):
+        if b.key in up:
+            keep.append(b)
+            continue
+        on = out_on.setdefault(b.event_id, set())
+        n = len(on - {b.key}) + 1   # this one's place on the game
+        if cfg.same_game_max and n > cfg.same_game_max:
+            alerters[0].held_counts["same game"] = alerters[0].held_counts.get("same game", 0) + 1
+            continue
+        if cfg.same_game_full and n > cfg.same_game_full and b.stake:
+            cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
+            b.stake = round_stake(b.stake * cfg.same_game_stake, min(cap, b.stake), cfg)
+            note = f"Stake ×{cfg.same_game_stake:g}: alert #{n} on this game (bets on one game win and lose together)"
+            b.tune_note = f"{b.tune_note}\n📊 {note}" if b.tune_note else note
+        on.add(b.key)
+        keep.append(b)
+    return keep
+
+
 def tune_bets(bets: list, cfg: Config, tuning: Tuning, alerters: tuple) -> list:
     """TUNE_ENABLED: new bets (no card up in these alerters) from a book whose price is usually gone by the next
     check need TUNE_SLOW_EXTRA_PCT more edge (the others are held back, counted as "tuned out"), and each new bet's
@@ -10274,7 +10341,8 @@ HELD_LABELS = {"waiting": "live, waiting for another check", "unconfirmed": "liv
                "live cap": "over the live-alert cap", "old data": "odds too old by sending time (checked again)",
                "not sent": "Discord didn't take it (tried again next check)",
                "alerted before": "alerted once already (ONE_ALERT_PER_BET)",
-               "tuned out": "edge too small for a book whose price is usually gone (TUNE_ENABLED)"}
+               "tuned out": "edge too small for a book whose price is usually gone (TUNE_ENABLED)",
+               "same game": "already enough alerts on that game (SAME_GAME_MAX)"}
 
 
 def take_held(*alerters: Alerter) -> dict[str, int]:
@@ -10333,6 +10401,8 @@ def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: d
     t.candidates.extend(rejects, at.timestamp())
     outs = tune_bets(outs, cfg, t.tuned(), (t.outs, t.evs))
     evs = tune_bets(evs, cfg, t.tuned(), (t.evs, t.outs))
+    kept_keys = {b.key for b in same_game(outs + evs, cfg, t, (t.evs, t.outs))}
+    outs, evs = [b for b in outs if b.key in kept_keys], [b for b in evs if b.key in kept_keys]
     hand_over(evs, outs, t.evs, t.outs, at.timestamp())
     kept = {id(b) for b in t.screen(t.bet_live, outs + evs, scope, at.timestamp(), (t.outs, t.evs))}
     post_outs, post_evs = [b for b in outs if id(b) in kept], [b for b in evs if id(b) in kept]
@@ -10375,6 +10445,8 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
     t.prop_prices.prune(at)
     p_outs = tune_bets(p_outs, cfg, t.tuned(), (t.prop_outs, t.prop_evs))
     p_evs = tune_bets(p_evs, t.prop_cfg, t.tuned(), (t.prop_evs, t.prop_outs))
+    kept_keys = {b.key for b in same_game(p_outs + p_evs, cfg, t, (t.prop_evs, t.prop_outs))}
+    p_outs, p_evs = [b for b in p_outs if b.key in kept_keys], [b for b in p_evs if b.key in kept_keys]
     hand_over(p_evs, p_outs, t.prop_evs, t.prop_outs, ts)
     note_related([(p_outs, t.prop_outs, checked), (p_evs, t.prop_evs, checked),
                   ([], t.outs, set()), ([], t.evs, set())], ts)
@@ -10458,6 +10530,9 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     shed_before: set[str] = set()       # SHED_SPORTS left out when the health channel was last told
     results_warned = 0.0                # when the health channel was last told grading or results failed
     trouble_told: dict[str, float] = {}   # webhook -> when the health channel was last told Discord refused it
+    beat = 0.0                          # last uptime ping (HEALTHCHECK_URL)
+    backup_tried = 0.0                  # last nightly backup attempt (DISCORD_BACKUP_WEBHOOK_URL)
+    site_tried = 0.0                    # last public results page update (RESULTS_SITE_*)
 
     def update_parlays() -> int:
         open_bets = parlay_bets(ev_alerter, prop_evs, out_alerter, prop_outs)
@@ -10738,6 +10813,21 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         except Exception as e:  # noqa: BLE001
             results_warned = results_trouble(status, e, results_warned)
         discord_trouble(cfg, status, trouble_told)
+        if not args.once:
+            beat = heartbeat(cfg, beat)
+        if not (args.once or args.dry_run) and (day := backup_due(cfg, now)) and time.time() - backup_tried > 3600:
+            backup_tried = time.time()   # (a failure is tried again in an hour; said at most once a day)
+            try:
+                send_backup(cfg, day)
+                print(f"  🗄️ Backup of the betting record posted for {day}", flush=True)
+            except Exception as e:  # noqa: BLE001 - a backup must never stop the bot
+                results_warned = results_trouble(status, e, results_warned, what="post the nightly backup")
+        if not (args.once or args.dry_run) and (day := site_due(cfg, now)) and time.time() - site_tried > 3600:
+            site_tried = time.time()
+            try:
+                print(f"  🌐 Public results page updated: {publish_site(cfg, day)} bets", flush=True)
+            except Exception as e:  # noqa: BLE001 - the page must never stop the bot
+                results_warned = results_trouble(status, e, results_warned, what="update the public results page")
         if not args.once and t.reactions.due():
             try:
                 t.reactions.tick(now)
@@ -10753,14 +10843,187 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         time.sleep(max(1.0, sched.seconds_to_next(now)))
 
 
-def results_trouble(status: "Status", e: Exception, warned: float, now: float | None = None) -> float:
-    """Grading or posting results failed: print it, and tell the health channel once a day. Returns when it last
-    told it."""
+# --------------------------------------------------------------------------- nightly backup (DISCORD_BACKUP_WEBHOOK_URL)
+
+BACKUP_AT = dtime(1, 15)          # New York time: after the day's results card
+BACKUP_LIMIT = 9 * 1024 * 1024    # Discord takes files up to 10 MB from a webhook
+# Biggest last: left out of the zip, in this order, if it would be too big for Discord.
+BACKUP_OPTIONAL = ("candidate_log_file", "markout_file", "log_file")
+
+
+def backup_zip(cfg: Config) -> tuple[bytes, list[str]]:
+    """The betting record zipped: the bet logs, results, closing lines, markouts and the state that goes with them
+    (who took what, what was alerted). Returns (zip, files left out to fit Discord's limit)."""
+    names = [f.name for f in fields(Config) if f.name.endswith("_file") and getattr(cfg, f.name)]
+    state = ([data_path(cfg.state_dir) / n for n in ("taken_bets.json", "alerted_bets.json", "results_posted.json")]
+             if cfg.state_dir else [])
+    left_out: list[str] = []
+    while True:
+        logs = [data_path(getattr(cfg, n)) for n in names if n not in left_out]
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for path in logs:
+                if path.exists():
+                    z.write(path, path.name)
+            for path in state:
+                if path.exists():
+                    z.write(path, f"state/{path.name}")
+        data = buf.getvalue()
+        more = [n for n in BACKUP_OPTIONAL if n in names and n not in left_out]
+        if len(data) <= BACKUP_LIMIT or not more:
+            return data, [Path(getattr(cfg, n)).name for n in left_out]
+        left_out.append(more[0])
+
+
+def post_file(url: str, filename: str, data: bytes, text: str) -> dict | None:
+    """Post a message with one file attached to a webhook (multipart, standard library only)."""
+    boundary = uuid.uuid4().hex
+    payload = json.dumps({"username": BOT_NAME, "content": text[:1900]})
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
+            f"Content-Type: application/json\r\n\r\n{payload}\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"{filename}\"\r\n"
+            f"Content-Type: application/zip\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(f"{url}?wait=true", data=body, method="POST",
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                                          "User-Agent": "arbbot/3.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else None
+
+
+def backup_due(cfg: Config, now: datetime) -> date | None:
+    """The day a nightly backup is owed for (from BACKUP_AT, once a day, remembered across restarts), else None."""
+    if not cfg.backup_webhook_url or not cfg.state_dir:
+        return None
+    local = now.astimezone(ZoneInfo(cfg.timezone))
+    if local.time() < BACKUP_AT:
+        return None
+    marker = data_path(cfg.state_dir) / "backup_day.txt"
+    try:
+        if marker.exists() and marker.read_text().strip() == local.date().isoformat():
+            return None
+    except OSError:
+        return None
+    return local.date()
+
+
+def send_backup(cfg: Config, day: date) -> None:
+    """Post the night's backup zip to DISCORD_BACKUP_WEBHOOK_URL, and remember that day's went."""
+    data, left_out = backup_zip(cfg)
+    graded = len(_read_csv(cfg.ev_results_file)) if cfg.ev_results_file else 0
+    text = (f"🗄️ Betting record backup, {day:%a %b %-d} ({graded} graded bets, {len(data) / 1024:,.0f} KB)."
+            + (f" Left out to fit Discord's limit: {', '.join(left_out)}." if left_out else "")
+            + " To restore, unzip it into /opt/arb-bot on the server. Keep this channel private.")
+    post_file(cfg.backup_webhook_url, f"ev-bot-backup-{day.isoformat()}.zip", data, text)
+    marker = data_path(cfg.state_dir) / "backup_day.txt"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(day.isoformat())
+
+
+# --------------------------------------------------------------------------- public results page (RESULTS_SITE_*)
+
+SITE_AT = dtime(1, 20)   # New York time: after the day's results card and the backup
+SITE_PAGE = "site/index.html"   # the page itself, kept with the code so it changes with it
+
+
+def site_data(cfg: Config, now: datetime | None = None) -> dict:
+    """The public page's data: every graded pre-game bet (live ones once live alerts are off), in units at the
+    stake its card showed, with its closing-line value. Nothing ungraded: no pick goes out before its game is over."""
+    now = now or datetime.now(timezone.utc)
+    unit = cfg.unit() or 1.0
+    bets = []
+    for r in sorted(bettable(cfg, _graded(cfg)), key=lambda r: r["commence_time"]):
+        pick = r.get("outcome", "") if r.get("market") == "parlay" else row_pick(r)
+        clv = r.get("clv_pct")
+        bets.append({"date": local_day(cfg, r["commence_time"]).isoformat(), "sport": r.get("sport", ""),
+                     "game": r.get("matchup", ""), "bet": pick, "book": r.get("book", ""),
+                     "odds": odds(float(r["price"])), "units": round(float(r["stake"]) / unit, 2),
+                     "result": r["result"], "profit": round(float(r["profit"]) / unit, 2),
+                     "clv": round(float(clv), 2) if clv not in ("", None) else None,
+                     "type": {"ev": "+EV", "outlier": "Outlier", "prop": "Prop", "parlay": "Parlay"}.get(_kind(r), "+EV")})
+    return {"name": BOT_NAME, "updated": now.isoformat(timespec="minutes"), "unit": unit, "bets": bets,
+            "live": not live_off(cfg)}
+
+
+def _github(token: str, method: str, path: str, body: dict | None = None) -> dict | None:
+    req = urllib.request.Request(f"https://api.github.com{path}", method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                                          "User-Agent": "arbbot/3.0", "X-GitHub-Api-Version": "2022-11-28"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else None
+
+
+def github_put(cfg: Config, name: str, content: bytes, message: str) -> None:
+    """Create or replace one file in RESULTS_SITE_REPO (only when it changed)."""
+    path = f"/repos/{cfg.results_site_repo}/contents/{urllib.parse.quote(name)}"
+    try:
+        old = _github(cfg.results_site_token, "GET", path) or {}
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        old = {}
+    if old.get("content") and base64.b64decode(old["content"]) == content:
+        return
+    _github(cfg.results_site_token, "PUT", path, {"message": message, "content": base64.b64encode(content).decode(),
+                                                  **({"sha": old["sha"]} if old.get("sha") else {})})
+
+
+def site_due(cfg: Config, now: datetime) -> date | None:
+    """The day the public page is owed an update for (from SITE_AT, once a day, remembered across restarts)."""
+    if not (cfg.results_site_repo and cfg.results_site_token and cfg.state_dir):
+        return None
+    local = now.astimezone(ZoneInfo(cfg.timezone))
+    marker = data_path(cfg.state_dir) / "site_day.txt"
+    try:
+        done = marker.read_text().strip() if marker.exists() else ""
+    except OSError:
+        return None
+    if not done:
+        return local.date()   # (never yet: right away, so the page isn't empty until tomorrow)
+    return local.date() if local.time() >= SITE_AT and done != local.date().isoformat() else None
+
+
+def publish_site(cfg: Config, day: date, now: datetime | None = None) -> int:
+    """Upload the page and its data to RESULTS_SITE_REPO; returns how many bets it shows."""
+    data = site_data(cfg, now)
+    page = HERE / SITE_PAGE
+    if page.exists():
+        github_put(cfg, "index.html", page.read_bytes(), f"Page updated ({day})")
+    github_put(cfg, "results.json", json.dumps(data, indent=1).encode(), f"Results through {day}")
+    marker = data_path(cfg.state_dir) / "site_day.txt"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(day.isoformat())
+    return len(data["bets"])
+
+
+HEARTBEAT_SECONDS = 300
+
+
+def heartbeat(cfg: Config, last: float, now: float | None = None) -> float:
+    """HEALTHCHECK_URL: tell the uptime monitor the bot is alive, every HEARTBEAT_SECONDS. A failed call only
+    prints (the monitor notices the silence anyway). Returns when it last called."""
     now = time.time() if now is None else now
-    print(f"! Results failed: {e!r:.300}", file=sys.stderr, flush=True)
+    if not cfg.healthcheck_url or now - last < HEARTBEAT_SECONDS:
+        return last
+    try:
+        urllib.request.urlopen(urllib.request.Request(cfg.healthcheck_url, headers={"User-Agent": "arbbot/3.0"}),
+                               timeout=5).close()
+    except Exception as e:  # noqa: BLE001
+        print(f"  ! Uptime ping failed: {e!r:.120}", file=sys.stderr)
+    return now
+
+
+def results_trouble(status: "Status", e: Exception, warned: float, now: float | None = None,
+                    what: str = "grade or post results") -> float:
+    """Grading or posting results (or a backup) failed: print it, and tell the health channel once a day. Returns
+    when it last told it."""
+    now = time.time() if now is None else now
+    print(f"! Results failed ({what}): {e!r:.300}", file=sys.stderr, flush=True)
     if warned and now - warned < 86400:
         return warned
-    status.send(f"⚠️ Couldn't grade or post results ({type(e).__name__}: {str(e)[:150]}). Bet alerts keep going; "
+    status.send(f"⚠️ Couldn't {what} ({type(e).__name__}: {str(e)[:150]}). Bet alerts keep going; "
                 "the server log has the details (journalctl -u arbbot | grep 'Results failed').")
     return now
 

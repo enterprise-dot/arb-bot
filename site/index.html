@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EV BOT Results</title>
+<meta name="description" content="Every graded EV BOT bet, wins and losses, updated nightly.">
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #16181d; --muted: #5d6573; --line: #e3e6eb;
+    --win: #128a4a; --loss: #c8372d; --push: #6b7280; --accent: #3b5bdb; --chip: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115; --card: #171a21; --text: #e8eaee; --muted: #9aa3b2; --line: #272c36;
+      --win: #3ccf7f; --loss: #ff6b5e; --push: #9aa3b2; --accent: #7c9bff; --chip: #222733;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .stat b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 13px; }
+  .pos { color: var(--win); } .neg { color: var(--loss); }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 10px; }
+  .bar button { border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 999px;
+                padding: 6px 12px; font: inherit; font-size: 14px; cursor: pointer; }
+  .bar button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+  svg { width: 100%; height: 180px; display: block; }
+  .tablewrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.bet { white-space: normal; min-width: 180px; }
+  .tag { background: var(--chip); border-radius: 6px; padding: 1px 6px; font-size: 12px; color: var(--muted); }
+  .r-win { color: var(--win); font-weight: 600; } .r-loss { color: var(--loss); font-weight: 600; }
+  .r-push { color: var(--push); }
+  .fine { color: var(--muted); font-size: 13px; }
+  .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>EV BOT results</h1>
+  <p class="sub" id="sub">Every graded bet, wins and losses. Loading…</p>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="bar" id="types" role="group" aria-label="Bet type"></div>
+  <div class="bar" id="ranges" role="group" aria-label="Time range"></div>
+
+  <div class="card">
+    <h2>Profit over time (units)</h2>
+    <svg id="chart" viewBox="0 0 600 180" preserveAspectRatio="none" role="img" aria-label="Cumulative profit in units"></svg>
+  </div>
+
+  <div class="card tablewrap">
+    <table>
+      <thead><tr><th>Date</th><th>Bet</th><th>Book</th><th class="num">Odds</th><th class="num">Units</th>
+        <th>Result</th><th class="num">Profit</th><th class="num">CLV</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>No graded bets here yet.</div>
+  </div>
+
+  <p class="fine">
+    Every alert is counted at the stake its card showed, in units, once its game is over. Nothing is left out:
+    losses are listed like wins. CLV (closing-line value) compares the price we alerted with the fair price when
+    the game started; beating the close over many bets is the clearest sign of a real edge. Past results don't
+    guarantee future ones. 21+ only. Bet responsibly. If gambling stops being fun, call 1-800-GAMBLER.
+  </p>
+</main>
+<script>
+(function () {
+  var TYPES = ["All", "+EV", "Prop", "Outlier", "Parlay"];
+  var RANGES = [["7 days", 7], ["30 days", 30], ["All time", 0]];
+  var state = { type: "All", days: 0, bets: [] };
+
+  function units(x) { return (x > 0 ? "+" : x < 0 ? "−" : "") + Math.abs(x).toFixed(2) + "u"; }
+  function pct(x) { return (x > 0 ? "+" : x < 0 ? "−" : "") + Math.abs(x).toFixed(1) + "%"; }
+  function cls(x) { return x > 0 ? "pos" : x < 0 ? "neg" : ""; }
+  function el(tag, attrs, text) {
+    var e = document.createElement(tag);
+    for (var k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function buttons(id, items, current, set) {
+    var bar = document.getElementById(id);
+    bar.textContent = "";
+    items.forEach(function (it) {
+      var label = Array.isArray(it) ? it[0] : it, value = Array.isArray(it) ? it[1] : it;
+      var b = el("button", { type: "button", "aria-pressed": String(value === current) }, label);
+      b.onclick = function () { set(value); render(); };
+      bar.appendChild(b);
+    });
+  }
+
+  function chosen() {
+    var cutoff = null;
+    if (state.days) {
+      var d = new Date(); d.setDate(d.getDate() - state.days);
+      cutoff = d.toISOString().slice(0, 10);
+    }
+    return state.bets.filter(function (b) {
+      return (state.type === "All" || b.type === state.type) && (!cutoff || b.date >= cutoff);
+    });
+  }
+
+  function stats(bets) {
+    var w = 0, l = 0, p = 0, staked = 0, profit = 0, clv = [], beat = 0;
+    bets.forEach(function (b) {
+      if (b.result === "win") w++; else if (b.result === "loss") l++; else p++;
+      if (b.result !== "push") staked += b.units;
+      profit += b.profit;
+      if (b.clv !== null && b.clv !== undefined) { clv.push(b.clv); if (b.clv > 0) beat++; }
+    });
+    var box = document.getElementById("stats");
+    box.textContent = "";
+    var avg = clv.length ? clv.reduce(function (a, c) { return a + c; }, 0) / clv.length : null;
+    [[w + "-" + l + (p ? "-" + p : ""), "Record", ""],
+     [units(profit), "Profit", cls(profit)],
+     [staked ? pct(profit / staked * 100) : "—", "ROI", cls(profit)],
+     [avg === null ? "—" : pct(avg), "Avg CLV", avg === null ? "" : cls(avg)],
+     [clv.length ? Math.round(beat / clv.length * 100) + "%" : "—", "Beat the close", ""],
+     [String(bets.length), "Bets", ""]].forEach(function (s) {
+      var c = el("div", { "class": "stat" });
+      c.appendChild(el("b", { "class": s[2] }, s[0]));
+      c.appendChild(el("span", null, s[1]));
+      box.appendChild(c);
+    });
+  }
+
+  function chart(bets) {
+    var svg = document.getElementById("chart");
+    svg.textContent = "";
+    if (bets.length < 2) return;
+    var run = 0, pts = bets.map(function (b) { run += b.profit; return run; });
+    var lo = Math.min(0, Math.min.apply(null, pts)), hi = Math.max(0, Math.max.apply(null, pts));
+    var span = hi - lo || 1, W = 600, H = 180, pad = 8;
+    function x(i) { return i / (pts.length - 1) * W; }
+    function y(v) { return pad + (hi - v) / span * (H - 2 * pad); }
+    var zero = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    [["x1", 0], ["x2", W], ["y1", y(0)], ["y2", y(0)], ["stroke", "var(--muted)"], ["stroke-opacity", ".4"],
+     ["stroke-dasharray", "4 4"], ["vector-effect", "non-scaling-stroke"]].forEach(function (a) {
+      zero.setAttribute(a[0], a[1]);
+    });
+    svg.appendChild(zero);
+    var d = pts.map(function (v, i) { return (i ? "L" : "M") + x(i).toFixed(1) + "," + y(v).toFixed(1); }).join("");
+    var line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    line.setAttribute("d", d);
+    line.setAttribute("fill", "none");
+    line.setAttribute("stroke", run >= 0 ? "var(--win)" : "var(--loss)");
+    line.setAttribute("stroke-width", "2");
+    line.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(line);
+  }
+
+  function table(bets) {
+    var body = document.getElementById("rows");
+    body.textContent = "";
+    bets.slice().reverse().forEach(function (b) {
+      var tr = el("tr");
+      tr.appendChild(el("td", null, b.date.slice(5)));
+      var bet = el("td", { "class": "bet" }, b.bet + " ");
+      bet.appendChild(el("span", { "class": "tag" }, b.type));
+      bet.appendChild(el("div", { "class": "fine" }, b.sport + " · " + b.game));
+      tr.appendChild(bet);
+      tr.appendChild(el("td", null, b.book));
+      tr.appendChild(el("td", { "class": "num" }, b.odds));
+      tr.appendChild(el("td", { "class": "num" }, b.units.toFixed(2)));
+      tr.appendChild(el("td", { "class": "r-" + b.result }, b.result.charAt(0).toUpperCase() + b.result.slice(1)));
+      tr.appendChild(el("td", { "class": "num " + cls(b.profit) }, units(b.profit)));
+      tr.appendChild(el("td", { "class": "num " + (b.clv === null ? "" : cls(b.clv)) }, b.clv === null ? "—" : pct(b.clv)));
+      body.appendChild(tr);
+    });
+    document.getElementById("empty").hidden = bets.length > 0;
+  }
+
+  function render() {
+    buttons("types", TYPES, state.type, function (v) { state.type = v; });
+    buttons("ranges", RANGES, state.days, function (v) { state.days = v; });
+    var bets = chosen();
+    stats(bets); chart(bets); table(bets);
+  }
+
+  fetch("results.json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (data) {
+    state.bets = data.bets || [];
+    var when = new Date(data.updated);
+    document.getElementById("sub").textContent = "Every graded " + (data.live ? "" : "pre-game ") +
+      "bet, wins and losses, in units at the stake each alert showed. Updated " +
+      when.toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) + ".";
+    render();
+  }).catch(function () {
+    document.getElementById("sub").textContent = "Results aren't available right now. Try again in a minute.";
+  });
+})();
+</script>
+</body>
+</html>
